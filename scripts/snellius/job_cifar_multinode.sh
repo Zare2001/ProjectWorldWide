@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pww-cifar-multi
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=18
+#SBATCH --cpus-per-task=16
+#SBATCH --distribution=block:block
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
@@ -14,8 +15,9 @@
 #   sbatch scripts/snellius/job_cifar_multinode.sh
 #   sbatch --nodes=4 scripts/snellius/job_cifar_multinode.sh
 #
-# !! UNVERIFIED -- run ./scripts/siteinfo.sh and confirm the values in the
-#    job_smoke.sh header before trusting results.
+# On gpu_a100 instead (72 cores rather than 64, so 18 per rank):
+#
+#   sbatch -p gpu_a100 --cpus-per-task=18 scripts/snellius/job_cifar_multinode.sh
 
 set -euo pipefail
 
@@ -32,8 +34,8 @@ export MASTER_PORT=29500
 
 # Cross-node collectives go over InfiniBand here, not Slingshot. If job_smoke.sh
 # reports single-digit GB/s across nodes, NCCL fell back to TCP -- set the
-# interface explicitly and check that the IB stack is visible in the job.
-# export NCCL_SOCKET_IFNAME=ib0
+# interface explicitly. The interfaces are ibp*/mlx5 on these nodes, not ib0.
+# export NCCL_SOCKET_IFNAME=ibp
 
 echo "nodes: ${SLURM_JOB_NUM_NODES} | ranks: ${SLURM_NTASKS} | master: ${MASTER_ADDR}"
 

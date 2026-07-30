@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pww-cifar-1node
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=18
+#SBATCH --cpus-per-task=16
+#SBATCH --distribution=block:block
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
@@ -13,8 +14,9 @@
 #
 #   sbatch scripts/snellius/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 #
-# !! UNVERIFIED -- see scripts/snellius/job_smoke.sh header and run
-#    ./scripts/siteinfo.sh to confirm partition, GPU count and cores per GPU.
+# On gpu_a100 instead (72 cores rather than 64, so 18 per rank):
+#
+#   sbatch -p gpu_a100 --cpus-per-task=18 scripts/snellius/job_cifar_1node.sh
 #
 # On accuracy comparability across sites: this node has 4 ranks where LUMI has 8,
 # so at the same --batch-size the global batch is halved and train_cifar scales

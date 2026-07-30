@@ -11,21 +11,22 @@ and pinning variable from the environment rather than assuming ROCm or CUDA.
 
 | | LUMI | Snellius |
 |---|---|---|
-| accelerator | AMD MI250X, ROCm/RCCL | NVIDIA, CUDA/NCCL |
+| accelerator | AMD MI250X, ROCm/RCCL | NVIDIA H100 / A100, CUDA/NCCL |
 | ranks per node | 8 (each MI250X = 2 GCDs) | 4 |
 | pinning variable | `ROCR_VISIBLE_DEVICES` | `CUDA_VISIBLE_DEVICES` |
-| environment | prebuilt Singularity container | EasyBuild modules |
+| environment | prebuilt Singularity container | pip venv built by `setup_venv.sh` |
+| torch | 2.7.1+rocm6.2.4 | 2.7.1+cu126 |
+| partitions | `dev-g`, `small-g`, `standard-g` | `gpu_h100`, `gpu_a100` |
 | interconnect | Slingshot (`hsn`) + aws-ofi-rccl | InfiniBand |
 | MIOpen cache workaround | required | not applicable |
-| status | **verified end to end** | **template, unverified** |
 
 ## Layout
 
 ```
 env.sh                    site detection + shared config
 sites/
-  lumi.sh                 LUMI specifics (verified)
-  snellius.sh             Snellius specifics (UNVERIFIED -- see below)
+  lumi.sh                 LUMI specifics
+  snellius.sh             Snellius specifics
 configs/                  YAML run configs
 scripts/
   bootstrap.sh            one-time setup (run first)
@@ -33,7 +34,7 @@ scripts/
   download_data.sh        pre-fetch datasets -- LOGIN NODE ONLY
   task_wrapper.sh         per-rank entrypoint, site-agnostic
   lumi/                   job_smoke, job_cifar_debug, job_cifar_1node, job_cifar_multinode
-  snellius/               job_smoke, job_cifar_1node, job_cifar_multinode
+  snellius/               setup_venv.sh (run first), job_smoke, job_cifar_1node, job_cifar_multinode
 src/pww/
   distributed.py          process group, GPU pinning, collective reductions
   parallel.py             DDP / FSDP wrapping, mixed precision, act. checkpointing
@@ -47,8 +48,14 @@ src/pww/
 tests/test_local.py       CPU-only tests, no allocation needed
 ```
 
-Code lives in `$HOME` (20 GB, 100k inodes). Data, checkpoints and logs live on
-`/scratch/project_462000226/$USER`, symlinked as `data/` and `runs/`.
+Code lives in `$HOME`; data, checkpoints and logs live on scratch, symlinked as
+`data/` and `runs/`. Which scratch differs per site, and so do the limits:
+
+| | LUMI | Snellius |
+|---|---|---|
+| `$HOME` | 20 GB, 100k inodes | 200 GiB, 1M inodes |
+| scratch (`PWW_SCRATCH`) | `/scratch/project_462000226/$USER` | `/scratch-shared/$USER` (8 TiB, **purged ~14 days**) |
+| venv | n/a (container) | `$HOME/venvs/pww-snellius` (~6 GB) |
 
 ## Getting started
 
@@ -179,57 +186,99 @@ on partial-node debug runs -- use a full node for anything you intend to measure
 **bf16, not fp16.** MI250X does bf16 natively and it has fp32's dynamic range, so
 no loss scaler is needed.
 
-## Bringing up Snellius
-
-The LUMI path is verified end to end. The Snellius path is a **template written
-from SURF documentation and never executed** -- no Snellius access was available
-when it was written. Treat every value marked `[VERIFY]` in `sites/snellius.sh`
-as a guess until confirmed.
-
-First run on Snellius:
+## Running on Snellius
 
 ```bash
-git clone <this repo> ~/ProjectWorldWide && cd ~/ProjectWorldWide
-./scripts/siteinfo.sh              # prints partitions, GPUs/node, cores, modules, filesystems
-```
-
-Use that output to correct, in `sites/snellius.sh`:
-
-| value | how `siteinfo.sh` tells you |
-|---|---|
-| `PWW_GPUS_PER_NODE` | `Gres=gpu:N` on a GPU node |
-| `PWW_CPUS_PER_TASK` | `CPUTot` / that N |
-| `PWW_TORCH_MODULE` | the candidate PyTorch modules listed |
-| `PWW_SCRATCH` | which of `/scratch-shared`, `/projects/0/...` exists and has room |
-| `PWW_ACCOUNT` | the accounts section (may legitimately be empty) |
-
-Then match the `#SBATCH` headers in `scripts/snellius/*.sh` to the same numbers
-and partition name, and work up in the same order that was used on LUMI:
-
-```bash
+git clone <this repo> && cd ProjectWorldWide
+./scripts/snellius/setup_venv.sh   # ONCE, from a login node. ~6 GB, a few minutes.
 ./scripts/bootstrap.sh
-./scripts/download_data.sh
+./scripts/download_data.sh         # once, from a login node
+
 source env.sh && pww_run python3 tests/test_local.py    # must be 17/17
 sbatch scripts/snellius/job_smoke.sh                    # must print SMOKE TEST PASSED
 sbatch scripts/snellius/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 sbatch scripts/snellius/job_cifar_multinode.sh
 ```
 
-The smoke test is the important gate: it verifies each rank gets a distinct GPU,
-that all-reduce is numerically correct, and that collective bandwidth is
-plausible. **Single-digit GB/s across nodes means NCCL fell back to TCP** instead
-of InfiniBand -- uncomment `NCCL_SOCKET_IFNAME` in the job script. For reference,
-LUMI measures 123 GB/s within a node and 88 GB/s across two.
+`./scripts/siteinfo.sh` re-derives every machine-specific value in
+`sites/snellius.sh` from the running system, which is how the values there were
+obtained. Run it if Snellius changes underneath you.
 
-Two things likely to need attention that the template cannot solve blind:
+### The environment is a venv, and it is not optional
 
-- **Package coverage.** LUMI's container bundles transformers, tokenizers,
-  datasets and flash-attn. A Snellius PyTorch module may not. If `siteinfo.sh`
-  reports any as MISSING, layer a venv on the module and point `PWW_VENV` at it:
-  `python -m venv --system-site-packages $PWW_SCRATCH/venv`.
-- **Comparing results between sites.** A Snellius node has 4 ranks where LUMI has
-  8, so the same `--batch-size` gives half the global batch and a different scaled
-  LR. Match the *global* batch when comparing, not the per-rank one.
+This is the one real structural difference between the two sites. LUMI has a
+maintained container with the whole AI stack in it. Snellius has no equivalent,
+and its module tree cannot run this code at all:
+
+- the **2023** tree has `PyTorch/2.1.2-foss-2023a-CUDA-12.1.1`, which predates
+  every distributed API this codebase uses -- no
+  `torch.distributed.device_mesh`, no `torch.distributed.checkpoint.state_dict`,
+  no `device_id=` on `init_process_group`, no `device_mesh=` on FSDP. So
+  `parallel.py` and all of `checkpoint.py` fail on import or first call.
+- the **2024** tree's `ai/PyTorch` directory is **empty**.
+- the **2025** tree has no `ai` modules at all.
+
+`scripts/snellius/setup_venv.sh` therefore builds the environment itself: a venv
+on `Python/3.12.3-GCCcore-13.3.0` with torch pinned to **2.7.1**, the same
+version as the LUMI container. That pin is the point -- the two sites running
+different torch generations would undermine the whole comparison. The pip wheels
+bundle their own CUDA runtime, so nothing depends on the EasyBuild CUDA version.
+
+It lives in `$HOME/venvs/pww-snellius` (override with `PWW_VENV`), deliberately
+not on `/scratch-shared`, which is purged on file age -- an environment that
+dissolves after two idle weeks is worse than no environment.
+
+`flash-attn` is the one thing the LUMI container has that this venv does not; it
+has no prebuilt wheel for this combination and compiling it takes upwards of an
+hour. Add it when the LLM phase actually needs it.
+
+### Partitions, cost and queueing
+
+| partition | nodes | GPUs/node | cores | RAM GiB | SBU/GPU-h |
+|---|---|---|---|---|---|
+| `gpu_h100` | 88 | 4x H100 | 64 (4x16) | 720 | 192 |
+| `gpu_a100` | 63 | 4x A100 | 72 (4x18) | 480 | 128 |
+| `gpu_vis` | 63 | 4x A100, 24 h cap | 72 | 480 | 128 |
+| `gpu_mig` | 4 | 8x A100 MIG slice | 72 (8x9) | 480 | 64 |
+
+There is **no partition called `gpu`** -- that name was a guess in the original
+template and jobs using it are rejected at submit time.
+
+The scripts default to `gpu_h100` at 16 cores per rank. For A100, override both
+together, since it has 72 cores rather than 64:
+
+```bash
+sbatch -p gpu_a100 --cpus-per-task=18 scripts/snellius/job_cifar_1node.sh
+```
+
+Both GPU partitions routinely sit at **zero idle nodes**, so expect to queue.
+Jobs asking for **1 hour or less** of walltime are routed to a reserved
+short-job pool and start much sooner -- keep debug runs at or under
+`--time=01:00:00`. H100 also bills 1.5x A100 per GPU-hour, so a run that is not
+H100-bound is cheaper on `gpu_a100`.
+
+### Other things that differ from LUMI
+
+- **No `--mem=0`.** Snellius allocates memory in proportion to the GPUs
+  requested (180 GiB per H100, 120 GiB per A100). Asking for all node memory is
+  neither necessary nor accepted the way it is on LUMI.
+- **CPU binding is simpler.** Both node types are 4 sockets with one GPU on
+  each, so `--cpus-per-task=<cores per socket>` plus `--distribution=block:block`
+  and `--cpu-bind=cores` gets the NUMA-correct placement. No hand-written mask,
+  unlike LUMI where the GCD-to-core map is not something SLURM can infer.
+- **`/scratch-shared` is purged at ~14 days** on file age. Fine for CIFAR and
+  for run output you will read this week; point `PWW_SCRATCH` at a `/projects`
+  space for anything you intend to keep.
+- **Comparing results between sites.** A Snellius node has 4 ranks where LUMI
+  has 8, so the same `--batch-size` gives half the global batch and a different
+  scaled LR. Match the *global* batch when comparing, not the per-rank one.
+
+The smoke test is the gate: it verifies each rank gets a distinct GPU, that
+all-reduce is numerically correct, and that collective bandwidth is plausible.
+**Single-digit GB/s across nodes means NCCL fell back to TCP** instead of
+InfiniBand -- uncomment `NCCL_SOCKET_IFNAME` in the job script (the interfaces
+here are `ibp*`/`mlx5`, not `ib0`). For reference, LUMI measures 123 GB/s within
+a node and 88 GB/s across two.
 
 ## Extending to LLM training
 
@@ -273,13 +322,29 @@ for l in pathlib.Path('runs/<run>/metrics.jsonl').read_text().splitlines():
 "
 ```
 
-Measured reference point (LUMI, verified): ResNet-18, 30 epochs, one node
-(8 GCDs, global batch 1024, LR 0.8) -> **93.35% eval accuracy** at
-**38,400 img/s**, 1.3 s/epoch, ~76 s wall clock for the whole run.
+Measured reference points, both verified, both ResNet-18 for 30 epochs on one
+node at **the same global batch of 1024 and the same LR of 0.8** -- which is the
+only way the two are comparable, since LUMI reaches 1024 as 8 x 128 and Snellius
+as 4 x 256:
 
-Two caveats on that number. The first epoch reports ~1,500 img/s rather than
-38,000 because MIOpen is autotuning kernels for the shapes it has not seen
-before; it is cached afterwards. And 93.35% is below the ~94-95% usually quoted
-for ResNet-18 on CIFAR-10 because those figures assume a much longer schedule at
-a smaller batch -- 30 epochs at a global batch of 1024 is a deliberately short
-run. Raise `epochs` if you want to close that gap.
+| | LUMI (8 GCDs, MI250X) | Snellius (4 GPUs, H100) |
+|---|---|---|
+| eval accuracy | 93.35% | **93.55%** |
+| throughput | 38,400 img/s | **56,184 img/s** |
+| per epoch | 1.3 s | 0.9 s |
+| whole run | ~76 s | ~39 s |
+| first epoch | ~1,500 img/s | 33,918 img/s |
+
+The two accuracies landing within 0.2 points of each other, from the same source
+at the same global batch on entirely different hardware and vendor stacks, is
+the real result here -- it is what says the port is correct rather than merely
+running.
+
+Three caveats. LUMI's first epoch is ~25x slower than its steady state because
+MIOpen autotunes kernels for shapes it has not seen; cuDNN does far less of
+this, so Snellius only loses about a third on epoch one. Snellius run-to-run
+variation of a few tenths of a point is normal, since nothing here is seeded
+across sites. And 93-94% is below the ~94-95% usually quoted for ResNet-18 on
+CIFAR-10 because those figures assume a much longer schedule at a smaller batch
+-- 30 epochs at a global batch of 1024 is a deliberately short run. Raise
+`epochs` if you want to close that gap.

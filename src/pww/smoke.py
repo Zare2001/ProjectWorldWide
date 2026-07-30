@@ -29,9 +29,12 @@ def check_gpu_visibility(info) -> bool:
         return False
 
     # Each rank prints its own line: the fastest way to spot two ranks pinned to
-    # the same GCD, which halves throughput without erroring.
+    # the same device, which halves throughput without erroring. The variable
+    # that does the pinning differs per site (ROCR_ on ROCm, CUDA_ on NVIDIA),
+    # so read its name from the environment rather than assuming either.
+    pin_var = os.environ.get("PWW_GPU_VISIBLE_VAR", "CUDA_VISIBLE_DEVICES")
     print(f"[r{info.rank}] host={info.hostname} "
-          f"ROCR_VISIBLE_DEVICES={os.environ.get('ROCR_VISIBLE_DEVICES', 'unset')} "
+          f"{pin_var}={os.environ.get(pin_var, 'unset')} "
           f"device_count={torch.cuda.device_count()} "
           f"name={torch.cuda.get_device_name(info.device)}", flush=True)
     return True

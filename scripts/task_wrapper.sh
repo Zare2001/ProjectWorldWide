@@ -23,8 +23,20 @@ export LOCAL_WORLD_SIZE="${SLURM_NTASKS_PER_NODE:-1}"
 # (ROCR_VISIBLE_DEVICES on ROCm, CUDA_VISIBLE_DEVICES on NVIDIA). Consequence:
 # inside the process there is only ever device 0, which is why the training code
 # keys off torch.cuda.device_count() rather than LOCAL_RANK.
+#
+# One subtlety, which bites on Snellius rather than LUMI: SLURM may have pinned
+# the task already. With --gpus-per-node the whole node's GPUs are visible to
+# every task and this assignment is what separates them. With --gpus-per-task
+# SLURM hands each task exactly one device, already renumbered to 0 -- and
+# overwriting that with the local id points ranks 1..N-1 at devices that do not
+# exist in their cgroup. So only assign when more than one device is visible.
 if [[ -z "${PWW_NO_GPU_PIN:-}" && -n "${PWW_GPU_VISIBLE_VAR:-}" ]]; then
-    export "${PWW_GPU_VISIBLE_VAR}"="${SLURM_LOCALID}"
+    _pww_visible="${!PWW_GPU_VISIBLE_VAR:-}"
+    _pww_n_visible=$(awk -F, 'NF{print NF}' <<<"${_pww_visible}")
+    if [[ -z "${_pww_visible}" || "${_pww_n_visible:-0}" -gt 1 ]]; then
+        export "${PWW_GPU_VISIBLE_VAR}"="${SLURM_LOCALID}"
+    fi
+    unset _pww_visible _pww_n_visible
 fi
 
 # --- ROCm: MIOpen cache -----------------------------------------------------
