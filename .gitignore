@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+
+# SLURM job output
+logs/
+
+# Symlinks into scratch created by scripts/bootstrap.sh -- the real data and
+# checkpoints live on /scratch and must never be committed.
+/runs
+/data
+
+# Checkpoints / datasets, in case anything lands here directly
+*.sif
+*.pt
+*.safetensors
+*.bin
+*.npy
+*.tar.gz

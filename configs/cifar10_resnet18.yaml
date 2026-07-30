@@ -1,0 +1,28 @@
+# ResNet-18 on CIFAR-10, tuned for one full LUMI-G node (8 GCDs).
+#
+#   sbatch scripts/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
+#
+# Reaches roughly 94-95% eval accuracy. Anything on the command line still wins
+# over what is set here.
+
+model: resnet18
+
+# Per rank. 128 x 8 ranks = 1024 global; train_cifar scales the LR accordingly
+# (0.1 * 1024/128 = 0.8), which is why warmup is not optional here.
+batch-size: 128
+num-workers: 6
+
+epochs: 30
+lr: 0.1
+momentum: 0.9
+weight-decay: 0.0005
+warmup-epochs: 2
+
+parallel: ddp
+# ResNet-18 is 11M params, so fp32 is not memory-bound and bf16 buys little.
+# Worth flipping to bf16 to sanity-check the mixed-precision path before LLMs.
+dtype: fp32
+
+save-every: 10
+log-every: 50
+seed: 42
