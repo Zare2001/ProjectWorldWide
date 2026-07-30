@@ -14,20 +14,52 @@ export PWW_CPUS_PER_TASK=7
 export PWW_ACCELERATOR=rocm
 export PWW_GPU_VISIBLE_VAR=ROCR_VISIBLE_DEVICES
 
-# --- Environment: LUMI-maintained container ---------------------------------
-# Already contains torch 2.7.1+rocm6.2.4, torchvision, transformers, tokenizers,
-# datasets, accelerate, flash-attn and the aws-ofi-rccl plugin. No build needed.
+# --- Environment: container -------------------------------------------------
+# Pick ONE of the two below by leaving exactly one uncommented. Either can also
+# be overridden per job without editing this file at all:
 #
-# Default because it is system-maintained and permanent. For the LLM phase there
-# is a richer alternative (DeepSpeed, apex, Transformer Engine, newer torch);
-# override per job without editing this file:
+#   PWW_CONTAINER=/path/to/other.sif sbatch scripts/lumi/job_smoke.sh
 #
-#   PWW_CONTAINER=/scratch/project_462000226/containers/laif-rocm-6.4.4-pytorch-2.9.1-te-2.4.0-fa-2.8.0-triton-3.2.0.sif \
-#       sbatch scripts/lumi/job_smoke.sh
+# Both were benchmarked head to head on the same jobs and are indistinguishable
+# for CIFAR-scale work:
 #
-# Measured identical on CIFAR and on collective bandwidth -- see README
-# "Container choice" for the benchmark and the caveats before adopting it.
-export PWW_CONTAINER="${PWW_CONTAINER:-/appl/local/containers/sif-images/lumi-pytorch-rocm-6.2.4-python-3.12-pytorch-v2.7.1.sif}"
+#                          official          laif
+#   CIFAR 30ep 8 GCDs      93.35%            93.27%
+#                          38,400 img/s      37,700 img/s
+#   all-reduce 1 node      123 GB/s          123.4 GB/s
+#   all-reduce 2 nodes     88 GB/s           87.8 GB/s
+#   tests/test_local.py    17/17             17/17
+
+# [1] DEFAULT -- LUMI-maintained, under /appl, permanent and system-supported.
+# torch 2.7.1+rocm6.2.4, torchvision, transformers 4.55.3, tokenizers, datasets,
+# accelerate, flash-attn 2.7.3, aws-ofi-rccl. Enough for the CIFAR phase and for
+# plain FSDP LLM training. Prefer this unless you specifically need [2].
+PWW_CONTAINER_DEFAULT=/appl/local/containers/sif-images/lumi-pytorch-rocm-6.2.4-python-3.12-pytorch-v2.7.1.sif
+
+# [2] LLM-phase alternative -- torch 2.9.1+rocm6.4.4, transformers 4.57.3,
+# flash-attn 2.8.0, Transformer Engine 2.4.0, DeepSpeed 0.18.6, apex, triton 3.2.
+# Verified on GPU here: FlashAttention forward, te.Linear (fp32/bf16/fp16),
+# apex FusedAdam. Uncomment to use, and comment out [1] above.
+#
+# Worth switching for: DeepSpeed as a ZeRO alternative to FSDP, apex FusedAdam,
+# newer FlashAttention. NOT worth switching for CIFAR -- see the table above.
+#
+# Three caveats, all verified on this hardware rather than assumed:
+#   * fp8 does NOT work on LUMI. TE asserts "Device arch gfx94x or gfx95x
+#     required"; MI250X is gfx90a. fp8 needs MI300X or newer -- bf16 is the
+#     ceiling here, so do not adopt this image expecting fp8 speedups.
+#   * Do not wrap TE layers in torch.autocast on gfx90a: te.Linear then fails
+#     with "Unable to find any suitable algorithms". Set layer dtypes explicitly.
+#   * It lives on purgeable scratch and is owned by another user, so it can
+#     vanish and break every job referencing it. Copy it into your own space
+#     before relying on it (13.5 GB against a 50 TB quota).
+#PWW_CONTAINER_DEFAULT=/scratch/project_462000226/containers/laif-rocm-6.4.4-pytorch-2.9.1-te-2.4.0-fa-2.8.0-triton-3.2.0.sif
+
+# A plain assignment above rather than the ${VAR:-...} form on purpose: if you
+# uncomment [2] and forget to comment out [1], the later line simply wins, which
+# is what you meant. With ${VAR:-...} on both, [1] would silently win instead.
+# The environment still overrides either, so per-job selection keeps working.
+export PWW_CONTAINER="${PWW_CONTAINER:-${PWW_CONTAINER_DEFAULT}}"
 
 # Bindings for Slingshot (RCCL/libfabric) + Lustre visibility. Mirrors
 # `module load singularity-AI-bindings`, inlined so jobs need no Lmod.
