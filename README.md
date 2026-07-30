@@ -205,6 +205,22 @@ sbatch scripts/snellius/job_cifar_multinode.sh
 `sites/snellius.sh` from the running system, which is how the values there were
 obtained. Run it if Snellius changes underneath you.
 
+Verified on Snellius, all on `gpu_h100`:
+
+| check | result |
+|---|---|
+| `tests/test_local.py` | 17/17 |
+| `job_cifar_debug.sh` (1 GPU) | passes in 21 s |
+| `job_smoke.sh` (1 node, 4 GPUs) | passes, 300.8 GB/s all-reduce |
+| `job_smoke.sh --nodes=2` (8 GPUs) | passes, 133.1 GB/s all-reduce over InfiniBand |
+| `job_cifar_1node.sh` (DDP, fp32) | 93.55% eval acc, 56,184 img/s |
+| `--parallel fsdp --dtype bf16` | trains and checkpoints, 62,672 img/s |
+
+The FSDP row is the one that matters for the LLM phase: it exercises
+`init_device_mesh`, `FSDP(device_mesh=)` and
+`torch.distributed.checkpoint.state_dict` -- three of the four APIs the
+Snellius PyTorch module is missing, and the reason the venv exists.
+
 ### The environment is a venv, and it is not optional
 
 This is the one real structural difference between the two sites. LUMI has a
@@ -304,10 +320,17 @@ Two consequences worth internalising:
 
 The smoke test is the gate: it verifies each rank gets a distinct GPU, that
 all-reduce is numerically correct, and that collective bandwidth is plausible.
+Measured, 256 MiB all-reduce:
+
+| | LUMI | Snellius (H100) |
+|---|---|---|
+| within a node | 123 GB/s | **300.8 GB/s** |
+| across two nodes | 88 GB/s | **133.1 GB/s** |
+
 **Single-digit GB/s across nodes means NCCL fell back to TCP** instead of
 InfiniBand -- uncomment `NCCL_SOCKET_IFNAME` in the job script (the interfaces
-here are `ibp*`/`mlx5`, not `ib0`). For reference, LUMI measures 123 GB/s within
-a node and 88 GB/s across two.
+here are `ibp*`/`mlx5`, not `ib0`). That did not happen on either measurement
+above: NCCL found InfiniBand unaided, so the variable stays commented out.
 
 ## Extending to LLM training
 
