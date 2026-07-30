@@ -93,6 +93,51 @@ for both phases:
 in login shells, batch scripts and containers. It inlines the one variable that
 `singularity-AI-bindings` sets; if LUMI changes those bindings, update it there.
 
+### Container choice
+
+Override per job rather than editing the site file:
+
+```bash
+PWW_CONTAINER=/path/to/other.sif sbatch scripts/lumi/job_smoke.sh
+```
+
+A richer image exists on project scratch:
+`laif-rocm-6.4.4-pytorch-2.9.1-te-2.4.0-fa-2.8.0-triton-3.2.0.sif`. Both were
+benchmarked head to head on the same jobs:
+
+| | LUMI official (default) | laif |
+|---|---|---|
+| torch / ROCm | 2.7.1 / 6.2.4 | 2.9.1 / 6.4.4 |
+| CIFAR-10, 30 ep, 8 GCDs | 93.35% @ 38,400 img/s | 93.27% @ 37,700 img/s |
+| all-reduce, 1 node | 123 GB/s | 123.4 GB/s |
+| all-reduce, 2 nodes | 88 GB/s | 87.8 GB/s |
+| `tests/test_local.py` | 17/17 | 17/17 |
+| flash-attn | 2.7.3 | 2.8.0 |
+| transformers | 4.55.3 | 4.57.3 |
+| Transformer Engine | -- | 2.4.0 |
+| DeepSpeed / apex | -- | 0.18.6 / yes |
+
+**For the CIFAR phase there is no reason to switch** -- performance is identical
+within noise. For LLM work the extra packages are worth having: DeepSpeed as a
+ZeRO alternative to FSDP, apex `FusedAdam`, newer FlashAttention.
+
+Three things to know before adopting it:
+
+1. **fp8 does not work on LUMI, at all.** Transformer Engine's fp8 path asserts
+   `Device arch gfx94x or gfx95x required`; MI250X is gfx90a. fp8 needs MI300X or
+   newer. If fp8 is why you want TE, it will not pay off here -- use bf16.
+2. **TE layers must not be wrapped in `torch.autocast`.** `te.Linear` under
+   autocast fails with `Unable to find any suitable algorithms` on gfx90a. With
+   explicit dtypes (fp32/bf16/fp16) it works. Set the layer dtype directly.
+3. **It lives on scratch and is owned by another user.** LUMI scratch is purged
+   after inactivity, and the file could be moved or deleted at any time, breaking
+   every job that references it. The default container is under `/appl` and is
+   system-maintained. If you adopt the laif image for real work, copy it into
+   your own space first (13.5 GB against a 50 TB quota).
+
+Verified working on GPU in the laif image: FlashAttention 2.8.0 forward,
+`te.Linear` in fp32/bf16/fp16, apex `FusedAdam`.
+
 ## Things that are easy to get wrong here
 
 **One node = 8 ranks, not 4.** A LUMI-G node has 4 MI250X cards, but each is two

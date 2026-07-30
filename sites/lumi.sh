@@ -17,6 +17,16 @@ export PWW_GPU_VISIBLE_VAR=ROCR_VISIBLE_DEVICES
 # --- Environment: LUMI-maintained container ---------------------------------
 # Already contains torch 2.7.1+rocm6.2.4, torchvision, transformers, tokenizers,
 # datasets, accelerate, flash-attn and the aws-ofi-rccl plugin. No build needed.
+#
+# Default because it is system-maintained and permanent. For the LLM phase there
+# is a richer alternative (DeepSpeed, apex, Transformer Engine, newer torch);
+# override per job without editing this file:
+#
+#   PWW_CONTAINER=/scratch/project_462000226/containers/laif-rocm-6.4.4-pytorch-2.9.1-te-2.4.0-fa-2.8.0-triton-3.2.0.sif \
+#       sbatch scripts/lumi/job_smoke.sh
+#
+# Measured identical on CIFAR and on collective bandwidth -- see README
+# "Container choice" for the benchmark and the caveats before adopting it.
 export PWW_CONTAINER="${PWW_CONTAINER:-/appl/local/containers/sif-images/lumi-pytorch-rocm-6.2.4-python-3.12-pytorch-v2.7.1.sif}"
 
 # Bindings for Slingshot (RCCL/libfabric) + Lustre visibility. Mirrors

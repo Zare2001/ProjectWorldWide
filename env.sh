@@ -59,6 +59,14 @@ export PWW_CACHE_DIR="${PWW_CACHE_DIR:-${PWW_SCRATCH}/cache}"
 
 export PYTHONPATH="${PWW_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Some containers set PYTHONPATH in their own /.singularity.d/env scripts, which
+# then wins over the host value and makes `pww` unimportable inside the job.
+# SINGULARITYENV_/APPTAINERENV_ are applied with higher precedence, so set both.
+# Safe even when the container ships a venv: a venv resolves its own
+# site-packages from sys.prefix, not from PYTHONPATH.
+export SINGULARITYENV_PYTHONPATH="${PYTHONPATH}"
+export APPTAINERENV_PYTHONPATH="${PYTHONPATH}"
+
 # Keep framework caches off small, inode-limited home directories.
 export HF_HOME="${PWW_CACHE_DIR}/huggingface"
 export TORCH_HOME="${PWW_CACHE_DIR}/torch"
