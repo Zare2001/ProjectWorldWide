@@ -34,7 +34,8 @@ scripts/
   download_data.sh        pre-fetch datasets -- LOGIN NODE ONLY
   task_wrapper.sh         per-rank entrypoint, site-agnostic
   lumi/                   job_smoke, job_cifar_debug, job_cifar_1node, job_cifar_multinode
-  snellius/               setup_venv.sh (run first), job_smoke, job_cifar_1node, job_cifar_multinode
+  snellius/               setup_venv.sh (run first), job_smoke, job_cifar_debug,
+                          job_cifar_1node, job_cifar_multinode
 src/pww/
   distributed.py          process group, GPU pinning, collective reductions
   parallel.py             DDP / FSDP wrapping, mixed precision, act. checkpointing
@@ -256,6 +257,34 @@ Jobs asking for **1 hour or less** of walltime are routed to a reserved
 short-job pool and start much sooner -- keep debug runs at or under
 `--time=01:00:00`. H100 also bills 1.5x A100 per GPU-hour, so a run that is not
 H100-bound is cheaper on `gpu_a100`.
+
+**The lever that decides your queue time is GPUs per job, not cores.** A
+single-node job may take a fraction of a node, and the smallest unit is 1 GPU +
+16 cores + 180 GiB. That fraction is nearly always free even when the cluster is
+fully allocated -- measured on a completely full `gpu_h100`:
+
+| job shape | nodes that could start it immediately |
+|---|---|
+| 1 GPU + 16 cores | 23 of 88 |
+| 2 GPUs + 32 cores | 6 of 88 |
+| 4 GPUs + 64 cores | **0 of 88** |
+
+So `scripts/snellius/job_cifar_debug.sh` (1 GPU) starts in seconds while a
+full-node job waits over an hour. Use it for "does this change run at all".
+
+Two consequences worth internalising:
+
+- **Trimming `--cpus-per-task` on a 4-GPU job saves nothing.** Billing is
+  `max(cpu, gpu, mem)` fraction, and 4 of 4 GPUs is already the whole node. You
+  would leave cores idle on a node you have fully paid for, and starve the
+  dataloader for no gain. The 64 cores come with the 4 GPUs; they are not
+  separately priced.
+- **There is no cheap multi-node run.** Snellius rejects a multi-node GPU job
+  that asks for fewer than all 4 GPUs per node:
+  *"You've requested less than the maximum amount of GPUs for your multi-node
+  job. If that's intentional, use `--exclusive`. You will be charged for all
+  GPUs, including the ones that you don't use."*
+  Multi-node means whole nodes, and `--exclusive` bills you for them anyway.
 
 ### Other things that differ from LUMI
 
