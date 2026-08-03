@@ -33,12 +33,14 @@ scripts/
   siteinfo.sh             report a machine's topology/partitions/modules
   download_data.sh        pre-fetch datasets -- LOGIN NODE ONLY
   task_wrapper.sh         per-rank entrypoint, site-agnostic
-  lumi/                   job_smoke, job_cifar_debug, job_cifar_1node, job_cifar_multinode
+  lumi/                   job_smoke, job_cifar_debug, job_cifar_1node,
+                          job_cifar_multinode, job_cifar_diloco
   snellius/               setup_venv.sh (run first), job_smoke, job_cifar_debug,
-                          job_cifar_1node, job_cifar_multinode
+                          job_cifar_1node, job_cifar_multinode, job_cifar_diloco
 src/pww/
   distributed.py          process group, GPU pinning, collective reductions
   parallel.py             DDP / FSDP wrapping, mixed precision, act. checkpointing
+  diloco.py               DiLoCo: replica layout, outer optimizer, outer step
   checkpoint.py           consolidated + sharded save/load, atomic writes
   config.py               YAML-under-argparse, seeding, run dirs
   logging_utils.py        rank-aware logging, JSONL metrics
@@ -46,7 +48,9 @@ src/pww/
   models/resnet.py        ResNet-18/34/50, CIFAR stem
   data/cifar.py           CIFAR-10 loaders with DistributedSampler
   train_cifar.py          training entrypoint
-tests/test_local.py       CPU-only tests, no allocation needed
+tests/
+  test_local.py           CPU-only, single process, no allocation needed
+  test_diloco_gloo.py     CPU-only, multi-process gloo -- DiLoCo collectives
 ```
 
 Code lives in `$HOME`; data, checkpoints and logs live on scratch, symlinked as
@@ -67,12 +71,15 @@ cd ~/ProjectWorldWide
 
 # validate before spending GPU hours
 source env.sh && pww_run python3 tests/test_local.py
+source env.sh && pww_run python3 tests/test_diloco_gloo.py
 sbatch scripts/lumi/job_smoke.sh
+sbatch scripts/lumi/job_smoke.sh --diloco-replicas 2
 
 # train
 sbatch scripts/lumi/job_cifar_debug.sh                                     # 1 GCD, ~2 min
 sbatch scripts/lumi/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 sbatch --nodes=4 scripts/lumi/job_cifar_multinode.sh
+sbatch scripts/lumi/job_cifar_diloco.sh                                    # 2 replicas
 ```
 
 Job logs land in `logs/<jobname>-<jobid>.out`. Per-run outputs (config snapshot,
@@ -119,7 +126,7 @@ benchmarked head to head on the same jobs:
 | CIFAR-10, 30 ep, 8 GCDs | 93.35% @ 38,400 img/s | 93.27% @ 37,700 img/s |
 | all-reduce, 1 node | 123 GB/s | 123.4 GB/s |
 | all-reduce, 2 nodes | 88 GB/s | 87.8 GB/s |
-| `tests/test_local.py` | 17/17 | 17/17 |
+| `tests/test_local.py` (17 checks then, 27 now) | all pass | all pass |
 | flash-attn | 2.7.3 | 2.8.0 |
 | transformers | 4.55.3 | 4.57.3 |
 | Transformer Engine | -- | 2.4.0 |
@@ -145,6 +152,141 @@ Three things to know before adopting it:
 
 Verified working on GPU in the laif image: FlashAttention 2.8.0 forward,
 `te.Linear` in fp32/bf16/fp16, apex `FusedAdam`.
+
+## DiLoCo
+
+Plain data parallelism all-reduces gradients on every step, so it needs a fat,
+low-latency link between every pair of ranks. [DiLoCo](https://arxiv.org/abs/2311.08105)
+replaces that with two nested loops, cutting inter-replica traffic by a factor
+of `H`:
+
+| paper | here | what it is |
+|---|---|---|
+| `k` | `--diloco-replicas` | model replicas, each on its own data shard |
+| `H` | `--diloco-inner-steps` | inner steps between exchanges |
+| `T` | derived | outer steps = total inner steps / `H` |
+| `InnerOpt` | `--inner-optimizer` | AdamW in the paper; SGD+Nesterov for ResNet |
+| `OuterOpt` | `--diloco-outer-optimizer` | Nesterov momentum, `lr` 0.7, `momentum` 0.9 |
+| Δ⁽ᵗ⁾ | logged as `delta_norm` | `mean_i(θ⁽ᵗ⁻¹⁾ − θᵢ⁽ᵗ⁾)`, averaged then fed to `OuterOpt` |
+
+Set `--diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0`
+and the outer step collapses to `θ⁽ᵗ⁾ = mean_i θᵢ⁽ᵗ⁾`, i.e. FederatedAveraging.
+That identity is what the test suite checks against.
+
+### Rank layout
+
+One allocation is carved into `k` contiguous equal blocks, so `k` must divide the
+rank count — 1, 2, 4 or 8 on a LUMI node, 1, 2 or 4 on a Snellius node. With
+`k=2` on one LUMI node:
+
+```
+replica 0 = ranks 0-3        replica 1 = ranks 4-7
+     inner group, DDP every step   inner group, DDP every step
+            \____________  outer groups  ____________/
+              {0,4} {1,5} {2,6} {3,7}  --  every H steps
+```
+
+Contiguous on purpose: SLURM numbers ranks node by node, so a replica stays
+inside as few nodes as possible and the chatty inner all-reduce keeps the fast
+local links. Every rank runs the outer step redundantly rather than electing a
+leader per replica — DDP already makes the ranks of a replica bit-identical, so
+pairing rank *j* of each replica with rank *j* of the others turns one `k`-way
+exchange into four parallel `k`-way exchanges and leaves every rank already
+holding `θ⁽ᵗ⁾` with no follow-up broadcast. The same layout is what makes FSDP
+work: rank *j* holds shard *j*, and exchanges with the ranks holding shard *j*
+elsewhere.
+
+The layout DiLoCo is actually *for* is one replica per node, which removes
+inter-node traffic except once every `H` steps:
+
+```bash
+sbatch --nodes=4 -p standard-g scripts/lumi/job_cifar_diloco.sh \
+    --diloco-replicas 4 --diloco-inner-steps 100
+```
+
+### Choosing k and H, and reading the result
+
+`H` is the whole trade. Watch `agreement` in `metrics.jsonl` — the norm of the
+averaged Δ over the norm of this replica's own Δ:
+
+- **near 1.0** — replicas still travelled in the same direction; `H` is safe and
+  you could probably raise it.
+- **near 1/√k** — replicas travelled in mutually orthogonal directions, so
+  averaging is cancelling most of their progress. `H` is too large for this
+  model and LR, and accuracy will suffer.
+
+Because a step only synchronises within a replica, **the LR is scaled to the
+replica batch, not the world batch**. `--batch-size 128` with `k=2` on 8 GCDs
+gives a replica batch of 512 and LR 0.4, where plain DDP on the same node gives
+1024 and 0.8. That is deliberate — each replica *is* a 4-rank data-parallel job —
+but it means a DiLoCo run and a DDP run at the same `--batch-size` are not the
+same experiment.
+
+Evaluation and checkpoints report `θ`, not whichever replica rank 0 happens to
+hold (`DiLoCo.global_model()`). Mid-inner-phase the replicas genuinely differ, so
+a world-reduced metric on local weights would be an average over `k` different
+models; `θ` is identical on every rank and lags by at most `H` steps. The final
+partial inner phase is flushed before the last eval, so the last checkpoint is
+the model you trained.
+
+One asymmetry to know about: the checkpoint pairs `θ` with the *inner* optimizer
+state of whichever rank wrote it, because inner optimizer state is per replica by
+construction and there is no meaningful average of it. Resuming therefore restarts
+each replica from `θ` carrying replica 0's inner momentum. The outer momentum,
+which *is* shared, is restored exactly (`runs/<run>/diloco/outer_r0.pt`).
+
+Memory cost is three extra fp32 copies of the parameters — `θ`, the outer
+momentum, and one flat communication buffer. Under FSDP all three are sharded
+with the model. `--diloco-outer-device cpu` moves two of them to host memory in
+exchange for two host↔device copies every `H` steps.
+
+### One measured warning: `T` matters as much as `H`
+
+A deliberately tiny CPU run (4 gloo ranks, 3 epochs x 40 steps, per-rank batch 32,
+so 120 inner steps and only **T=6 outer steps**), everything identical except the
+outer optimizer:
+
+| outer optimizer | eval acc, epochs 1/2/3 | final eval loss |
+|---|---|---|
+| *(none — plain DDP over all 4 ranks)* | 12.3 / 30.2 / **35.9** | 1.84 |
+| `sgd`, lr 1.0, momentum 0 (FederatedAveraging) | 16.4 / 33.7 / **39.1** | 1.77 |
+| `nesterov`, lr 0.7, momentum 0.9 (paper defaults, shipped) | 10.0 / 10.5 / **24.6** | 3.67 |
+
+FederatedAveraging tracked plain DDP; the paper's Nesterov defaults were much
+worse, with a first-epoch eval loss of 290. Two things plausibly contribute, and
+this run does not separate them: the outer step overshoots each replica's own
+progress by `1 + momentum` = 1.9x, and BatchNorm running statistics were collected
+at the replicas' weights rather than at the extrapolated `θ`, so eval uses
+mismatched statistics (train accuracy stayed close to DDP throughout — 33.7 vs
+31.1 — while eval collapsed).
+
+**Do not read this as a verdict on the paper's defaults.** `T=6` is far outside
+the regime they were tuned in: outer momentum of 0.9 needs tens to hundreds of
+outer steps to be worth having, and the paper's models use LayerNorm, which has no
+running statistics to mismatch. The actionable rule is that **`H` should be chosen
+so that `T` reaches at least the tens**, and if you are running DiLoCo on a
+BatchNorm model with few outer steps, compare against
+`--diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0`
+before trusting the defaults.
+
+### What is verified
+
+| | |
+|---|---|
+| outer-step arithmetic, layout, state round-trip | `tests/test_local.py`, 27 checks, single process |
+| group membership, cross-replica averaging, `θ(0)` alignment, DDP-in-replica reconvergence | `tests/test_diloco_gloo.py`, real process groups over gloo on CPU |
+| the same on GPU with RCCL/NCCL, plus outer-vs-inner step cost | `sbatch scripts/lumi/job_smoke.sh --diloco-replicas 2` |
+| it trains, and roughly tracks DDP | yes, but only on a 120-step CPU toy run — see the warning above |
+| **convergence at scale** | **not yet measured** — run `job_cifar_diloco.sh` against the 93.35% DDP reference below |
+| DiLoCo + FSDP | code path exists (`--parallel fsdp`) and is sharding-aware, but **untested**; CIFAR is too small to shard meaningfully |
+
+Note also that `k` replicas are only usefully *independent* while they share one
+Slurm allocation here. Running one replica per cluster across LUMI and Snellius
+would need an outer-gradient transport that does not exist yet: there is no
+shared filesystem between the two sites and compute nodes reach the outside world
+only through a slow proxy, so it would need a staging host both sides can reach.
+`diloco.py` is structured so that only the two `dist.all_reduce` calls in
+`outer_step` would have to change.
 
 ## Things that are easy to get wrong here
 
@@ -186,6 +328,18 @@ on partial-node debug runs -- use a full node for anything you intend to measure
 
 **bf16, not fp16.** MI250X does bf16 natively and it has fp32's dynamic range, so
 no loss scaler is needed.
+
+**DiLoCo: every rank must reach the outer step the same number of times.** The
+outer step is a collective, triggered by a per-rank counter. `drop_last=True` on
+the training sampler is therefore load-bearing: a ragged final batch makes ranks
+disagree on the step count and the job hangs in the all-reduce rather than
+failing. The same applies to any `continue`/`break` added to the inner loop.
+
+**DiLoCo: `k` replicas must start from one `θ(0)`.** `set_seed` offsets the seed
+by rank, so each rank builds a *different* random model, and replica-scoped DDP
+only equalises within a replica. `DiLoCo.__init__` broadcasts `θ(0)` for exactly
+this reason. Averaging deltas between models that were never the same model
+trains to nothing while looking perfectly healthy.
 
 ## Running on Snellius
 
@@ -332,6 +486,18 @@ InfiniBand -- uncomment `NCCL_SOCKET_IFNAME` in the job script (the interfaces
 here are `ibp*`/`mlx5`, not `ib0`). That did not happen on either measurement
 above: NCCL found InfiniBand unaided, so the variable stays commented out.
 
+### Comparing a Snellius run against a LUMI one
+
+A Snellius node has 4 ranks where LUMI has 8, so the same `--batch-size` gives
+half the global batch and a different scaled LR. Match the *global* batch, not the
+per-rank one.
+
+Under DiLoCo match the *replica* batch and `k` separately, because the LR is
+scaled to the replica: `k=2` gives 2 ranks per replica here against 4 on LUMI, so
+`--batch-size` has to double to keep the replica batch equal. `k` must also divide
+the rank count, so a 4-GPU node allows `k` of 1, 2 or 4 — `k=8` is a LUMI-only
+layout.
+
 ## Extending to LLM training
 
 The intent is that `train_cifar.py` is the only file replaced. What carries over
@@ -341,6 +507,12 @@ unchanged:
 - `parallel.py` -- `wrap_model(..., strategy="fsdp", transformer_layer_cls={YourDecoderLayer}, activation_checkpointing=True)`
 - `checkpoint.py` -- switch to `--sharded-checkpoint`; it resumes onto a
   different world size, which matters when a run is requeued at a different scale
+- `diloco.py` -- nothing in it knows what is being trained. The `--diloco-*`
+  flags live in `config.add_common_args`, so a new entrypoint gets them by
+  calling `build_replicas` / `DiLoCo` and `diloco.inner_step()` after
+  `optimizer.step()`. This is where DiLoCo starts paying off: `H` in the hundreds
+  is a rounding error against an LLM step, and `--inner-optimizer adamw` matches
+  the paper
 - `config.py`, `logging_utils.py`, all `scripts/` and `env.sh`
 
 What needs writing:
@@ -373,6 +545,12 @@ for l in pathlib.Path('runs/<run>/metrics.jsonl').read_text().splitlines():
     if r['split'] == 'eval': print(r['epoch'], round(r['acc'], 2))
 "
 ```
+
+A DiLoCo run adds `split == "diloco"` rows, one per outer step, carrying
+`outer_step`, `delta_norm`, `avg_delta_norm` and `agreement`. Plot `agreement`
+first — it is the one number that tells you whether `H` was chosen sensibly. Note
+that `eval` rows repeat between outer steps, because they measure `θ`, which only
+moves when an outer step happens.
 
 Measured reference points, both verified, both ResNet-18 for 30 epochs on one
 node at **the same global batch of 1024 and the same LR of 0.8** -- which is the

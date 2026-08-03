@@ -13,6 +13,7 @@
 # Validate the distributed stack on one Snellius GPU node.
 #
 #   sbatch scripts/snellius/job_smoke.sh
+#   sbatch scripts/snellius/job_smoke.sh --diloco-replicas 2   # also check DiLoCo
 #
 # On gpu_a100 instead (72 cores rather than 64, so 18 per rank):
 #
@@ -47,4 +48,4 @@ export MASTER_PORT=29500
 srun --cpu-bind="$(pww_cpu_bind)" \
     "${PWW_LAUNCH[@]}" \
         "${PWW_ROOT}/scripts/task_wrapper.sh" \
-            python3 -m pww.smoke
+            python3 -m pww.smoke "$@"

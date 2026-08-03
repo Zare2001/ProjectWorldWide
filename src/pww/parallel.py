@@ -65,12 +65,18 @@ def wrap_model(
     dtype: str = "fp32",
     transformer_layer_cls: Iterable[type[nn.Module]] | None = None,
     activation_checkpointing: bool = False,
+    process_group=None,
 ) -> nn.Module:
     """Move `model` to `device` and apply the requested parallelism strategy.
 
     transformer_layer_cls tells FSDP which module type to treat as a shard unit.
     Omitting it for a large transformer means the whole model becomes one flat
     shard, which defeats the point -- so pass e.g. {LlamaDecoderLayer}.
+
+    process_group restricts gradient all-reduce (DDP) or sharding (FSDP) to a
+    subset of ranks. Default None means the whole world, which is what plain data
+    parallelism wants; DiLoCo passes a replica-scoped group so that the ranks of
+    one replica synchronise every step while replicas only meet every H steps.
     """
     log = get_logger()
     if strategy not in STRATEGIES:
@@ -87,10 +93,15 @@ def wrap_model(
     if strategy == "ddp":
         model = model.to(device)
         device_ids = [device.index] if device.type == "cuda" else None
-        return DDP(model, device_ids=device_ids, gradient_as_bucket_view=True)
+        return DDP(model, device_ids=device_ids, process_group=process_group,
+                   gradient_as_bucket_view=True)
 
     # --- FSDP ---------------------------------------------------------------
-    mesh = build_mesh(device.type, dist.get_world_size())
+    # device_mesh and process_group are mutually exclusive in FSDP, so a
+    # replica-scoped run shards over the group and skips the mesh. The mesh is
+    # kept for the default path because it is the seam for adding a second
+    # (tensor-parallel) dimension later.
+    mesh = None if process_group is not None else build_mesh(device.type, dist.get_world_size())
 
     auto_wrap_policy = None
     if transformer_layer_cls:
@@ -111,6 +122,7 @@ def wrap_model(
     fsdp_model = FSDP(
         model,
         device_mesh=mesh,
+        process_group=process_group,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision=mixed_precision,
@@ -154,17 +166,19 @@ def _apply_activation_checkpointing(model: nn.Module, layer_cls) -> None:
     )
 
 
-def count_parameters(model: nn.Module) -> tuple[int, int]:
+def count_parameters(model: nn.Module, group=None) -> tuple[int, int]:
     """(total, trainable) parameter counts.
 
     Under FSDP each rank only holds a shard, so this is summed across ranks to
-    report the true model size.
+    report the true model size. `group` must be the group the model is sharded
+    over: reducing over the whole world under DiLoCo would report k times the
+    real model size, once per replica.
     """
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if isinstance(model, FSDP) and dist.is_initialized():
         counts = torch.tensor([total, trainable], dtype=torch.float64,
                               device=next(model.parameters()).device)
-        dist.all_reduce(counts)
+        dist.all_reduce(counts, group=group)
         total, trainable = int(counts[0].item()), int(counts[1].item())
     return total, trainable

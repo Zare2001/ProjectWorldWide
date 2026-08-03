@@ -1,0 +1,59 @@
+# ResNet-18 on CIFAR-10 with DiLoCo. Site-independent: k is expressed in
+# replicas, not ranks, so the same file works on LUMI's 8 GCDs and Snellius's
+# 4 GPUs -- only how many ranks land inside each replica changes.
+#
+#   sbatch scripts/lumi/job_cifar_diloco.sh
+#   sbatch scripts/snellius/job_cifar_diloco.sh
+#
+# Anything on the command line still wins over what is set here.
+
+model: resnet18
+
+# Per rank. Note that under DiLoCo the LR is scaled to the *replica* batch, not
+# the world batch, because a step only synchronises inside one replica.
+batch-size: 128
+num-workers: 6
+
+epochs: 30
+lr: 0.1
+momentum: 0.9
+weight-decay: 0.0005
+warmup-epochs: 2
+
+# InnerOpt. The paper uses AdamW, which is right for transformers; SGD+Nesterov
+# is what actually works for ResNet/CIFAR, so keep it here and switch to adamw
+# for the LLM phase.
+inner-optimizer: sgd
+
+parallel: ddp
+dtype: fp32
+
+# --- DiLoCo ---------------------------------------------------------------
+# k=2: two replicas. Must divide the rank count -- 8 GCDs on LUMI allow
+# 1,2,4,8; 4 GPUs on Snellius allow 1,2,4.
+diloco-replicas: 2
+
+# H. The paper uses several hundred, but a CIFAR-10 epoch at this batch size is
+# only ~390/k steps, so H=100 already means roughly one exchange per epoch per
+# replica. Larger H here mostly measures how far replicas can drift before
+# averaging stops helping -- watch the "agreement" number in metrics.jsonl:
+# near 1.0 means the replicas still agree, near 1/sqrt(k) means averaging is
+# cancelling most of their progress and H is too large.
+#
+# Also check the other end: H must be small enough that T = total_steps / H
+# reaches at least the tens, or the outer momentum below never gets going and
+# only its 1.9x overshoot is felt. At 30 epochs x ~195 steps (k=2) this gives
+# T~58, which is enough. Lower `epochs` and you should lower H with it.
+diloco-inner-steps: 100
+
+# OuterOpt. Nesterov momentum at these values is the paper's choice, and is right
+# once T is large. On a short run, or on a BatchNorm model, compare against
+# FederatedAveraging first -- see the measured warning in the README:
+#   --diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0
+diloco-outer-optimizer: nesterov
+diloco-outer-lr: 0.7
+diloco-outer-momentum: 0.9
+
+save-every: 10
+log-every: 50
+seed: 42

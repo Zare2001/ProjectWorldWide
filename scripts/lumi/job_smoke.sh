@@ -15,6 +15,11 @@
 # change, before spending GPU hours on real training.
 #
 #   sbatch scripts/job_smoke.sh
+#   sbatch scripts/lumi/job_smoke.sh --diloco-replicas 2   # also check DiLoCo
+#
+# With --diloco-replicas k it additionally verifies the DiLoCo group layout and
+# one outer step against an exact answer, and reports what an outer step costs
+# relative to an inner one. Run that before the first real DiLoCo job.
 #
 # --mem=0 requests all memory on the node; the default per-node share is far too
 # small for 8 dataloader-heavy ranks.
@@ -38,4 +43,4 @@ export MASTER_PORT=29500
 srun --cpu-bind="$(pww_cpu_bind)" \
     "${PWW_LAUNCH[@]}" \
         "${PWW_ROOT}/scripts/task_wrapper.sh" \
-            python3 -m pww.smoke
+            python3 -m pww.smoke "$@"

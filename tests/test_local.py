@@ -1,8 +1,9 @@
 """CPU-only tests -- runnable on a login node, no allocation needed.
 
 Covers the logic that is painful to debug inside a queued job: model shapes,
-checkpoint round-trips, config layering, LR schedule. Anything that needs real
-collectives belongs in pww.smoke instead.
+checkpoint round-trips, config layering, LR schedule, and DiLoCo's outer-step
+arithmetic. Anything that needs real collectives belongs in
+tests/test_diloco_gloo.py (still CPU-only) or pww.smoke (needs GPUs).
 
     singularity exec $PWW_CONTAINER python3 tests/test_local.py
 """
@@ -278,6 +279,244 @@ def _():
         for k in keys:
             assert k in stats, f"missing {k}"
         assert stats["loss"] > 0 and 0 <= stats["acc"] <= 100, stats
+
+
+# --- DiLoCo -----------------------------------------------------------------
+# Single-process, so the outer step reduces over one replica. That is enough to
+# pin down every part of the algorithm except the collectives themselves, which
+# tests/test_diloco_gloo.py covers with real process groups.
+
+
+def _tiny_model(value: float = 0.0) -> torch.nn.Module:
+    model = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.BatchNorm1d(3))
+    with torch.no_grad():
+        for p in model.parameters():
+            p.fill_(value)
+    return model
+
+
+@check("replica layout splits the world into contiguous equal blocks")
+def _():
+    from pww.diloco import build_replicas
+
+    r = build_replicas(4, rank=6, world_size=16)
+    assert (r.num_replicas, r.ranks_per_replica) == (4, 4), r
+    assert (r.replica_id, r.rank_in_replica) == (1, 2), r
+    assert not r.is_replica_master
+
+    for rank, want in ((0, (0, 0)), (3, (0, 3)), (4, (1, 0)), (15, (3, 3))):
+        r = build_replicas(4, rank=rank, world_size=16)
+        assert (r.replica_id, r.rank_in_replica) == want, (rank, r)
+
+    # k == world_size: one rank per replica, no inner group work to do.
+    r = build_replicas(8, rank=5, world_size=8)
+    assert (r.ranks_per_replica, r.replica_id, r.rank_in_replica) == (1, 5, 0), r
+
+
+@check("replica layout rejects sizes that cannot be split evenly")
+def _():
+    from pww.diloco import build_replicas
+
+    for k, world in ((3, 8), (5, 16), (9, 8), (0, 8), (-1, 8)):
+        try:
+            build_replicas(k, rank=0, world_size=world)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for k={k}, world={world}")
+
+    # The message has to name the usable values, or the next person guesses.
+    try:
+        build_replicas(3, rank=0, world_size=8)
+    except ValueError as exc:
+        assert "1, 2, 4, 8" in str(exc), str(exc)
+
+
+@check("outer step with sgd(lr=1, momentum=0) and k=1 is exactly the identity")
+def _():
+    """FederatedAveraging over one replica must return the replica's own weights.
+
+    This is the load-bearing sign convention: Delta is theta(t-1) - theta_i(t),
+    so descending it has to *reproduce* the inner progress, not undo it. A flipped
+    sign still trains, just backwards, and only shows up as a bad loss curve.
+    """
+    from pww.diloco import DiLoCo, build_replicas
+
+    model = _tiny_model()
+    dl = DiLoCo(model, build_replicas(1, rank=0, world_size=1), inner_steps=2,
+                outer_optimizer="sgd", outer_lr=1.0, outer_momentum=0.0)
+
+    with torch.no_grad():                       # pretend two inner steps happened
+        for p in model.parameters():
+            p.add_(torch.arange(p.numel(), dtype=torch.float32).view_as(p))
+    trained = [p.detach().clone() for p in model.parameters()]
+
+    assert dl.inner_step() is None, "must not fire before H steps"
+    stats = dl.inner_step()
+    assert stats is not None and stats["outer_step"] == 1.0, stats
+    for after, before in zip(model.parameters(), trained):
+        assert torch.allclose(after, before, atol=1e-6), "outer step changed the weights"
+
+
+@check("nesterov outer step overshoots the inner progress by (1 + momentum)")
+def _():
+    from pww.diloco import DiLoCo, build_replicas
+
+    model = _tiny_model()
+    theta0 = [p.detach().clone() for p in model.parameters()]
+    dl = DiLoCo(model, build_replicas(1, rank=0, world_size=1), inner_steps=1,
+                outer_optimizer="nesterov", outer_lr=0.7, outer_momentum=0.9)
+
+    step = 0.25
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(step)                        # inner progress: +0.25 everywhere
+
+    dl.inner_step()
+    # PyTorch nesterov, first step from a zero buffer: d_used = (1 + m) * Delta.
+    # Delta = theta0 - theta_local = -0.25, so theta(1) = theta0 + 0.7*1.9*0.25.
+    want = 0.7 * 1.9 * step
+    for after, before in zip(model.parameters(), theta0):
+        assert torch.allclose(after - before, torch.full_like(after, want), atol=1e-6), \
+            f"expected +{want}, got {(after - before).flatten()[0].item()}"
+
+
+@check("finish() flushes a partial inner phase")
+def _():
+    from pww.diloco import DiLoCo, build_replicas
+
+    model = _tiny_model()
+    dl = DiLoCo(model, build_replicas(1, rank=0, world_size=1), inner_steps=100)
+    for _ in range(7):
+        assert dl.inner_step() is None
+    stats = dl.finish()
+    assert stats is not None and stats["inner_steps"] == 7.0, stats
+    assert dl.finish() is None, "a second finish() must be a no-op"
+
+
+@check("global_model() swaps theta in and restores local weights on exit")
+def _():
+    from pww.diloco import DiLoCo, build_replicas
+
+    model = _tiny_model()
+    dl = DiLoCo(model, build_replicas(1, rank=0, world_size=1), inner_steps=1,
+                outer_optimizer="sgd", outer_lr=1.0, outer_momentum=0.0)
+    theta = [p.detach().clone() for p in model.parameters()]
+
+    with torch.no_grad():                       # drift away from theta
+        for p in model.parameters():
+            p.add_(3.0)
+        for b in model.buffers():
+            if b.is_floating_point():
+                b.add_(5.0)
+    drifted = [p.detach().clone() for p in model.parameters()]
+    drifted_buffers = [b.detach().clone() for b in model.buffers() if b.is_floating_point()]
+
+    with dl.global_model():
+        for p, want in zip(model.parameters(), theta):
+            assert torch.allclose(p, want, atol=1e-6), "theta was not swapped in"
+        for b, drifted_b in zip((b for b in model.buffers() if b.is_floating_point()),
+                                drifted_buffers):
+            assert not torch.allclose(b, drifted_b) or torch.allclose(
+                drifted_b, torch.zeros_like(drifted_b)), "buffers were not swapped"
+
+    for p, want in zip(model.parameters(), drifted):
+        assert torch.allclose(p, want, atol=1e-6), "local weights were not restored"
+    for b, want in zip((b for b in model.buffers() if b.is_floating_point()),
+                       drifted_buffers):
+        assert torch.allclose(b, want, atol=1e-6), "local buffers were not restored"
+
+
+@check("outer state round-trips and refuses a mismatched configuration")
+def _():
+    from pww.diloco import DiLoCo, build_replicas
+
+    replicas = build_replicas(1, rank=0, world_size=1)
+    model = _tiny_model()
+    dl = DiLoCo(model, replicas, inner_steps=1, outer_lr=0.7, outer_momentum=0.9)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.5)
+    dl.inner_step()
+    dl.inner_step()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "diloco_outer_r0.pt"
+        dl.save(path)
+        assert path.exists() and not list(Path(tmp).glob("*.tmp"))
+
+        fresh = DiLoCo(_tiny_model(), replicas, inner_steps=1,
+                       outer_lr=0.7, outer_momentum=0.9)
+        assert fresh.outer_steps == 0
+        fresh.load(path)
+        assert fresh.outer_steps == dl.outer_steps == 2, fresh.outer_steps
+        assert fresh.total_inner_steps == dl.total_inner_steps
+
+        # Momentum must actually come back, not just the counters.
+        got = fresh._opt.state_dict()["state"][0]["momentum_buffer"]
+        want = dl._opt.state_dict()["state"][0]["momentum_buffer"]
+        assert torch.allclose(got, want), "momentum buffer was not restored"
+
+        # Swapping the outer optimizer invalidates the momentum, so refuse it
+        # rather than silently reinterpreting Adam moments as SGD momentum.
+        other = DiLoCo(_tiny_model(), replicas, inner_steps=1, outer_optimizer="adamw")
+        try:
+            other.load(path)
+        except ValueError as exc:
+            assert "outer_optimizer" in str(exc), str(exc)
+        else:
+            raise AssertionError("expected ValueError on optimizer mismatch")
+
+
+@check("outer step rejects contradictory settings")
+def _():
+    from pww.diloco import DiLoCo, build_replicas
+
+    replicas = build_replicas(1, rank=0, world_size=1)
+    for kwargs, needle in (
+        ({"inner_steps": 0}, "inner_steps"),
+        ({"inner_steps": 1, "outer_optimizer": "rmsprop"}, "rmsprop"),
+        ({"inner_steps": 1, "outer_momentum": 0.0}, "momentum"),   # nesterov needs it
+    ):
+        try:
+            DiLoCo(_tiny_model(), replicas, **kwargs)
+        except ValueError as exc:
+            assert needle in str(exc), f"{kwargs}: {exc}"
+            continue
+        raise AssertionError(f"expected ValueError for {kwargs}")
+
+
+@check("outer state does not shadow the newest model checkpoint")
+def _():
+    """--resume auto globs *.pt, so the outer state must not live among them."""
+    from pww.train_cifar import _outer_state_path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "epoch_1.pt").write_bytes(b"x")
+        outer = _outer_state_path(tmp, rank=0, sharded=False)
+        outer.parent.mkdir(parents=True, exist_ok=True)
+        outer.write_bytes(b"y")                       # written after, so newer
+        assert latest_checkpoint(tmp).name == "epoch_1.pt", latest_checkpoint(tmp)
+
+
+@check("diloco flags reach the trainer and default to off")
+def _():
+    from pww.train_cifar import parse_args
+
+    args = parse_args([])
+    assert args.diloco_replicas == 0, "DiLoCo must be opt-in"
+
+    args = parse_args(["--diloco-replicas", "4", "--diloco-inner-steps", "50",
+                       "--diloco-outer-optimizer", "sgd", "--diloco-outer-lr", "1.0",
+                       "--diloco-outer-momentum", "0.0", "--inner-optimizer", "adamw"])
+    assert args.diloco_replicas == 4 and args.diloco_inner_steps == 50
+    assert args.diloco_outer_optimizer == "sgd" and args.inner_optimizer == "adamw"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Path(tmp) / "c.yaml"
+        cfg.write_text("diloco-replicas: 2\ndiloco-inner-steps: 200\n")
+        args = parse_args(["--config", str(cfg)])
+        assert args.diloco_replicas == 2 and args.diloco_inner_steps == 200
 
 
 if __name__ == "__main__":

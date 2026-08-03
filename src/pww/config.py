@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from . import diloco
+
 
 def apply_config_file(parser: argparse.ArgumentParser, argv: list[str] | None = None) -> argparse.Namespace:
     """Parse args, folding in `--config file.yaml` as overridden defaults."""
@@ -54,6 +56,30 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g = parser.add_argument_group("parallelism")
     g.add_argument("--parallel", type=str, default="ddp", choices=("single", "ddp", "fsdp"))
     g.add_argument("--dtype", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
+
+    # DiLoCo lives here rather than in one trainer because the outer loop is
+    # independent of what is being trained -- the LLM entrypoint gets it free.
+    g = parser.add_argument_group("diloco")
+    g.add_argument("--diloco-replicas", type=int, default=0,
+                   help="k: number of model replicas. 0 disables DiLoCo. Must divide "
+                        "the world size. k=1 is a valid degenerate case (no "
+                        "inter-replica traffic) useful for isolating the outer loop")
+    g.add_argument("--diloco-inner-steps", type=int, default=diloco.DEFAULT_INNER_STEPS,
+                   help="H: inner steps between outer steps. Larger means less "
+                        "communication and more replica drift")
+    g.add_argument("--diloco-outer-lr", type=float, default=diloco.DEFAULT_OUTER_LR)
+    g.add_argument("--diloco-outer-momentum", type=float, default=diloco.DEFAULT_OUTER_MOMENTUM)
+    g.add_argument("--diloco-outer-optimizer", type=str, default="nesterov",
+                   choices=diloco.OUTER_OPTIMIZERS,
+                   help="nesterov is the paper's choice; 'sgd' with --diloco-outer-lr 1 "
+                        "--diloco-outer-momentum 0 is FederatedAveraging")
+    g.add_argument("--diloco-outer-device", type=str, default="auto", choices=("auto", "cpu"),
+                   help="'cpu' keeps theta and the outer momentum in host memory, "
+                        "trading two host<->device copies every H steps for two "
+                        "fewer model-sized allocations on the accelerator")
+    g.add_argument("--diloco-no-sync-buffers", action="store_true",
+                   help="Do not average float buffers (BatchNorm statistics) across "
+                        "replicas at the outer step")
 
     g = parser.add_argument_group("checkpointing")
     g.add_argument("--resume", type=str, default=None,
