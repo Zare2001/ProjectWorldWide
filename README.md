@@ -235,6 +235,25 @@ construction and there is no meaningful average of it. Resuming therefore restar
 each replica from `θ` carrying replica 0's inner momentum. The outer momentum,
 which *is* shared, is restored exactly (`runs/<run>/diloco/outer_r0.pt`).
 
+### What an outer step actually costs
+
+Measured on one LUMI node, ResNet-18 (11.17M params), `k=2` x 4 GCDs
+(`job_smoke.sh --diloco-replicas 2`):
+
+| | |
+|---|---|
+| inner step (fwd + bwd + DDP all-reduce over 4 ranks) | 10.7 ms |
+| outer step (Δ, one 2-way all-reduce, OuterOpt, re-dispatch) | 3.8 ms |
+| overhead at `H`=10 / 100 / 500 | 3.6% / 0.36% / 0.07% |
+
+The outer step being *cheaper* than an inner one is not a surprise on a single
+node: it is one all-reduce of the parameters over 2 replicas across Infinity
+Fabric, against a full forward, backward and 4-rank gradient all-reduce. Two
+things change that ratio and neither is measured yet — replicas on separate nodes
+push the exchange onto Slingshot, and a model large enough to need FSDP changes
+both sides. Re-run the smoke test in whatever layout you actually intend to use;
+it prints this table for that layout.
+
 Memory cost is three extra fp32 copies of the parameters — `θ`, the outer
 momentum, and one flat communication buffer. Under FSDP all three are sharded
 with the model. `--diloco-outer-device cpu` moves two of them to host memory in
@@ -275,7 +294,7 @@ before trusting the defaults.
 |---|---|
 | outer-step arithmetic, layout, state round-trip | `tests/test_local.py`, 27 checks, single process |
 | group membership, cross-replica averaging, `θ(0)` alignment, DDP-in-replica reconvergence | `tests/test_diloco_gloo.py`, real process groups over gloo on CPU |
-| the same on GPU with RCCL/NCCL, plus outer-vs-inner step cost | `sbatch scripts/lumi/job_smoke.sh --diloco-replicas 2` |
+| the same on GPU with RCCL | **verified** on one LUMI node, `k=2 x 4` GCDs (job 20646477): group membership correct, outer step exactly `0.5000` |
 | it trains, and roughly tracks DDP | yes, but only on a 120-step CPU toy run — see the warning above |
 | **convergence at scale** | **not yet measured** — run `job_cifar_diloco.sh` against the 93.35% DDP reference below |
 | DiLoCo + FSDP | code path exists (`--parallel fsdp`) and is sharding-aware, but **untested**; CIFAR is too small to shard meaningfully |
