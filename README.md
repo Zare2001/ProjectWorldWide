@@ -33,6 +33,7 @@ scripts/
   siteinfo.sh             report a machine's topology/partitions/modules
   download_data.sh        pre-fetch datasets -- LOGIN NODE ONLY
   task_wrapper.sh         per-rank entrypoint, site-agnostic
+  darl_coordinator.sh     start/stop the lease coordinator -- LOGIN NODE ONLY
   lumi/                   job_smoke, job_cifar_debug, job_cifar_1node,
                           job_cifar_multinode, job_cifar_diloco
   snellius/               setup_venv.sh (run first), job_smoke, job_cifar_debug,
@@ -48,9 +49,17 @@ src/pww/
   models/resnet.py        ResNet-18/34/50, CIFAR stem
   data/cifar.py           CIFAR-10 loaders with DistributedSampler
   train_cifar.py          training entrypoint
+  darl/                   dynamic dataset leasing across clusters
+    space.py              index space, block permutation, digests
+    table.py              lease state machine: TTL, expiry, stealing, invariants
+    server.py             coordinator -- HTTP, one lock, write-ahead log
+    client.py             cluster side -- RPCs, heartbeats, prefetch
+    torch_data.py         spans -> per-rank sample lists
+    simulate.py           m clusters end to end, with a coverage audit
 tests/
   test_local.py           CPU-only, single process, no allocation needed
   test_diloco_gloo.py     CPU-only, multi-process gloo -- DiLoCo collectives
+  test_darl.py            CPU-only, incl. a real coordinator on a socket
 ```
 
 Code lives in `$HOME`; data, checkpoints and logs live on scratch, symlinked as
@@ -72,6 +81,7 @@ cd ~/ProjectWorldWide
 # validate before spending GPU hours
 source env.sh && pww_run python3 tests/test_local.py
 source env.sh && pww_run python3 tests/test_diloco_gloo.py
+source env.sh && pww_run python3 tests/test_darl.py        # dataset leasing
 sbatch scripts/lumi/job_smoke.sh
 sbatch scripts/lumi/job_smoke.sh --diloco-replicas 2
 
@@ -342,6 +352,169 @@ transport rather than a collective — which is the same outer step with a diffe
 carrier, since `Δ` is just a difference of two checkpoints.
 `diloco.py` is structured so that only the two `dist.all_reduce` calls in
 `outer_step` would have to change.
+
+## Dynamic dataset leasing (DARL)
+
+DiLoCo says how the replicas exchange weights. It says nothing about how they
+agree on *who trains on what*, and once the replicas are separate clusters that
+question stops being trivial: each one starts when its own batch queue lets it,
+runs at its own speed, and can be killed at walltime mid-step. The requirement is
+still that the corpus is covered exactly once -- no sample twice, no sample
+missed -- because a duplicate is invisible in the loss curve and a gap is
+invisible in everything.
+
+Splitting the corpus m ways in advance cannot deliver that. The fast cluster
+drains its shard and idles; the slow one never finishes; a cluster that dies takes
+its whole shard out of the epoch. Handing out work dynamically without a protocol
+is worse -- two clusters race and silently train on the same samples.
+
+So `src/pww/darl/` leases the index space, the way CockroachDB leases key ranges
+and Flink assigns key-groups:
+
+| | |
+|---|---|
+| unit | a **block** of `K` consecutive samples; `M = ceil(N/K)` blocks |
+| order | blocks are permuted once from the seed, so a lease is a random sample of the corpus, not a run of consecutive text |
+| lease | a contiguous run of positions, granted to one cluster under a heartbeat TTL |
+| states | `UNASSIGNED` → `LEASED` → `COMMITTED`, plus `QUARANTINED` for a block that keeps failing |
+| expiry | heartbeats stop → the uncommitted tail returns to the pool, no operator involved |
+| stealing | an idle cluster takes the *unstarted* tail of whoever will finish last |
+| commit | means "durably processed", i.e. covered by a checkpoint -- not "consumed" |
+
+Three invariants, and `LeaseTable.verify()` asserts all three on every snapshot:
+the union of committed blocks is the whole space (completeness), no two clusters
+ever hold the same block (disjointness), and the per-cluster committed counts sum
+to `M` (zero duplication).
+
+### Running it
+
+The coordinator is one small Python process on a login node -- not a batch job,
+because it has to outlive every job that leases from it:
+
+```bash
+./scripts/darl_coordinator.sh start --num-samples 1000000 --block-size 10000
+./scripts/darl_coordinator.sh status         # progress, per-cluster throughput
+./scripts/darl_coordinator.sh url            # give this to the other site
+```
+
+Validate before spending queue time; both of these run on a login node:
+
+```bash
+source env.sh && pww_run python3 tests/test_darl.py        # must be 36/36
+pww_run python3 -m pww.darl.simulate --clusters 4 --kill 1 --late 1
+```
+
+`simulate` is the one worth reading the output of. It starts a real coordinator
+and four **separate processes** running the real client over real HTTP, gives them
+throughputs an 8x spread apart, delays one behind a simulated queue, kills one
+mid-lease without releasing anything, and then audits coverage from what the
+processes themselves report rather than from the coordinator's own books:
+
+```
+cluster       committed  leased   lost    blk/s    (1,000 blocks, one epoch)
+sim-0                18       0     12   31.469    <- crashed holding 12 blocks
+sim-1               281       0      0    7.767
+sim-2               141       0      0    3.942    <- slowest
+sim-3               560       0      0   15.430    <- fastest, took 4x sim-2's share
+blocks covered   1,000 of 1,000     duplicates 0     missing 0
+PASS: coverage is exactly once
+```
+
+The crashed cluster's 12 blocks were reclaimed on TTL expiry and finished by
+someone else, and the fastest cluster did four times the slowest one's work
+without anyone configuring a ratio. That is the whole argument for leasing over
+static partitioning, on one page.
+
+### Granularity, and why it costs nothing
+
+Lease one span per DiLoCo local phase (`blocks_for_phase(space, inner_steps=H,
+batch_size=..., ranks=...)`, which is what `--darl-blocks-per-phase 0` derives).
+Two consequences:
+
+- **No coordinator traffic during the inner loop.** The only moment a lease
+  boundary is observable is the outer step, where the ranks are synchronised
+  anyway. The run above served 277 requests to cover 1,000 blocks across 4
+  clusters -- for an LLM, where a phase is minutes, that is a handful of RPCs an
+  hour and WAN latency is irrelevant.
+- **One process per stream talks to the coordinator, not one per rank.** The
+  stream leader acquires and broadcasts three integers per span over the process
+  group the ranks already have; every rank then derives its own sample list from
+  the shared seed. A 512-rank job makes the same number of RPCs as a 4-rank one.
+
+TTL follows the design note, `Δt_TTL = α·t̄_step + β·RTT` with α=2.5, β=10, from
+the client's own measured phase duration and RTT -- so a cluster that gets slower
+asks for a longer lease instead of being declared dead mid-phase.
+
+### Wiring it into a trainer
+
+`train_cifar.py` does **not** use this yet (CIFAR is 50k samples on local disk, so
+there is nothing to lease). For an LLM entrypoint it is four calls:
+
+```python
+space   = BlockSpace(num_samples=N, block_size=args.darl_block_size, seed=args.seed)
+session = session_for_replica(space, replicas, url=args.darl_url, site=PWW_SITE,
+                              batch_size=args.batch_size,
+                              inner_steps=args.diloco_inner_steps)   # None off rank 0
+data    = DARLDataSource.for_diloco(space, session, replicas, seed=args.seed)
+
+while (phase := data.next_phase()) is not None:      # collective: every rank, same count
+    sampler.set_indices(phase.indices)
+    for batch in loader:
+        ...                                          # inner steps as usual
+    data.end_phase()                                 # feeds the TTL estimate
+    save_checkpoint(...)                             # then, and only then:
+    data.commit()                                    # blocks are now COMMITTED
+```
+
+The order of the last two lines is the exactly-once guarantee. Commit before the
+checkpoint lands and a crash in between drops those samples from the epoch; commit
+after and a crash re-runs them, which is correct, because the model rolled back
+too.
+
+### What is verified
+
+| | |
+|---|---|
+| state machine -- expiry, stealing, quarantine, grant sizing, snapshot/restore, journal replay | `tests/test_darl.py`, 36 checks, injected clock |
+| disjointness under real concurrency | same file: a real coordinator on a socket, 4 client threads, 400 blocks, 0 duplicates |
+| exactly-once across processes, with a crash and a late joiner | `pww.darl.simulate`, output above -- **verified on a Snellius login node** |
+| coordinator restart mid-epoch | snapshot + journal replay is unit-tested; a *live* restart under load is not |
+| use in a real training loop | **not done** -- `torch_data.py` has its sharding maths tested with the broadcast stubbed, but no GPU job has consumed a lease yet |
+| cross-site reachability | **not tested.** Compute nodes reach their own login nodes; whether a Snellius compute node can reach a LUMI login node is the open question in [TODO.md](TODO.md), and `scripts/darl_coordinator.sh` documents the `curl /health` check and the SSH-tunnel fallback |
+
+### Things that are easy to get wrong here
+
+**The heartbeat reply is an instruction, not an acknowledgement.** It carries the
+coordinator's `end` for each lease, which may have shrunk because the tail was
+stolen, and `valid: false` for a lease that was reclaimed. A client that trains to
+its own remembered `end` breaks disjointness. `LeaseSession` applies the reply
+before any more samples are drawn; anything built on `LeaseClient` directly has to
+do the same.
+
+**Every site must derive the same permutation.** It comes from the seed alone so
+that no communication is needed, which means a Python or library skew between two
+sites would hand two clusters the same samples under different position numbers.
+Hence `BlockSpace.digest()` and the check at registration -- a mismatch is a
+startup error, not a data-quality mystery three weeks later.
+
+**One session per *stream*, not per job.** Under DiLoCo a stream is one replica:
+k replicas in one allocation are k independent models and must see disjoint data.
+`for_diloco` registers each replica as its own cluster.
+
+**`persistent_workers=False` with `LeasedSampler`.** Persistent workers keep a
+forked copy of the sampler from the first iteration and would replay the first
+phase forever. Re-forking costs milliseconds against a phase of hundreds of steps.
+
+**A single coordinator is a single point of failure.** While it is down, clusters
+keep training on the span they hold (their leases are extended by
+`--restore-grace` on restart) but cannot acquire. Replicating the state machine is
+the one thing etcd would add, and the journal is exactly what Raft would
+replicate; `Coordinator` is the only class that would have to change.
+
+**Quarantine trades exactness for termination.** A block reclaimed
+`--max-attempts` times is dropped from the epoch so a corrupt shard cannot hang it
+forever. The status report and the completion message both say so loudly. Set
+`--max-attempts 0` if a missing block is worse than a stalled epoch.
 
 ## Things that are easy to get wrong here
 

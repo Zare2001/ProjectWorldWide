@@ -81,6 +81,40 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="Do not average float buffers (BatchNorm statistics) across "
                         "replicas at the outer step")
 
+    # DARL lives here for the same reason DiLoCo does: nothing in it knows what is
+    # being trained. A trainer opts in by building a session and a data source; see
+    # the DARL section of the README.
+    g = parser.add_argument_group("darl")
+    g.add_argument("--darl-url", type=str, default=None,
+                   help="Lease coordinator, e.g. http://int-node-1:8760. Unset (and "
+                        "no $PWW_DARL_URL) disables DARL and the trainer shards data "
+                        "over its own ranks as usual")
+    g.add_argument("--darl-token", type=str, default=None,
+                   help="Shared secret for the coordinator (default: $DARL_TOKEN)")
+    g.add_argument("--darl-num-samples", type=int, default=None,
+                   help="N: samples in the global corpus. Must match the coordinator; "
+                        "a mismatch is refused at registration rather than silently "
+                        "duplicating data")
+    g.add_argument("--darl-block-size", type=int, default=10_000,
+                   help="K: samples per leased block. Coarse enough that leasing "
+                        "costs nothing, fine enough that a dead cluster only strands "
+                        "one lease")
+    g.add_argument("--darl-blocks-per-phase", type=int, default=0,
+                   help="Blocks per lease. 0 derives it from H, the batch and the "
+                        "rank count, so one lease is exactly one local phase")
+    g.add_argument("--darl-commit-policy", type=str, default="checkpoint",
+                   choices=("checkpoint", "consumption"),
+                   help="'checkpoint' commits only what a durable checkpoint covers, "
+                        "which is what makes the epoch exactly-once under a crash; "
+                        "'consumption' releases spans sooner and accepts a one-lease "
+                        "window of gaps or duplicates")
+    g.add_argument("--darl-site", type=str, default=None,
+                   help="Name this cluster reports (default: $PWW_SITE). Stable across "
+                        "requeues on purpose, so measured throughput is not lost")
+    g.add_argument("--darl-proxy", action="store_true",
+                   help="Reach the coordinator through $http_proxy. Needed only when "
+                        "the coordinator is at another facility")
+
     g = parser.add_argument_group("checkpointing")
     g.add_argument("--resume", type=str, default=None,
                    help="Checkpoint path, or 'auto' to pick the newest in the output dir")
