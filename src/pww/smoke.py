@@ -1,10 +1,11 @@
 """Infrastructure smoke test -- run this first after any environment change.
 
-Checks, in order of what actually breaks on LUMI:
-  1. every rank sees exactly one distinct GCD (pinning works),
-  2. RCCL all-reduce produces the mathematically correct answer,
-  3. RCCL bandwidth is in the right ballpark (catches the classic failure where
-     collectives silently fall back to TCP instead of Slingshot),
+Checks, in order of what actually breaks:
+  1. every rank sees exactly one distinct GCD/GPU (pinning works),
+  2. the all-reduce produces the mathematically correct answer,
+  3. collective bandwidth is in the right ballpark (catches the classic failure
+     where RCCL/NCCL silently falls back to TCP instead of Slingshot or
+     InfiniBand),
   4. a real fwd/bwd step runs on the GPU.
 
 With --diloco-replicas k it additionally verifies the DiLoCo rank layout, both
@@ -65,9 +66,12 @@ def check_allreduce_correctness(info) -> None:
 def benchmark_allreduce(info, size_mb: int = 256, iters: int = 20) -> None:
     """Measure all-reduce bandwidth.
 
-    Expect tens to hundreds of GB/s within a node (Infinity Fabric). Single-digit
-    GB/s across nodes means RCCL is not using the Slingshot NICs -- check that
-    /opt/aws-ofi-rccl is on LD_LIBRARY_PATH and the libfabric binds are present.
+    Expect tens to hundreds of GB/s within a node -- measured 123 GB/s on LUMI
+    (Infinity Fabric) and 300.8 GB/s on a Snellius H100 node. Single-digit GB/s
+    across nodes means the collective is going over TCP rather than the fast
+    fabric: on LUMI check that /opt/aws-ofi-rccl is on LD_LIBRARY_PATH and the
+    libfabric binds are present; on Snellius set NCCL_SOCKET_IFNAME to the
+    InfiniBand interface (ibp*/mlx5, not ib0).
     """
     log = get_logger()
     if not info.is_distributed:

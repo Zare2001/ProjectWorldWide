@@ -5,7 +5,10 @@ checkpoint round-trips, config layering, LR schedule, and DiLoCo's outer-step
 arithmetic. Anything that needs real collectives belongs in
 tests/test_diloco_gloo.py (still CPU-only) or pww.smoke (needs GPUs).
 
-    singularity exec $PWW_CONTAINER python3 tests/test_local.py
+    source env.sh && pww_run python3 tests/test_local.py
+
+pww_run enters the container on LUMI and is a no-op inside the venv on Snellius,
+so the same line works on both. Last measured 28/28 on Snellius.
 """
 
 from __future__ import annotations

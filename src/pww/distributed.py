@@ -47,10 +47,11 @@ class DistInfo:
 def _resolve_device(local_rank: int) -> torch.device:
     """Pick this process's device.
 
-    task_wrapper.sh sets ROCR_VISIBLE_DEVICES=$SLURM_LOCALID, so a pinned rank
-    sees a single GCD that it must address as cuda:0. When running unpinned
-    (e.g. a bare `python3` on a login/interactive node) fall back to indexing by
-    local rank.
+    task_wrapper.sh pins each rank to one device via whichever variable the site
+    uses -- ROCR_VISIBLE_DEVICES on ROCm, CUDA_VISIBLE_DEVICES on NVIDIA -- so a
+    pinned rank sees a single GCD or GPU that it must address as cuda:0. When
+    running unpinned (e.g. a bare `python3` on a login/interactive node) fall
+    back to indexing by local rank.
     """
     if not torch.cuda.is_available():
         return torch.device("cpu")

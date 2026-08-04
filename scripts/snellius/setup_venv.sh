@@ -79,11 +79,15 @@ echo
 echo "installing the rest of the stack..."
 # Versions mirror what the LUMI container carries, so the LLM phase does not
 # silently diverge between sites.
+# accelerate is pinned like the rest: left unpinned it resolves to 1.x, which is a
+# major version away from the LUMI container's 0.34.2 and quietly breaks the
+# "same stack on both sites" property this file exists to maintain. 0.34.2 with
+# transformers 4.55.3 is the combination LUMI already runs, so it is proven.
 python3 -m pip install \
     "transformers==4.55.3" \
     "tokenizers==0.21.4" \
     "datasets==4.0.0" \
-    "accelerate" \
+    "accelerate==0.34.2" \
     "pyyaml"
 
 echo

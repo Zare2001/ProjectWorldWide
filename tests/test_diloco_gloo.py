@@ -10,8 +10,11 @@ It runs gloo over localhost, so it belongs on a login node next to test_local.py
 rather than in a queued job. pww.smoke covers the same ground on real GPUs with
 RCCL/NCCL, where the failure modes are different.
 
-    singularity exec $PWW_CONTAINER python3 tests/test_diloco_gloo.py
-    singularity exec $PWW_CONTAINER python3 tests/test_diloco_gloo.py --world-size 6 --replicas 3
+    source env.sh && pww_run python3 tests/test_diloco_gloo.py
+    source env.sh && pww_run python3 tests/test_diloco_gloo.py --world-size 6 --replicas 3
+
+pww_run enters the container on LUMI and is a no-op inside the venv on Snellius,
+so the same line works on both. Last measured 14/14 on Snellius.
 """
 
 from __future__ import annotations

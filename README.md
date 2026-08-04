@@ -272,6 +272,24 @@ same node gets **93.35%**:
 | `nesterov` 0.7 / 0.9 (paper defaults) | 25 | 58 | 90.04% | −3.31 |
 | `nesterov` 0.7 / 0.9 (paper defaults) | 100 | 15 | 85.70% | −7.65 |
 
+The two FedAvg rows were then reproduced on Snellius, `k=2` x 2 H100s at the
+same replica batch of 512 and the same `T` (`--batch-size 256`, since 2 ranks
+per replica there against LUMI's 4):
+
+| | `H` | LUMI (8 GCDs) | Snellius (4 H100) | Δ |
+|---|---|---|---|---|
+| FederatedAveraging | 25 | 92.41% | **92.56%** | +0.15 |
+| FederatedAveraging | 100 | 92.17% | **92.20%** | +0.03 |
+| plain DDP, same global batch | -- | 93.35% | 93.55% | +0.20 |
+
+Landing within 0.15 points on entirely different hardware, vendor stacks and
+rank-to-replica layouts is the same result as the DDP cross-check: it says the
+outer loop is correct, not merely running. `agreement` decayed 0.89 → 0.76 over
+the H=100 run against a 1/√2 = 0.707 floor, so H=100 is close to the edge on
+this model at this LR -- the same shape LUMI shows. The paper's Nesterov rows
+were not re-run there; nothing suggests they would behave differently, since the
+mechanism is BatchNorm, not hardware.
+
 **FederatedAveraging at `H`=100 gives up 1.2 points of accuracy for a 100x
 reduction in inter-replica communication, at identical throughput** (38,475 vs
 38,400 img/s). That is DiLoCo working as advertised.
@@ -310,7 +328,8 @@ second-to-last checkpoint, or use FedAvg.
 | outer-step arithmetic, layout, state round-trip | `tests/test_local.py`, 27 checks, single process |
 | group membership, cross-replica averaging, `θ(0)` alignment, DDP-in-replica reconvergence | `tests/test_diloco_gloo.py`, real process groups over gloo on CPU |
 | the same on GPU with RCCL | **verified** on one LUMI node, `k=2 x 4` GCDs (job 20646477): group membership correct, outer step exactly `0.5000` |
-| **convergence** | **measured** — 92.41% against 93.35% for plain DDP, one LUMI node, `k=2`. See the table above |
+| the same on GPU with NCCL | **verified** on one Snellius node, `k=2 x 2` and `k=4 x 1` H100s: group membership correct, outer step exactly `0.5000` and `1.5000` |
+| **convergence** | **measured on both sites** — 92.41% / 92.56% at H=25 and 92.17% / 92.20% at H=100 (LUMI / Snellius), against 93.35% / 93.55% for plain DDP. See the tables above |
 | DiLoCo + FSDP | code path exists (`--parallel fsdp`) and is sharding-aware, but **untested**; CIFAR is too small to shard meaningfully |
 
 Note also that `k` replicas are only usefully *independent* while they share one
@@ -362,8 +381,19 @@ otherwise. Forcing the fixed mask on a partial allocation fails hard with
 `CPU binding outside of job step allocation`. Affinity is therefore not optimal
 on partial-node debug runs -- use a full node for anything you intend to measure.
 
+**`MASTER_PORT` must not be a constant.** Every job script derives it from
+`SLURM_JOB_ID` rather than pinning 29500, because two of your own jobs can land
+on the same node -- routine on Snellius, where single-node jobs share a node by
+default, and possible on LUMI's `small-g`. A fixed port makes the second job die
+in the TCPStore rendezvous with "address already in use", which reads like a
+network fault rather than a scheduling one.
+
 **bf16, not fp16.** MI250X does bf16 natively and it has fp32's dynamic range, so
-no loss scaler is needed.
+no loss scaler is needed. `--dtype fp16` is accepted by the parser but there is
+**no `GradScaler` anywhere** -- neither the autocast path in `train_cifar.py` nor
+FSDP's `MixedPrecision` scales gradients -- so fp16 training will quietly
+underflow. It is untested on both sites. Use bf16, on H100 as well as on MI250X,
+until someone wires a scaler in.
 
 **DiLoCo: every rank must reach the outer step the same number of times.** The
 outer step is a collective, triggered by a per-rank counter. `drop_last=True` on
@@ -385,31 +415,55 @@ git clone <this repo> && cd ProjectWorldWide
 ./scripts/bootstrap.sh
 ./scripts/download_data.sh         # once, from a login node
 
-source env.sh && pww_run python3 tests/test_local.py    # must be 28/28
-sbatch scripts/snellius/job_smoke.sh                    # must print SMOKE TEST PASSED
+# validate on the login node first -- no allocation needed
+source env.sh && pww_run python3 tests/test_local.py       # must be 28/28
+source env.sh && pww_run python3 tests/test_diloco_gloo.py # must be 14/14
+
+sbatch scripts/snellius/job_smoke.sh                       # must print SMOKE TEST PASSED
+sbatch scripts/snellius/job_smoke.sh --diloco-replicas 2   # before any DiLoCo job
 sbatch scripts/snellius/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 sbatch scripts/snellius/job_cifar_multinode.sh
+sbatch scripts/snellius/job_cifar_diloco.sh
 ```
+
+Budget a few minutes for the two CPU test suites: the Snellius login nodes are
+heavily shared, and one ResNet-18 CPU step there has been measured at 68 s, which
+makes `test_local.py` take around 7 minutes rather than the seconds it takes on an
+idle machine. That is contention, not a hang.
 
 `./scripts/siteinfo.sh` re-derives every machine-specific value in
 `sites/snellius.sh` from the running system, which is how the values there were
 obtained. Run it if Snellius changes underneath you.
 
-Verified on Snellius, all on `gpu_h100`:
+Verified on Snellius, all on `gpu_h100` unless noted:
 
 | check | result |
 |---|---|
-| `tests/test_local.py` | all pass (17 checks when measured, 28 now) |
+| `tests/test_local.py` | 28/28 pass |
+| `tests/test_diloco_gloo.py` | 14/14 pass across k=2 and k=4 |
 | `job_cifar_debug.sh` (1 GPU) | passes in 21 s |
 | `job_smoke.sh` (1 node, 4 GPUs) | passes, 300.8 GB/s all-reduce |
 | `job_smoke.sh --nodes=2` (8 GPUs) | passes, 133.1 GB/s all-reduce over InfiniBand |
+| `job_smoke.sh --diloco-replicas 2` | passes, outer step exactly `0.5000`, 1.9 ms vs a 7.2 ms inner step |
+| `job_smoke.sh --diloco-replicas 4` | passes, outer step exactly `1.5000` |
 | `job_cifar_1node.sh` (DDP, fp32) | 93.55% eval acc, 56,184 img/s |
-| `--parallel fsdp --dtype bf16` | trains and checkpoints, 62,672 img/s |
+| `job_cifar_1node.sh --dtype bf16` | 93.35%, 67,776 img/s |
+| `--parallel fsdp --dtype bf16`, 30 ep | 92.96%, 64,802 img/s |
+| `job_cifar_multinode.sh` (2 nodes, 8 GPUs) | 93.20%, 85,220 img/s |
+| `job_cifar_diloco.sh` (k=2, H=100) | 92.20% -- see the DiLoCo section |
+| consolidated resume, 4 ranks -> 1 | works |
+| `--sharded-checkpoint`, 4 ranks -> 2 | works |
+| `gpu_a100` | **not yet run** -- the partition sits at 0 idle nodes |
 
 The FSDP row is the one that matters for the LLM phase: it exercises
 `init_device_mesh`, `FSDP(device_mesh=)` and
 `torch.distributed.checkpoint.state_dict` -- three of the four APIs the
 Snellius PyTorch module is missing, and the reason the venv exists.
+
+The two resume rows are the ones that matter for federated training: a
+checkpoint written by 4 ranks reloads onto a different world size, in both
+formats. That is the claim [TODO.md](TODO.md) rests on, and it is now tested
+rather than assumed.
 
 ### The environment is a venv, and it is not optional
 
@@ -434,6 +488,12 @@ bundle their own CUDA runtime, so nothing depends on the EasyBuild CUDA version.
 It lives in `$HOME/venvs/pww-snellius` (override with `PWW_VENV`), deliberately
 not on `/scratch-shared`, which is purged on file age -- an environment that
 dissolves after two idle weeks is worse than no environment.
+
+Every package in it is pinned to the LUMI container's version, `accelerate`
+included -- left unpinned that one resolves to 1.x against LUMI's 0.34.2, which
+is exactly the silent divergence the pinning exists to prevent. If your venv was
+built before that pin landed, `pip install accelerate==0.34.2` inside it to
+align.
 
 `flash-attn` is the one thing the LUMI container has that this venv does not; it
 has no prebuilt wheel for this combination and compiling it takes upwards of an

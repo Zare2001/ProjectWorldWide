@@ -1,9 +1,14 @@
-# ResNet-18 on CIFAR-10, tuned for one full LUMI-G node (8 GCDs).
+# ResNet-18 on CIFAR-10. batch-size below is tuned for one full LUMI-G node
+# (8 GCDs x 128 = a global batch of 1024).
 #
-#   sbatch scripts/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
+#   sbatch scripts/lumi/job_cifar_1node.sh     --config configs/cifar10_resnet18.yaml
+#   sbatch scripts/snellius/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 #
-# Reaches roughly 94-95% eval accuracy. Anything on the command line still wins
-# over what is set here.
+# The Snellius script passes --batch-size 256 of its own, which wins over the 128
+# here and lands on the same global batch of 1024 from 4 ranks instead of 8. That
+# is what makes the two sites' numbers comparable -- see the README.
+#
+# Anything on the command line still wins over what is set here.
 
 model: resnet18
 

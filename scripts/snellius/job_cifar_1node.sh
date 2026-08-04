@@ -35,7 +35,12 @@ fi
 source "${PWW_ROOT}/env.sh"
 
 export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
-export MASTER_PORT=29500
+# Derived from the job id rather than fixed: when two of your own jobs share a
+# node -- routine on Snellius, where partial single-node allocations get packed
+# together -- a fixed port makes the second job die in the TCPStore rendezvous
+# with "address already in use". Kept below the ephemeral range (32768+) so it
+# cannot clash with an outgoing connection either.
+export MASTER_PORT=$((10000 + SLURM_JOB_ID % 20000))
 
 srun --cpu-bind="$(pww_cpu_bind)" \
     "${PWW_LAUNCH[@]}" \

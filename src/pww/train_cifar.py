@@ -29,7 +29,7 @@ from .parallel import count_parameters, resolve_dtype, wrap_model
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CIFAR-10 distributed training on LUMI")
+    p = argparse.ArgumentParser(description="CIFAR-10 distributed training")
     add_common_args(p)
 
     g = p.add_argument_group("model")

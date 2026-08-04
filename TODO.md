@@ -56,12 +56,26 @@ Already works in our favour: resume reads `epoch` from checkpoint meta and
 fast-forwards the scheduler (`train_cifar.py:213-218`), so once this split
 exists, a merged checkpoint continues the *global* schedule for free.
 
-### 1.3 Verify cross-world-size resume actually round-trips
+### 1.3 Verify cross-world-size resume actually round-trips -- DONE
 
-Claimed but never tested: save on 8 ranks, load on 4.
+- [x] Test consolidated save/load across differing world sizes.
+- [x] Do it on Snellius alone first (4 ranks -> 1 rank via the debug job).
 
-- [ ] Test consolidated save/load across differing world sizes.
-- [ ] Do it on Snellius alone first (4 ranks -> 1 rank via the debug job).
+Both formats round-trip onto a different world size, tested on Snellius alone:
+
+| written by | reloaded on | format | result |
+|---|---|---|---|
+| 4 ranks | 1 rank | consolidated | resumed at epoch 4, loss continued at 1.31 |
+| 4 ranks | 2 ranks | sharded | resumed at epoch 4, loss continued at 1.45 |
+
+The loss values are the check that matters: a cold ResNet-18 starts near 2.5, so
+picking up at 1.3-1.4 means the weights really loaded rather than the run
+silently restarting. `set_model_state_dict` reshards on load exactly as fact 2
+above claims.
+
+Still untested: the *cross-site* direction, LUMI's 8 ranks -> Snellius's 4. That
+needs a checkpoint physically moved between the sites, so it belongs to Phase 4
+rather than here.
 
 ## Phase 2 -- `src/pww/federated.py`
 

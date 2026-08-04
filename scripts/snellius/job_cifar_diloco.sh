@@ -15,11 +15,14 @@
 #   sbatch scripts/snellius/job_cifar_diloco.sh                       # k=2 x 2 GPUs
 #   sbatch scripts/snellius/job_cifar_diloco.sh --diloco-replicas 4   # k=4 x 1 GPU
 #
-# The Snellius path itself is verified end to end; the headers above match
-# job_cifar_1node.sh. What has NOT been run is DiLoCo on this site specifically --
-# it is verified on LUMI (92.41% against 93.35% for DDP) and by
-# tests/test_diloco_gloo.py, and nothing in diloco.py is site-dependent, so this
-# is expected to work rather than known to.
+# Verified on this site, not just on LUMI. job_smoke.sh --diloco-replicas 2/4
+# passes over NCCL (outer step exactly 0.5000 and 1.5000, group membership
+# correct), and the convergence numbers reproduce LUMI's to within 0.15 points at
+# the same replica batch:
+#
+#              H=25     H=100
+#   LUMI       92.41%   92.17%
+#   Snellius   92.56%   92.20%      (plain DDP here: 93.55%)
 #
 # k must divide the number of ranks, which is 4 here against LUMI's 8 -- so the
 # usable values are k=1,2,4 rather than k=1,2,4,8. To compare a run against LUMI,
@@ -43,7 +46,12 @@ fi
 source "${PWW_ROOT}/env.sh"
 
 export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
-export MASTER_PORT=29500
+# Derived from the job id rather than fixed: when two of your own jobs share a
+# node -- routine on Snellius, where partial single-node allocations get packed
+# together -- a fixed port makes the second job die in the TCPStore rendezvous
+# with "address already in use". Kept below the ephemeral range (32768+) so it
+# cannot clash with an outgoing connection either.
+export MASTER_PORT=$((10000 + SLURM_JOB_ID % 20000))
 
 # NCCL found InfiniBand unaided on the verified multi-node runs (133.1 GB/s across
 # two nodes), so this stays off. If the smoke test ever reports single-digit GB/s
