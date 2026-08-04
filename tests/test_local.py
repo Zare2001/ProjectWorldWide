@@ -393,6 +393,44 @@ def _():
     assert dl.finish() is None, "a second finish() must be a no-op"
 
 
+@check("finish() warns when a short flush meets outer momentum")
+def _():
+    """Measured to cost ~1.8 points of eval accuracy, so it must not be silent."""
+    import logging
+
+    from pww.diloco import DiLoCo, build_replicas
+
+    replicas = build_replicas(1, rank=0, world_size=1)
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("pww")
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        # With momentum: 3 of H=100 is well under half, so warn.
+        dl = DiLoCo(model := _tiny_model(), replicas, inner_steps=100,
+                    outer_momentum=0.9)
+        for _ in range(3):
+            dl.inner_step()
+        dl.finish()
+        assert any("mis-scaled" in m for m in records), records
+
+        # Without momentum the flush is harmless, so stay quiet.
+        records.clear()
+        dl = DiLoCo(model, replicas, inner_steps=100, outer_optimizer="sgd",
+                    outer_lr=1.0, outer_momentum=0.0)
+        for _ in range(3):
+            dl.inner_step()
+        dl.finish()
+        assert not any("mis-scaled" in m for m in records), records
+    finally:
+        logger.removeHandler(handler)
+
+
 @check("global_model() swaps theta in and restores local weights on exit")
 def _():
     from pww.diloco import DiLoCo, build_replicas

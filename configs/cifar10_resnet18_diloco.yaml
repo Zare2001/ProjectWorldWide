@@ -40,19 +40,28 @@ diloco-replicas: 2
 # near 1.0 means the replicas still agree, near 1/sqrt(k) means averaging is
 # cancelling most of their progress and H is too large.
 #
-# Also check the other end: H must be small enough that T = total_steps / H
-# reaches at least the tens, or the outer momentum below never gets going and
-# only its 1.9x overshoot is felt. At 30 epochs x ~195 steps (k=2) this gives
-# T~58, which is enough. Lower `epochs` and you should lower H with it.
+# Count the steps when picking H: DistributedSampler shards over the *world*, not
+# per replica, so steps per epoch is 50000/(ranks * batch-size) regardless of k.
+# On 8 GCDs at batch 128 that is 48, so 30 epochs is 1440 inner steps and H=100
+# gives T=14 outer steps. Measured here: 92.17% at H=100 against 92.41% at H=25,
+# so the 4x extra communication buys 0.24 points -- keep H=100.
 diloco-inner-steps: 100
 
-# OuterOpt. Nesterov momentum at these values is the paper's choice, and is right
-# once T is large. On a short run, or on a BatchNorm model, compare against
-# FederatedAveraging first -- see the measured warning in the README:
-#   --diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0
-diloco-outer-optimizer: nesterov
-diloco-outer-lr: 0.7
-diloco-outer-momentum: 0.9
+# OuterOpt. NOT the paper's Nesterov, deliberately -- measured on this model,
+# 8 GCDs, 30 epochs, against 93.35% for plain DDP:
+#
+#   sgd 1.0/0.0 (this)      H=100 -> 92.17%      H=25 -> 92.41%
+#   nesterov 0.7/0.9        H=100 -> 85.70%      H=25 -> 90.04%
+#
+# Nesterov's outer step overshoots past every replica's weights, landing theta
+# outside their convex hull, where the averaged BatchNorm running statistics no
+# longer apply. FedAvg's mean_i theta_i stays inside it. The paper's models use
+# LayerNorm and have no running statistics to invalidate, which is why their
+# default is fine there and not here -- revisit it for the LLM phase. The full
+# write-up is in the README.
+diloco-outer-optimizer: sgd
+diloco-outer-lr: 1.0
+diloco-outer-momentum: 0.0
 
 save-every: 10
 log-every: 50

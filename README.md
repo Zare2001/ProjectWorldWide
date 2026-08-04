@@ -259,34 +259,49 @@ momentum, and one flat communication buffer. Under FSDP all three are sharded
 with the model. `--diloco-outer-device cpu` moves two of them to host memory in
 exchange for two host↔device copies every `H` steps.
 
-### One measured warning: `T` matters as much as `H`
+### Measured: on a BatchNorm model, use FederatedAveraging
 
-A deliberately tiny CPU run (4 gloo ranks, 3 epochs x 40 steps, per-rank batch 32,
-so 120 inner steps and only **T=6 outer steps**), everything identical except the
-outer optimizer:
+Four runs on one LUMI node, `k=2` x 4 GCDs, ResNet-18, 30 epochs, per-rank batch
+128, everything identical except the outer optimizer and `H`. Plain DDP on the
+same node gets **93.35%**:
 
-| outer optimizer | eval acc, epochs 1/2/3 | final eval loss |
-|---|---|---|
-| *(none — plain DDP over all 4 ranks)* | 12.3 / 30.2 / **35.9** | 1.84 |
-| `sgd`, lr 1.0, momentum 0 (FederatedAveraging) | 16.4 / 33.7 / **39.1** | 1.77 |
-| `nesterov`, lr 0.7, momentum 0.9 (paper defaults, shipped) | 10.0 / 10.5 / **24.6** | 3.67 |
+| outer optimizer | `H` | `T` | best eval | vs DDP |
+|---|---|---|---|---|
+| `sgd` 1.0 / 0 (FederatedAveraging) | 25 | 58 | **92.41%** | −0.94 |
+| `sgd` 1.0 / 0 (FederatedAveraging) | 100 | 15 | **92.17%** | −1.18 |
+| `nesterov` 0.7 / 0.9 (paper defaults) | 25 | 58 | 90.04% | −3.31 |
+| `nesterov` 0.7 / 0.9 (paper defaults) | 100 | 15 | 85.70% | −7.65 |
 
-FederatedAveraging tracked plain DDP; the paper's Nesterov defaults were much
-worse, with a first-epoch eval loss of 290. Two things plausibly contribute, and
-this run does not separate them: the outer step overshoots each replica's own
-progress by `1 + momentum` = 1.9x, and BatchNorm running statistics were collected
-at the replicas' weights rather than at the extrapolated `θ`, so eval uses
-mismatched statistics (train accuracy stayed close to DDP throughout — 33.7 vs
-31.1 — while eval collapsed).
+**FederatedAveraging at `H`=100 gives up 1.2 points of accuracy for a 100x
+reduction in inter-replica communication, at identical throughput** (38,475 vs
+38,400 img/s). That is DiLoCo working as advertised.
 
-**Do not read this as a verdict on the paper's defaults.** `T=6` is far outside
-the regime they were tuned in: outer momentum of 0.9 needs tens to hundreds of
-outer steps to be worth having, and the paper's models use LayerNorm, which has no
-running statistics to mismatch. The actionable rule is that **`H` should be chosen
-so that `T` reaches at least the tens**, and if you are running DiLoCo on a
-BatchNorm model with few outer steps, compare against
-`--diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0`
-before trusting the defaults.
+The paper's Nesterov defaults cost 6.5 points more than FedAvg here, and the
+mechanism is visible in the logs. `θ⁽ᵗ⁾ = θ⁽ᵗ⁻¹⁾ − lr(1+momentum)·Δ` overshoots
+*past* every replica's actual weights, so `θ` lands outside their convex hull —
+whereas FedAvg's `mean_i θᵢ` lands inside it. BatchNorm running statistics were
+collected at the replicas' weights, so they remain valid for an interpolation and
+do not for an extrapolation. Hence eval losses of 223 and 32832 early on, decaying
+back to sane values in exact step with `‖Δ‖` (18.5 → 0.38), while *training*
+accuracy stayed healthy at 92%. It is not purely an eval artifact either — train
+accuracy visibly regresses across an outer step (77.4% → 51.2% at outer step 5),
+so the extrapolated `θ` really is a worse model, not just a badly-measured one.
+
+Both knobs matter and the outer optimizer dominates. `T` matters only for the
+momentum variants — halving `H` bought Nesterov 4.3 points and FedAvg 0.24, which
+is what you would expect from an optimizer that has no momentum buffer to warm up.
+
+None of this contradicts the paper: their models use LayerNorm, which keeps no
+running statistics to invalidate. **`configs/cifar10_resnet18_diloco.yaml`
+therefore ships FedAvg**, while the code default in `diloco.py` stays at the
+paper's Nesterov — revisit that for the LLM phase, where the interaction goes away.
+
+**One more thing to know:** `finish()` flushes a trailing partial inner phase, and
+with momentum that step is mis-scaled — the buffer holds momentum accumulated from
+full-length `H`-step deltas while `Δ` covers only the short remainder. Measured at
+the last epoch: Nesterov lost 1.81 and 0.90 points to the flush, FedAvg gained
+0.13 and 0.14. Either make the step count a multiple of `H`, or take the
+second-to-last checkpoint, or use FedAvg.
 
 ### What is verified
 
@@ -295,8 +310,7 @@ before trusting the defaults.
 | outer-step arithmetic, layout, state round-trip | `tests/test_local.py`, 27 checks, single process |
 | group membership, cross-replica averaging, `θ(0)` alignment, DDP-in-replica reconvergence | `tests/test_diloco_gloo.py`, real process groups over gloo on CPU |
 | the same on GPU with RCCL | **verified** on one LUMI node, `k=2 x 4` GCDs (job 20646477): group membership correct, outer step exactly `0.5000` |
-| it trains, and roughly tracks DDP | yes, but only on a 120-step CPU toy run — see the warning above |
-| **convergence at scale** | **not yet measured** — run `job_cifar_diloco.sh` against the 93.35% DDP reference below |
+| **convergence** | **measured** — 92.41% against 93.35% for plain DDP, one LUMI node, `k=2`. See the table above |
 | DiLoCo + FSDP | code path exists (`--parallel fsdp`) and is sharding-aware, but **untested**; CIFAR is too small to shard meaningfully |
 
 Note also that `k` replicas are only usefully *independent* while they share one
