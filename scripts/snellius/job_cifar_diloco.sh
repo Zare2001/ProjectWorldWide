@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pww-cifar-diloco
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=18
+#SBATCH --cpus-per-task=16
+#SBATCH --distribution=block:block
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
@@ -14,11 +15,11 @@
 #   sbatch scripts/snellius/job_cifar_diloco.sh                       # k=2 x 2 GPUs
 #   sbatch scripts/snellius/job_cifar_diloco.sh --diloco-replicas 4   # k=4 x 1 GPU
 #
-# !! UNVERIFIED -- like every other script under scripts/snellius/, this was
-#    written from SURF documentation. Run ./scripts/siteinfo.sh and correct
-#    sites/snellius.sh first. The DiLoCo code itself is site-independent and is
-#    verified on LUMI plus by tests/test_diloco_gloo.py, so the risk here is the
-#    partition/GPU/core values above, not the algorithm.
+# The Snellius path itself is verified end to end; the headers above match
+# job_cifar_1node.sh. What has NOT been run is DiLoCo on this site specifically --
+# it is verified on LUMI (92.41% against 93.35% for DDP) and by
+# tests/test_diloco_gloo.py, and nothing in diloco.py is site-dependent, so this
+# is expected to work rather than known to.
 #
 # k must divide the number of ranks, which is 4 here against LUMI's 8 -- so the
 # usable values are k=1,2,4 rather than k=1,2,4,8. To compare a run against LUMI,
@@ -44,10 +45,10 @@ source "${PWW_ROOT}/env.sh"
 export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
 export MASTER_PORT=29500
 
-# [VERIFY] InfiniBand interface name. `ibstat`/`ip link` on a GPU node will say;
-# NCCL usually picks it correctly on its own, so this is commented out until a
-# multi-node run shows single-digit GB/s in the smoke test.
-#export NCCL_SOCKET_IFNAME=ib
+# NCCL found InfiniBand unaided on the verified multi-node runs (133.1 GB/s across
+# two nodes), so this stays off. If the smoke test ever reports single-digit GB/s
+# across nodes it fell back to TCP -- the interfaces here are ibp*/mlx5, not ib0.
+#export NCCL_SOCKET_IFNAME=ibp
 
 echo "nodes: ${SLURM_JOB_NUM_NODES} | ranks: ${SLURM_NTASKS} | master: ${MASTER_ADDR}"
 

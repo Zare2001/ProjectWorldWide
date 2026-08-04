@@ -126,7 +126,7 @@ benchmarked head to head on the same jobs:
 | CIFAR-10, 30 ep, 8 GCDs | 93.35% @ 38,400 img/s | 93.27% @ 37,700 img/s |
 | all-reduce, 1 node | 123 GB/s | 123.4 GB/s |
 | all-reduce, 2 nodes | 88 GB/s | 87.8 GB/s |
-| `tests/test_local.py` (17 checks then, 27 now) | all pass | all pass |
+| `tests/test_local.py` (17 checks then, 28 now) | all pass | all pass |
 | flash-attn | 2.7.3 | 2.8.0 |
 | transformers | 4.55.3 | 4.57.3 |
 | Transformer Engine | -- | 2.4.0 |
@@ -318,6 +318,9 @@ Slurm allocation here. Running one replica per cluster across LUMI and Snellius
 would need an outer-gradient transport that does not exist yet: there is no
 shared filesystem between the two sites and compute nodes reach the outside world
 only through a slow proxy, so it would need a staging host both sides can reach.
+[TODO.md](TODO.md) plans exactly that, using consolidated checkpoints as the
+transport rather than a collective — which is the same outer step with a different
+carrier, since `Δ` is just a difference of two checkpoints.
 `diloco.py` is structured so that only the two `dist.all_reduce` calls in
 `outer_step` would have to change.
 
@@ -382,7 +385,7 @@ git clone <this repo> && cd ProjectWorldWide
 ./scripts/bootstrap.sh
 ./scripts/download_data.sh         # once, from a login node
 
-source env.sh && pww_run python3 tests/test_local.py    # must be 17/17
+source env.sh && pww_run python3 tests/test_local.py    # must be 28/28
 sbatch scripts/snellius/job_smoke.sh                    # must print SMOKE TEST PASSED
 sbatch scripts/snellius/job_cifar_1node.sh --config configs/cifar10_resnet18.yaml
 sbatch scripts/snellius/job_cifar_multinode.sh
@@ -396,7 +399,7 @@ Verified on Snellius, all on `gpu_h100`:
 
 | check | result |
 |---|---|
-| `tests/test_local.py` | 17/17 |
+| `tests/test_local.py` | all pass (17 checks when measured, 28 now) |
 | `job_cifar_debug.sh` (1 GPU) | passes in 21 s |
 | `job_smoke.sh` (1 node, 4 GPUs) | passes, 300.8 GB/s all-reduce |
 | `job_smoke.sh --nodes=2` (8 GPUs) | passes, 133.1 GB/s all-reduce over InfiniBand |
