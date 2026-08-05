@@ -60,14 +60,17 @@ elif [[ -x "${VENV_DIR}/bin/python3" ]]; then
     PYTHON_BIN="${VENV_DIR}/bin/python3"
 fi
 
+NUM_SAMPLES="${NUM_SAMPLES:-50000}"
+BLOCK_SIZE="${BLOCK_SIZE:-1000}"
+
 # 1. Start DARL Coordinator
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
-    echo "Starting DARL Lease Coordinator on port ${DARL_PORT}..."
+    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE})..."
     DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
-        --num-samples 1000000 \
-        --block-size 10000 > "${STATE_DIR}/darl.log" 2>&1 &
+        --num-samples "${NUM_SAMPLES}" \
+        --block-size "${BLOCK_SIZE}" > "${STATE_DIR}/darl.log" 2>&1 &
     echo "DARL started."
 fi
 
