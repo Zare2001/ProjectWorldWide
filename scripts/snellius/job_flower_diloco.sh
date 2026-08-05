@@ -22,6 +22,12 @@ source "${PWW_ROOT}/env.sh"
 
 export PYTHONNOUSERSITE=0
 
+# Fix Snellius XALT module OpenSSL 3 shared library conflict
+module unload XALT 2>/dev/null || true
+if [[ -d "/sw/arch/RHEL9/EB_production/2024/software/OpenSSL/3/lib64" ]]; then
+    export LD_LIBRARY_PATH="/sw/arch/RHEL9/EB_production/2024/software/OpenSSL/3/lib64:${LD_LIBRARY_PATH:-}"
+fi
+
 # Ensure forked Flower repository (fedmom-strategy branch) is installed
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
 if ! pww_run python3 -c "import flwr" 2>/dev/null; then
@@ -30,7 +36,7 @@ fi
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
-FLOWER_PORT="${FLOWER_PORT:-29511}"
+FLOWER_PORT="${FLOWER_PORT:-29512}"
 
 # Resolve DARL_TOKEN if not explicitly set
 if [[ -z "${DARL_TOKEN:-}" ]]; then
