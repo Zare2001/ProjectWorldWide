@@ -123,6 +123,7 @@ def main() -> None:
     g.add_argument("--darl-port", type=int, default=29510, help="DARL HTTP port")
     g.add_argument("--flower-port", type=int, default=29511, help="Flower gRPC port")
     g.add_argument("--cluster-id", type=str, default=None, help="snellius or lumi")
+    g.add_argument("--inner-steps", type=int, default=100, help="H inner steps")
 
     g = parser.add_argument_group("model")
     g.add_argument("--model", type=str, default="resnet18", choices=sorted(RESNET_FACTORY))
@@ -139,10 +140,6 @@ def main() -> None:
     g.add_argument("--momentum", type=float, default=0.9)
     g.add_argument("--weight-decay", type=float, default=5e-4)
     g.add_argument("--warmup-epochs", type=int, default=2)
-
-    g = parser.add_argument_group("diloco")
-    g.add_argument("--inner-steps", "--diloco-inner-steps", type=int, default=100, dest="inner_steps", help="H inner steps")
-    g.add_argument("--diloco-replicas", type=int, default=2)
 
     g = parser.add_argument_group("execution")
     g.add_argument("--save-every", type=int, default=10)
@@ -192,7 +189,7 @@ def main() -> None:
         loader=loader,
         sampler=sampler,
         darl_source=darl_source,
-        inner_steps=args.inner_steps,
+        inner_steps=getattr(args, "inner_steps", None) or getattr(args, "diloco_inner_steps", 100),
         device=device,
     )
 
