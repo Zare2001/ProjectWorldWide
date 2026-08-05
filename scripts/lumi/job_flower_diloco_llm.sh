@@ -21,6 +21,19 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
 fi
 source "${PWW_ROOT}/env.sh"
 
+export PYTHONNOUSERSITE=0
+export SINGULARITYENV_PYTHONNOUSERSITE=0
+
+export NCCL_SOCKET_IFNAME=hsn
+export NCCL_NET_GDR_LEVEL=PHB
+export FI_CXI_DEFAULT_CQ_SIZE=131072
+
+# Ensure forked Flower repository (fedmom-strategy branch) is installed inside container
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
+if ! pww_run python3 -c "import flwr" 2>/dev/null; then
+    pww_run python3 -m pip install --user "${FLOWER_REPO}"
+fi
+
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
