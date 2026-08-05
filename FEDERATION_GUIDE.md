@@ -196,3 +196,91 @@ curl -sS -H "X-DARL-Token: $(cat runs/darl/token)" http://145.38.206.143:29510/s
 | **Flower Server stuck waiting** | The server requires both Snellius AND LUMI to connect (`min_clients=2`). | Check `squeue` on both sites. Training starts automatically as soon as the second cluster enters `RUNNING` status. |
 | **DARL Lease Expiry** | Slurm walltime expired mid-epoch on one cluster. | **Self-healing**: DARL automatically expires uncommitted leases via TTL and returns blocks to the pool so the surviving cluster completes the epoch. |
 | **`Connection refused` on 29511** | Central Node services are not running. | Run `./scripts/central_node/start_central_services.sh` on the Central Node (`145.38.206.143`). |
+
+---
+
+## 7. LLM Multi-Site Federated Runbook (GPT-2, LLaMA & Qwen)
+
+This section provides a complete runbook for scaling federated DiLoCo training from ResNet/CIFAR-10 to **Causal Language Models (LLMs)** on pre-tokenized datasets across Snellius (NVIDIA H100) and LUMI (AMD MI250X).
+
+### 7.1 Dataset & Tokenization Formats
+
+The LLM data loader ([src/pww/data/text.py](file:///home/zpalanciya/data/thomasistriplet/ProjectWorldWide/src/pww/data/text.py)) handles continuous token streams sliced into fixed context windows (`seq_len=1024/2048/4096`). It supports three tokenized dataset inputs:
+
+1. **HuggingFace Datasets**: Online hub datasets (e.g. `wikitext`, `allenai/c4`) or pre-tokenized datasets saved to disk via `dataset.save_to_disk()`.
+2. **Binary Memory-Mapped Token Arrays**: Flat `.bin` or `.npy` arrays of `uint16` / `uint32` token IDs (FineWeb, Megatron, or NanoGPT format).
+3. **PyTorch Token Tensors**: Saved `.pt` files containing 1D `input_ids`.
+
+DARL dynamically partitions the total token count into token blocks (e.g. 100,000 tokens per block) so Snellius and LUMI train on disjoint token subsets without overlapping data.
+
+---
+
+### 7.2 Running the Fast LLM Integration Test (GPT-2 124M)
+
+Use the lightweight GPT-2 configuration ([configs/llm_gpt2_diloco.yaml](file:///home/zpalanciya/data/thomasistriplet/ProjectWorldWide/configs/llm_gpt2_diloco.yaml)) to verify end-to-end multi-site execution in minutes:
+
+#### Step 1: Start Central Node Daemons (Central VM)
+```bash
+./scripts/central_node/stop_central_services.sh
+./scripts/central_node/start_central_services.sh
+```
+
+#### Step 2: Submit Slurm Jobs on HPC Clusters
+
+* **On Snellius (NVIDIA H100)**:
+  ```bash
+  cd ~/ProjectWorldWide
+  git pull origin main
+  sbatch scripts/snellius/job_flower_diloco_llm.sh
+  ```
+
+* **On LUMI (AMD MI250X)**:
+  ```bash
+  cd ~/ProjectWorldWide
+  git pull origin main
+  sbatch scripts/lumi/job_flower_diloco_llm.sh
+  ```
+
+---
+
+### 7.3 Scaling to 1B – 7B LLMs (LLaMA-3 / Qwen-2.5 with FSDP & FlashAttention)
+
+To train larger models, pass the 7B scaling configuration ([configs/llm_7b_diloco.yaml](file:///home/zpalanciya/data/thomasistriplet/ProjectWorldWide/configs/llm_7b_diloco.yaml)) when submitting Slurm jobs.
+
+#### Feature Highlights for 7B Models:
+* **FSDP (Fully Sharded Data Parallel)**: Shards weights, gradients, and optimizer states across all node GPUs.
+* **FlashAttention-2 / SDPA**: Native PyTorch Scaled Dot-Product Attention for high attention throughput.
+* **Mixed Precision (`bf16`)**: Native bfloat16 computation on H100 & MI250X tensor cores.
+
+#### Launch Commands:
+
+* **On Snellius**:
+  ```bash
+  sbatch scripts/snellius/job_flower_diloco_llm.sh --config configs/llm_7b_diloco.yaml
+  ```
+
+* **On LUMI**:
+  ```bash
+  sbatch scripts/lumi/job_flower_diloco_llm.sh --config configs/llm_7b_diloco.yaml
+  ```
+
+---
+
+### 7.4 Monitoring LLM Metrics & Perplexity
+
+* **Stream Central Outer Aggregation Log**:
+  ```bash
+  tail -f runs/central/flower.log
+  ```
+
+* **Expected Log Output**:
+  ```text
+  INFO : [ROUND 1]
+  INFO : configure_fit: strategy sampled 2 clients (out of 2)
+  INFO : aggregate_fit: received 2 results and 0 failures
+  INFO :   >> Aggregated Training Loss: 3.4120  (2 clusters, 51,200 tokens)
+  INFO : configure_evaluate: strategy sampled 2 clients (out of 2)
+  INFO : aggregate_evaluate: received 2 results and 0 failures
+  INFO :   >> Test Accuracy (Perplexity): 30.33  (per-cluster: [30.12, 30.54], 20,480 test tokens)
+  ```
+
