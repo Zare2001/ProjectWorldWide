@@ -47,6 +47,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         loader: DataLoader,
+        eval_loader: DataLoader | None,
         sampler: LeasedSampler,
         darl_source: DARLDataSource,
         inner_steps: int,
@@ -55,6 +56,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         self.model = model
         self.optimizer = optimizer
         self.loader = loader
+        self.eval_loader = eval_loader
         self.sampler = sampler
         self.darl_source = darl_source
         self.inner_steps = inner_steps
@@ -115,6 +117,38 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         num_samples_trained = max(1, step_count * self.loader.batch_size)
         return self.get_parameters(config={}), num_samples_trained, {"loss": float(avg_loss)}
 
+    def evaluate(self, parameters: list, config: dict) -> tuple[float, int, dict]:
+        if parameters:
+            self.set_parameters(parameters)
+
+        if self.eval_loader is None:
+            return 0.0, 0, {}
+
+        self.model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        criterion = nn.CrossEntropyLoss()
+
+        with torch.no_grad():
+            for x, y in self.eval_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                out = self.model(x)
+                loss = criterion(out, y)
+                total_loss += loss.item() * x.size(0)
+                correct += (out.argmax(dim=1) == y).sum().item()
+                total += x.size(0)
+
+        avg_loss = total_loss / max(1, total)
+        accuracy = (correct / max(1, total)) * 100.0
+
+        if D.is_leader():
+            logger.info(
+                f"DiLoCo Outer Round Evaluation -> Test Loss: {avg_loss:.4f}, Test Acc: {accuracy:.2f}%"
+            )
+
+        return float(avg_loss), total, {"accuracy": float(accuracy)}
+
     def fit(self, parameters: list, config: dict) -> tuple:
         if D.world_size() > 1 and D.is_leader():
             import torch.distributed as dist
@@ -132,6 +166,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 break
             elif msg == "FIT":
                 self._execute_local_phase(params)
+            elif msg == "EVAL":
+                self.evaluate(params, {})
 
 
 def main() -> None:
@@ -191,10 +227,13 @@ def main() -> None:
     # 2. Build dataset and DARL Data Source
     data_root = args.data_root or str(Path(os.environ.get("PWW_DATA_DIR", "./data")) / "cifar10")
     train_dataset = datasets.CIFAR10(root=data_root, train=True, download=False, transform=_transforms(True))
+    eval_dataset = datasets.CIFAR10(root=data_root, train=False, download=False, transform=_transforms(False))
+
     space = BlockSpace(num_samples=len(train_dataset), block_size=1000, seed=args.seed)
 
     sampler = LeasedSampler()
     loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
+    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     if info.is_master:
         darl_token = args.darl_token or os.environ.get("DARL_TOKEN", "")
@@ -221,6 +260,7 @@ def main() -> None:
         model=model,
         optimizer=optimizer,
         loader=loader,
+        eval_loader=eval_loader,
         sampler=sampler,
         darl_source=darl_source,
         inner_steps=getattr(args, "inner_steps", None) or getattr(args, "diloco_inner_steps", 100),
