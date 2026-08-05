@@ -805,6 +805,9 @@ The ProjectWorldWide codebase natively supports **Causal Language Model (LLM) pr
 3. **Zero Sample Duplication**: Before each inner phase, Snellius and LUMI lease fresh token block spans via lightweight 50-byte HTTP `/acquire` calls. Snellius and LUMI train on completely disjoint token blocks.
 4. **Decoupled Rounds & Epochs**: A single 1-epoch corpus supports hundreds or thousands of Flower outer aggregation rounds ($H$ inner steps per round) without repeating a single token.
 
+#### Note on Tokenizers (`src/pww/data/tokenizer.py`):
+For standard pre-trained LLMs (LLaMA-3, Qwen-2.5, GPT-2), tokenizers are loaded automatically from HuggingFace via `AutoTokenizer.from_pretrained()`. A custom `data/tokenizer.py` script is an optional utility helper if you wish to train a brand-new BPE / SentencePiece tokenizer from scratch on raw text files.
+
 ---
 
 ### Inner Loop Optimization & Parallelism Stack

@@ -144,3 +144,7 @@ Only once this behaves should LUMI enter the picture.
   belong in `/projects`, or they will vanish mid-experiment.
 - **Snellius priority is ~98% fairshare** with a 1-day decay half-life. A long
   federated sweep will steadily lower your own queue priority.
+
+## LLM Extension & Utility Helpers
+
+- [ ] **Custom Tokenizer Training (`src/pww/data/tokenizer.py`)**: (Optional) For standard pre-trained LLMs (LLaMA-3, Qwen-2.5, GPT-2), tokenizers are loaded automatically from HuggingFace via `AutoTokenizer.from_pretrained()`. `tokenizer.py` is an optional utility helper if you wish to train a brand-new BPE/SentencePiece tokenizer from scratch on raw text corpora.
