@@ -107,6 +107,7 @@ def build_hf_tokenized_dataset(
         tokenized = hf_dataset.map(
             tokenize_function,
             batched=True,
+            num_proc=4,
             remove_columns=hf_dataset.column_names,
             desc="Tokenizing dataset",
         )
