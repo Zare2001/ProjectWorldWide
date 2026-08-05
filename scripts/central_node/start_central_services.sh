@@ -33,25 +33,23 @@ echo " Flower Port: ${FLOWER_PORT}"
 echo " State Dir:   ${STATE_DIR}"
 echo "========================================================="
 
-# 0. Setup Environment using uv or venv
-if command -v uv >/dev/null 2>&1; then
-    echo "Using uv for environment management..."
-    if [[ ! -d "${VENV_DIR}" ]]; then
-        uv venv "${VENV_DIR}"
-    fi
-    uv pip install --python "${VENV_DIR}/bin/python" "${FLOWER_REPO}"
-    PYTHON_BIN="${VENV_DIR}/bin/python3"
-else
-    echo "uv not found, using python3 venv..."
-    if [[ ! -d "${VENV_DIR}" ]]; then
-        python3 -m venv "${VENV_DIR}" 2>/dev/null || true
-    fi
-    if [[ -x "${VENV_DIR}/bin/pip" ]]; then
+# 0. Setup Environment: uv -> venv -> pip --break-system-packages
+PYTHON_BIN="python3"
+
+if ! python3 -c "import flwr" 2>/dev/null; then
+    echo "Installing Flower from ${FLOWER_REPO}..."
+    if command -v uv >/dev/null 2>&1; then
+        echo "Using uv..."
+        uv pip install --system "${FLOWER_REPO}" 2>/dev/null || uv pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || true
+    elif python3 -m venv "${VENV_DIR}" 2>/dev/null && [[ -x "${VENV_DIR}/bin/pip" ]]; then
+        echo "Using python3 venv..."
         "${VENV_DIR}/bin/pip" install "${FLOWER_REPO}"
         PYTHON_BIN="${VENV_DIR}/bin/python3"
     else
-        pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || pip install "${FLOWER_REPO}"
-        PYTHON_BIN="python3"
+        echo "Using pip with --break-system-packages..."
+        python3 -m pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || \
+        python3 -m pip install --user --break-system-packages "${FLOWER_REPO}" 2>/dev/null || \
+        pip install --break-system-packages "${FLOWER_REPO}"
     fi
 fi
 
