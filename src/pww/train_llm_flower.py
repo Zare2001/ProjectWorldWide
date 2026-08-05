@@ -25,7 +25,7 @@ from .config import add_common_args, apply_config_file, resolve_output_dir
 from .darl.client import LeaseClient, LeaseSession
 from .darl.space import BlockSpace
 from .darl.torch_data import DARLDataSource, LeasedSampler
-from .distributed import DistributedInfo as D
+from . import distributed as D
 from .logging_utils import get_logger, setup_logging
 from .models.llm import build_llm
 from .data.text import TokenizedDataset, build_hf_tokenized_dataset
