@@ -134,7 +134,7 @@ def main() -> None:
     g = parser.add_argument_group("data")
     g.add_argument("--data-root", type=str, default=None, help="default: $PWW_DATA_DIR/cifar10")
     g.add_argument("--batch-size", type=int, default=128, help="PER-RANK batch size")
-    g.add_argument("--num-workers", type=int, default=6)
+    g.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (use 0 for gRPC compatibility)")
 
     g = parser.add_argument_group("optimisation")
     g.add_argument("--epochs", type=int, default=30)
@@ -173,7 +173,7 @@ def main() -> None:
     space = BlockSpace(num_samples=len(train_dataset), block_size=1000, seed=args.seed)
 
     sampler = LeasedSampler()
-    loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2)
+    loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
 
     if info.is_master:
         darl_token = args.darl_token or os.environ.get("DARL_TOKEN", "")
