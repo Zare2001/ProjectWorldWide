@@ -142,7 +142,7 @@ status)
     fi
     if [[ -s "${DARL_TOKEN_FILE}" ]]; then
         export DARL_TOKEN="$(cat "${DARL_TOKEN_FILE}")"
-        pww_run python3 -m pww.darl.client status --url "$(darl_url)" || true
+        pww_run python3 -W ignore::RuntimeWarning -m pww.darl.client status --url "$(darl_url)" || true
     fi
     ;;
 
