@@ -112,7 +112,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         if D.is_leader():
             logger.info(f"Completed local inner phase ({step_count} steps), avg loss: {avg_loss:.4f}")
 
-        return self.get_parameters(config={}), step_count, {"loss": float(avg_loss)}
+        num_samples_trained = max(1, step_count * self.loader.batch_size)
+        return self.get_parameters(config={}), num_samples_trained, {"loss": float(avg_loss)}
 
     def fit(self, parameters: list, config: dict) -> tuple:
         if D.world_size() > 1 and D.is_leader():
