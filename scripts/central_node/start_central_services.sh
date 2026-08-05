@@ -91,6 +91,7 @@ else
         --port "${FLOWER_PORT}" > "${STATE_DIR}/flower.log" 2>&1 &
     echo $! > "${FLOWER_PID_FILE}"
     echo "Flower server started (PID $(cat "${FLOWER_PID_FILE}"))."
+    sleep 2
 fi
 
 echo ""
