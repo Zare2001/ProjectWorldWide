@@ -56,6 +56,7 @@ srun --cpu-bind="$(pww_cpu_bind)" \
         "${PWW_ROOT}/scripts/task_wrapper.sh" \
             python3 -m pww.train_llm_flower \
                 --config "${CONFIG}" \
+                --cluster-id lumi \
                 --central-ip "${CENTRAL_IP}" \
                 --darl-port "${DARL_PORT}" \
                 --flower-port "${FLOWER_PORT}" \
