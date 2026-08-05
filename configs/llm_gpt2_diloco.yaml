@@ -24,3 +24,7 @@ diloco-outer-momentum: 0.0
 save-every: 5
 log-every: 10
 seed: 42
+
+# --- DARL Token Dataset Leasing ---
+darl-num-samples: 2335
+darl-block-size: 100
