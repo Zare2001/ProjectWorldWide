@@ -59,6 +59,7 @@ srun "${PWW_ROOT}/scripts/task_wrapper.sh" \
         --darl-port "${DARL_PORT}" \
         ${DARL_TOKEN:+--darl-token "${DARL_TOKEN}"} \
         --flower-port "${FLOWER_PORT}" \
+        --num-workers 0 \
         --cluster-id "snellius" \
         --config "${PWW_ROOT}/configs/cifar10_resnet18_diloco.yaml" \
         "$@"

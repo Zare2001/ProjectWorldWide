@@ -59,6 +59,7 @@ srun --cpu-bind="$(pww_cpu_bind)" \
                 --darl-port "${DARL_PORT}" \
                 ${DARL_TOKEN:+--darl-token "${DARL_TOKEN}"} \
                 --flower-port "${FLOWER_PORT}" \
+        --num-workers 0 \
                 --cluster-id "lumi" \
                 --config "${PWW_ROOT}/configs/cifar10_resnet18_diloco.yaml" \
                 "$@"
