@@ -124,6 +124,18 @@ def all_reduce_sum(value: float, device: torch.device) -> float:
     return tensor.item()
 
 
+def all_reduce_avg_(tensors: torch.Tensor | list[torch.Tensor]) -> None:
+    """Average tensor(s) in-place across all distributed ranks in the process group."""
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    world_size = float(dist.get_world_size())
+    for tensor in tensors:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(world_size)
+
+
 @contextlib.contextmanager
 def master_first():
     """Let rank 0 run the block before anyone else.
