@@ -1,0 +1,24 @@
+# LLaMA-3 / Qwen-2.5 7B Scaling Configuration for Multi-Site DiLoCo & DARL
+# Run across Snellius (NVIDIA H100) and LUMI (AMD MI250X)
+
+model: meta-llama/Llama-3.2-1B
+seq-len: 2048
+batch-size: 2
+gradient-accumulation-steps: 4
+
+dtype: bf16
+attn-implementation: sdpa
+
+# --- DiLoCo Inner Loop ---
+diloco-inner-steps: 100
+lr: 1e-4
+weight-decay: 0.1
+
+# --- Outer Aggregation ---
+diloco-outer-optimizer: sgd
+diloco-outer-lr: 1.0
+diloco-outer-momentum: 0.0
+
+save-every: 10
+log-every: 20
+seed: 42
