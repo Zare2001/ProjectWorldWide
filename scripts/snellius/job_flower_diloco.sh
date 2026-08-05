@@ -24,8 +24,12 @@ export PYTHONNOUSERSITE=0
 
 # Fix Snellius XALT module OpenSSL 3 shared library conflict
 module unload XALT 2>/dev/null || true
+unset LD_PRELOAD
 if [[ -d "/sw/arch/RHEL9/EB_production/2024/software/OpenSSL/3/lib64" ]]; then
     export LD_LIBRARY_PATH="/sw/arch/RHEL9/EB_production/2024/software/OpenSSL/3/lib64:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH}" | tr ':' '\n' | grep -v "/opt/xalt" | paste -sd:)
 fi
 
 # Ensure forked Flower repository (fedmom-strategy branch) is installed
@@ -36,7 +40,7 @@ fi
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
-FLOWER_PORT="${FLOWER_PORT:-29512}"
+FLOWER_PORT="${FLOWER_PORT:-29511}"
 
 # Resolve DARL_TOKEN if not explicitly set
 if [[ -z "${DARL_TOKEN:-}" ]]; then
