@@ -767,42 +767,98 @@ scaled to the replica: `k=2` gives 2 ranks per replica here against 4 on LUMI, s
 the rank count, so a 4-GPU node allows `k` of 1, 2 or 4 — `k=8` is a LUMI-only
 layout.
 
-## Extending to LLM training
+## Extending to LLM Training (Implemented Pipeline)
 
-The intent is that `train_cifar.py` is the only file replaced. What carries over
-unchanged:
+The ProjectWorldWide codebase natively supports **Causal Language Model (LLM) pre-training** on pre-tokenized datasets across Snellius (NVIDIA H100) and LUMI (AMD MI250X) using **Flower + DARL + HuggingFace `Trainer` + FSDP**.
 
-- `distributed.py` -- rank/device resolution is task-independent
-- `parallel.py` -- `wrap_model(..., strategy="fsdp", transformer_layer_cls={YourDecoderLayer}, activation_checkpointing=True)`
-- `checkpoint.py` -- switch to `--sharded-checkpoint`; it resumes onto a
-  different world size, which matters when a run is requeued at a different scale
-- `diloco.py` -- nothing in it knows what is being trained. The `--diloco-*`
-  flags live in `config.add_common_args`, so a new entrypoint gets them by
-  calling `build_replicas` / `DiLoCo` and `diloco.inner_step()` after
-  `optimizer.step()`. This is where DiLoCo starts paying off: `H` in the hundreds
-  is a rounding error against an LLM step, and `--inner-optimizer adamw` matches
-  the paper
-- `config.py`, `logging_utils.py`, all `scripts/` and `env.sh`
+### System Architecture for Multi-Site LLM Training
 
-What needs writing:
+```
+                  +-------------------------------------------------+
+                  |            CENTRAL ORCHESTRATOR NODE            |
+                  |            (Ubuntu 24.04 @ 145.38.206.143)     |
+                  |  +-------------------+   +-------------------+  |
+                  |  | DARL Coordinator  |   | Flower Server     |  |
+                  |  | (Token Leases)    |   | (FedMom / FedAvg) |  |
+                  |  +---------+---------+   +---------^---------+  |
+                  +------------|-----------------------|------------+
+                               | Lease Spans           | FedMom Weights
+                               |                       |
+                 +-------------+------------+          |
+                 |                          |          |
+     +-----------v-----------+  +-----------v----------++
+     |    SNELLIUS CLUSTER   |  |     LUMI CLUSTER      |
+     |  NVIDIA H100 (SURF)   |  |  AMD MI250X (EuroHPC) |
+     |                       |  |                       |
+     |  train_llm_flower.py  |  |  train_llm_flower.py  |
+     |  (HuggingFace Trainer |  |  (HuggingFace Trainer |
+     |   FSDP + FlashAttn-2) |  |   FSDP + FlashAttn-2) |
+     +-----------------------+  +-----------------------+
+```
 
-1. `data/tokenizer.py` -- train or load your tokenizer; write it once from rank 0
-   (see `distributed.master_first`)
-2. `data/text.py` -- tokenise the corpus to a flat `uint16`/`uint32` memmap of
-   token ids, then serve fixed-length blocks. Do the tokenisation as a separate
-   preprocessing job, not in the dataloader; and prefer one big memmap over many
-   small files, because Lustre handles a few large files far better than many
-   small ones.
-3. `models/transformer.py` -- or a `transformers` config. Pass the decoder layer
-   class to FSDP as the wrap unit; without it the whole model becomes one shard
-   and sharding buys nothing.
-4. `train_llm.py` -- same loop shape, but step-based rather than epoch-based, with
-   gradient accumulation, grad clipping, AdamW, and tokens/s instead of images/s.
+---
 
-Expect to need, in roughly this order: `--dtype bf16`, `--parallel fsdp`,
-activation checkpointing, gradient accumulation for the target global batch, then
-sharded checkpoints. `parallel.build_mesh` is where tensor parallelism would go
-if a model outgrows pure FSDP.
+### How Single-Pass LLM Dataset Partitioning Works (DARL)
+
+1. **Continuous 1D Token Stream**: The pre-tokenized corpus (e.g. FineWeb, C4, RedPajama) is sliced into fixed-length sequence windows (`seq_len=1024/2048/4096`).
+2. **Dynamic 1-Epoch Leasing (`DARL_EPOCHS=1`)**: The dataset is divided into DARL token blocks (e.g., 100,000 tokens per block). All blocks start in the pool as `UNASSIGNED`.
+3. **Zero Sample Duplication**: Before each inner phase, Snellius and LUMI lease fresh token block spans via lightweight 50-byte HTTP `/acquire` calls. Snellius and LUMI train on completely disjoint token blocks.
+4. **Decoupled Rounds & Epochs**: A single 1-epoch corpus supports hundreds or thousands of Flower outer aggregation rounds ($H$ inner steps per round) without repeating a single token.
+
+---
+
+### Inner Loop Optimization & Parallelism Stack
+
+Inside each HPC cluster, the inner training loop is managed by HuggingFace `Trainer` + PyTorch FSDP:
+
+* **Optimizer**: `AdamW` with cosine decay and `weight_decay=0.01/0.1`.
+* **Gradient Accumulation & Clipping**: Micro-batch size accumulation with `max_grad_norm=1.0` gradient norm clipping.
+* **Mixed Precision (`bf16`)**: Native bfloat16 computation on H100 and MI250X tensor cores.
+* **FSDP (Fully Sharded Data Parallel)**: Shards model parameters, gradients, and optimizer states across all node GPUs, enabling 1B to 7B+ model training without VRAM OOM.
+* **FlashAttention-2 / PyTorch SDPA**: Native scaled dot-product attention for high throughput.
+
+---
+
+### Quick Start Commands
+
+#### Step 1: Launch Central Daemons
+```bash
+./scripts/central_node/start_central_services.sh
+```
+
+#### Step 2: Submit Slurm Jobs
+
+* **Fast Integration Test (GPT-2 124M on WikiText-2)**:
+  ```bash
+  # On Snellius
+  sbatch scripts/snellius/job_flower_diloco_llm.sh
+
+  # On LUMI
+  sbatch scripts/lumi/job_flower_diloco_llm.sh
+  ```
+
+* **Scaling Run (1B - 7B LLaMA-3 / Qwen-2.5)**:
+  ```bash
+  # On Snellius
+  sbatch scripts/snellius/job_flower_diloco_llm.sh --config configs/llm_7b_diloco.yaml
+
+  # On LUMI
+  sbatch scripts/lumi/job_flower_diloco_llm.sh --config configs/llm_7b_diloco.yaml
+  ```
+
+---
+
+### Monitoring & Evaluation Metrics
+
+Stream outer round metrics on the Central VM:
+```bash
+tail -f runs/central/flower.log
+```
+
+Log outputs report:
+* **Aggregated Training Loss**: Weighted average loss across clusters.
+* **Token Throughput**: Tokens processed per second (`tokens/sec`).
+* **Validation Perplexity**: Evaluated on test tokens ($\text{PPL} = \exp(\text{loss})$).
 
 ## Reading results
 
