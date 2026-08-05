@@ -85,9 +85,7 @@ start)
     fi
     export DARL_TOKEN="${DARL_TOKEN-$(cat "${DARL_TOKEN_FILE}")}"
 
-    # nohup needs a binary, and pww_run is a shell function, so expand the site's
-    # launch prefix here instead. It is empty on Snellius (native) and a
-    # `singularity exec` on LUMI.
+    export PYTHONPATH="${PWW_ROOT}/src:${PYTHONPATH:-}"
     nohup ${PWW_LAUNCH[@]+"${PWW_LAUNCH[@]}"} python3 -m pww.darl.server \
         --port "${DARL_PORT}" \
         --state-dir "${DARL_STATE_DIR}" \
