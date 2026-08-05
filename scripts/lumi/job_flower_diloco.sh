@@ -37,7 +37,7 @@ fi
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
-FLOWER_PORT="${FLOWER_PORT:-29512}"
+FLOWER_PORT="${FLOWER_PORT:-29511}"
 
 # Resolve DARL_TOKEN if not explicitly set
 if [[ -z "${DARL_TOKEN:-}" ]]; then

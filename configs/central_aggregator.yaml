@@ -15,6 +15,6 @@ num-rounds: 50
 min-clients: 2
 
 # Dataset Leasing Settings (DARL)
-num-samples: 1000000
-block-size: 10000
+num-samples: 50000
+block-size: 1000
 darl-state-dir: "./runs/darl"
