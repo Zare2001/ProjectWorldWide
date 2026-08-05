@@ -30,6 +30,7 @@ export PWW_SITE="$(pww_detect_site)"
 # build on them (e.g. deriving PWW_DATA_DIR from its own PWW_SCRATCH).
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
+export SINGULARITYENV_PYTHONUNBUFFERED=1
 
 # --- Site specifics ---------------------------------------------------------
 # Each sites/<site>.sh must define:
