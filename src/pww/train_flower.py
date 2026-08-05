@@ -63,13 +63,12 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         self.device = device
 
     def get_parameters(self, config: dict) -> list:
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        return [p.detach().cpu().numpy() for p in self.model.parameters() if p.requires_grad]
 
     def set_parameters(self, parameters: list) -> None:
-        state_dict = self.model.state_dict()
-        for (k, _), val in zip(state_dict.items(), parameters):
-            state_dict[k] = torch.from_numpy(val).to(self.device)
-        self.model.load_state_dict(state_dict)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        for p, val in zip(trainable_params, parameters):
+            p.data.copy_(torch.from_numpy(val).to(self.device))
 
     def _execute_local_phase(self, parameters: list | None) -> tuple[list, int, dict]:
         # 1. Synchronize model weights with global params received from FedMom
@@ -157,6 +156,15 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
 
         if self.eval_loader is None:
             return 0.0, 0, {}
+
+        # Calibrate BatchNorm running statistics for the global parameters
+        self.model.train()
+        with torch.no_grad():
+            for i, (x, y) in enumerate(self.loader):
+                if i >= 5:
+                    break
+                x = x.to(self.device)
+                self.model(x)
 
         self.model.eval()
         total_loss = 0.0

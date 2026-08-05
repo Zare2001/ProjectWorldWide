@@ -8,9 +8,11 @@
 darl-port: 29510
 flower-port: 29511
 
-# FedMom Strategy Parameters (Huo et al., 2020)
+# FedMom / FedAvg Strategy Parameters
+# For ResNet with BatchNorm, outer momentum must be 0.0 (FedAvg) to keep outer weights
+# inside the convex hull and preserve BatchNorm statistics (see configs/cifar10_resnet18_diloco.yaml).
 server-learning-rate: 1.0
-server-momentum: 0.9
+server-momentum: 0.0
 num-rounds: 50
 min-clients: 2
 round-timeout: 300.0
