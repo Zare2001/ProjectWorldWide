@@ -111,7 +111,6 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
 
 
 def main() -> None:
-    setup_logging()
     if not HAS_FLWR:
         logger.error("flwr is required on the cluster. Run: pip install flwr")
         sys.exit(1)
@@ -131,6 +130,7 @@ def main() -> None:
 
     # 1. Setup PyTorch distributed environment inside cluster
     D.setup()
+    setup_logging(D.rank())
     device = D.device()
     set_seed(args.seed + D.rank())
 

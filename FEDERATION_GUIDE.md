@@ -1,6 +1,6 @@
 # Multi-Site DiLoCo Federated Training Guide (Snellius + LUMI + Central Node)
 
-This guide provides step-by-step instructions for running distributed DiLoCo training across **Snellius** (SURF, NVIDIA GPUs), **LUMI** (EuroHPC, AMD GPUs), and a **Central Cloud Node** (`145.38.206.143`) using **DARL** for dynamic 1-epoch dataset partitioning and **Flower (`Zare2001/flower@fedmom-strategy#subdirectory=framework`)** for `FedMom` outer step optimization over open ports `29510` and `29512`.
+This guide provides step-by-step instructions for running distributed DiLoCo training across **Snellius** (SURF, NVIDIA GPUs), **LUMI** (EuroHPC, AMD GPUs), and a **Central Cloud Node** (`145.38.206.143`) using **DARL** for dynamic 1-epoch dataset partitioning and **Flower (`Zare2001/flower@fedmom-strategy#subdirectory=framework`)** for `FedMom` outer step optimization over open ports `29510` and `29511`.
 
 ---
 
@@ -12,7 +12,7 @@ This guide provides step-by-step instructions for running distributed DiLoCo tra
                   |            (Ubuntu 24.04 @ 145.38.206.143)     |
                   |  +-------------------+   +-------------------+  |
                   |  | DARL Coordinator  |   | Flower Server     |  |
-                  |  | (HTTP Port 29510) |   | (FedMom - 29512)  |  |
+                  |  | (HTTP Port 29510) |   | (FedMom - 29511)  |  |
                   |  +---------+---------+   +---------^---------+  |
                   +------------|-----------------------|------------+
                                | Lease Spans           | FedMom Weights
@@ -31,7 +31,7 @@ This guide provides step-by-step instructions for running distributed DiLoCo tra
 | Service | Protocol | Open Port | Security Group Rule |
 | :--- | :--- | :--- | :--- |
 | **DARL Lease Coordinator** | HTTP / REST | **`29510`** | `29510` open to LUMI (`193.167.209.128/26`) & Snellius Subnet (`145.136.63.0/24` or `145.136.0.0/16`) |
-| **Flower Server (`FedMom`)** | gRPC | **`29512`** | `29512` open to LUMI (`193.167.209.128/26`) & Snellius Subnet (`145.136.63.0/24` or `145.136.0.0/16`) |
+| **Flower Server (`FedMom`)** | gRPC | **`29511`** | `29511` open to LUMI (`193.167.209.128/26`) & Snellius Subnet (`145.136.63.0/24` or `145.136.0.0/16`) |
 
 ---
 
@@ -51,7 +51,7 @@ cd ~/ProjectWorldWide
 
 This launches both daemons in the background:
 * **DARL Coordinator** on port `29510`
-* **Flower Aggregator Server** (`FedMom` strategy) on port `29512`
+* **Flower Aggregator Server** (`FedMom` strategy) on port `29511`
 
 ### Step 2: Check Central Node Status
 Verify both daemons are active and ports are listening:
@@ -81,13 +81,13 @@ Log in to Snellius (`int4.local.snellius.surf.nl` or any login node) and test co
 curl -sS -H "X-DARL-Token: <token>" http://145.38.206.143:29510/health
 # Expected output: {"ok": true, "epoch": 0}
 
-nc -zv 145.38.206.143 29512
-# Expected output: Connection to 145.38.206.143 29512 port [tcp/*] succeeded!
+nc -zv 145.38.206.143 29511
+# Expected output: Connection to 145.38.206.143 29511 port [tcp/*] succeeded!
 ```
 
 > **Note on Snellius Compute Nodes**: If Snellius GPU compute nodes are on a separate subnet blocked by the firewall, establish an SSH tunnel on the Snellius login node:
 > ```bash
-> ssh -f -N -g -L 29510:145.38.206.143:29510 -L 29512:145.38.206.143:29512 145.38.206.143
+> ssh -f -N -g -L 29510:145.38.206.143:29510 -L 29511:145.38.206.143:29511 145.38.206.143
 > ```
 
 ### Step 2: Submit Snellius Slurm Job
@@ -111,8 +111,8 @@ Log in to the LUMI login node and test reachability to the Central Node:
 curl -sS -H "X-DARL-Token: <token>" http://145.38.206.143:29510/health
 # Expected output: {"ok": true, "epoch": 0}
 
-nc -zv 145.38.206.143 29512
-# Expected output: Connection to 145.38.206.143 29512 port [tcp/*] succeeded!
+nc -zv 145.38.206.143 29511
+# Expected output: Connection to 145.38.206.143 29511 port [tcp/*] succeeded!
 ```
 
 ### Step 2: Submit LUMI Slurm Job
@@ -139,7 +139,7 @@ tail -f runs/central/flower.log
 ```
 
 *Key log indicators:*
-* `Starting Flower Aggregator Server (FedMom) on 0.0.0.0:29512...`: Server ready.
+* `Starting Flower Aggregator Server (FedMom) on 0.0.0.0:29511...`: Server ready.
 * `Round 1: Aggregating outer step from 2 clusters`: Both Snellius and LUMI connected!
 * `Round 1 complete: avg_cluster_loss=1.8421, pseudo_grad_norm=0.124501`: FedMom outer update applied.
 
@@ -183,4 +183,4 @@ curl -sS -H "X-DARL-Token: $(cat runs/darl/token)" http://145.38.206.143:29510/s
 | :--- | :--- | :--- |
 | **Flower Server stuck waiting** | The server requires both Snellius AND LUMI to connect (`min_clients=2`). | Check `squeue` on both sites. Training starts automatically as soon as the second cluster enters `RUNNING` status. |
 | **DARL Lease Expiry** | Slurm walltime expired mid-epoch on one cluster. | **Self-healing**: DARL automatically expires uncommitted leases via TTL and returns blocks to the pool so the surviving cluster completes the epoch. |
-| **`Connection refused` on 29512** | Central Node services are not running. | Run `./scripts/central_node/start_central_services.sh` on the Central Node (`145.38.206.143`). |
+| **`Connection refused` on 29511** | Central Node services are not running. | Run `./scripts/central_node/start_central_services.sh` on the Central Node (`145.38.206.143`). |
