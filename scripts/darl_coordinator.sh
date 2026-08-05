@@ -55,7 +55,7 @@ shift || true
 mkdir -p "${DARL_STATE_DIR}"
 
 darl_host() {
-    hostname -f 2>/dev/null || hostname
+    echo "${DARL_HOST:-$(hostname -f 2>/dev/null || hostname)}"
 }
 
 darl_url() {

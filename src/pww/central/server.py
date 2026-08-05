@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=None, help="YAML config file")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind")
     parser.add_argument(
-        "--port", type=int, default=29511, help="Port to listen on (open SG port: 29511)"
+        "--port", type=int, default=None, help="Port to listen on"
     )
     parser.add_argument(
         "--flower-port", type=int, default=None, help="Alias for --port"
@@ -73,7 +73,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    port = args.flower_port if args.flower_port is not None else args.port
+    port = args.port or args.flower_port or 29511
     server_address = f"{args.host}:{port}"
     logger.info(f"Starting Flower Aggregator Server (FedMom) on {server_address}...")
     logger.info(
