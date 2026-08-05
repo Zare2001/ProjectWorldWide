@@ -1,0 +1,20 @@
+# Central Node / Aggregator Configuration for Multi-Site DiLoCo Training with FedMom
+#
+# Runs on the Central Ubuntu Cloud VM (145.38.206.143).
+# Configured to use explicit open Security Group ports:
+#   - DARL HTTP port: 29510
+#   - Flower gRPC port: 29511
+
+darl-port: 29510
+flower-port: 29511
+
+# FedMom Strategy Parameters (Huo et al., 2020)
+server-learning-rate: 1.0
+server-momentum: 0.9
+num-rounds: 50
+min-clients: 2
+
+# Dataset Leasing Settings (DARL)
+num-samples: 1000000
+block-size: 10000
+darl-state-dir: "./runs/darl"
