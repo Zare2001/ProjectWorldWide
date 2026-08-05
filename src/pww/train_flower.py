@@ -148,23 +148,24 @@ def main() -> None:
     args = apply_config_file(parser)
 
     # 1. Setup PyTorch distributed environment inside cluster
-    D.setup()
-    setup_logging(D.rank())
-    device = D.device()
-    set_seed(args.seed + D.rank())
+    info = D.setup()
+    output_dir = resolve_output_dir(args, default_name=f"cifar10-flower-{args.model}")
+    log = setup_logging(info.rank, output_dir)
+    device = info.device
+    set_seed(args.seed, info.rank)
 
-    cluster_id = args.cluster_id or ("snellius" if D.backend() == "nccl" else "lumi")
+    cluster_id = args.cluster_id or ("snellius" if info.backend == "nccl" else "lumi")
     darl_url = f"http://{args.central_ip}:{args.darl_port}"
     flower_address = f"{args.central_ip}:{args.flower_port}"
 
-    if D.is_leader():
-        logger.info(
+    if info.is_master:
+        log.info(
             f"Initializing Flower client on cluster '{cluster_id}' -> "
             f"DARL: {darl_url}, Flower: {flower_address}"
         )
 
     # 2. Build dataset and DARL Data Source
-    train_dataset, _ = build_cifar10_loaders(data_root=args.output_dir, batch_size=args.batch_size)[:2]
+    train_dataset, _ = build_cifar10_loaders(data_root=output_dir, batch_size=args.batch_size)[:2]
     space = BlockSpace(num_samples=len(train_dataset), block_size=1000, seed=args.seed)
 
     sampler = LeasedSampler()
@@ -194,7 +195,7 @@ def main() -> None:
     )
 
     # 4. Start Flower client on cluster leader
-    if D.is_leader():
+    if info.is_master:
         fl.client.start_numpy_client(
             server_address=flower_address,
             client=client,
