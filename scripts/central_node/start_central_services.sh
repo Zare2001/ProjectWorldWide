@@ -70,7 +70,8 @@ else
     echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE})..."
     DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
         --num-samples "${NUM_SAMPLES}" \
-        --block-size "${BLOCK_SIZE}" > "${STATE_DIR}/darl.log" 2>&1 &
+        --block-size "${BLOCK_SIZE}" \
+        --fresh > "${STATE_DIR}/darl.log" 2>&1 &
     echo "DARL started."
 fi
 
