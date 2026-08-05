@@ -42,7 +42,7 @@ else
 fi
 
 # 2. Start Flower Aggregator Server
-FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git}"
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
 python3 -c "import flwr" 2>/dev/null || pip install "${FLOWER_REPO}"
 
 if [[ -f "${FLOWER_PID_FILE}" ]] && kill -0 "$(cat "${FLOWER_PID_FILE}")" 2>/dev/null; then
