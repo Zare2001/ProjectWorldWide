@@ -26,14 +26,10 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_NET_GDR_LEVEL=PHB
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 
-# Ensure forked Flower repository (fedmom-strategy branch) is installed
+# Ensure forked Flower repository (fedmom-strategy branch) is installed inside container
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
-if ! python3 -c "import flwr" 2>/dev/null; then
-    if command -v uv >/dev/null 2>&1; then
-        uv pip install "${FLOWER_REPO}"
-    else
-        pip install --user "${FLOWER_REPO}"
-    fi
+if ! pww_run python3 -c "import flwr" 2>/dev/null; then
+    pww_run python3 -m pip install --user "${FLOWER_REPO}"
 fi
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
