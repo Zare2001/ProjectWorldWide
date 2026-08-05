@@ -85,12 +85,42 @@ def main() -> None:
         f"min_clients={args.min_clients}, round_timeout={args.round_timeout}s"
     )
 
+    def aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
+        """Weighted average of per-cluster training loss."""
+        total_examples = sum(n for n, _ in metrics)
+        if total_examples == 0:
+            return {}
+        avg_loss = sum(n * m.get("loss", 0.0) for n, m in metrics) / total_examples
+        logger.info(
+            f"  >> Aggregated Training Loss: {avg_loss:.4f}  "
+            f"({len(metrics)} clusters, {total_examples} samples)"
+        )
+        return {"loss": avg_loss}
+
+    def aggregate_eval_metrics(metrics: list[tuple[int, dict]]) -> dict:
+        """Weighted average of per-cluster test accuracy and loss."""
+        total_examples = sum(n for n, _ in metrics)
+        if total_examples == 0:
+            return {}
+        # Each client returns {"accuracy": float} from evaluate()
+        avg_acc = sum(n * m.get("accuracy", 0.0) for n, m in metrics) / total_examples
+        per_cluster = ", ".join(
+            f"{m.get('accuracy', 0.0):.2f}%" for _, m in metrics
+        )
+        logger.info(
+            f"  >> Test Accuracy: {avg_acc:.2f}%  "
+            f"(per-cluster: [{per_cluster}], {total_examples} test samples)"
+        )
+        return {"accuracy": avg_acc}
+
     strategy = FedMom(
         min_fit_clients=args.min_clients,
         min_evaluate_clients=args.min_clients,
         min_available_clients=args.min_clients,
         server_learning_rate=args.server_learning_rate,
         server_momentum=args.server_momentum,
+        fit_metrics_aggregation_fn=aggregate_fit_metrics,
+        evaluate_metrics_aggregation_fn=aggregate_eval_metrics,
     )
 
     fl.server.start_server(
