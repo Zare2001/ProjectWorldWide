@@ -105,8 +105,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 loss_sum += loss.item()
                 step_count += 1
 
-        self.darl_source.end_phase()
-        self.darl_source.commit()
+            self.darl_source.end_phase()
+            self.darl_source.commit()
 
         avg_loss = loss_sum / max(1, step_count)
         if D.is_leader():
