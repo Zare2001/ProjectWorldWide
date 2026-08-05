@@ -13,6 +13,7 @@ server-learning-rate: 1.0
 server-momentum: 0.9
 num-rounds: 50
 min-clients: 2
+round-timeout: 300.0
 
 # Dataset Leasing Settings (DARL)
 num-samples: 50000

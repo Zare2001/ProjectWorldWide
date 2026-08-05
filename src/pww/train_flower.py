@@ -69,48 +69,68 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
             state_dict[k] = torch.from_numpy(val).to(self.device)
         self.model.load_state_dict(state_dict)
 
-    def fit(self, parameters: list, config: dict) -> tuple:
+    def _execute_local_phase(self, parameters: list | None) -> tuple[list, int, dict]:
         # 1. Synchronize model weights with global params received from FedMom
         if parameters:
             self.set_parameters(parameters)
 
-        # 2. Acquire dynamic dataset lease span from DARL
-        phase = self.darl_source.next_phase()
-        if phase is None:
-            logger.info("DARL dataset leasing complete for this epoch.")
-            return self.get_parameters(config={}), 0, {"loss": 0.0}
-
-        self.sampler.set_indices(phase.indices)
-
-        # 3. Inner Loop Training (H steps)
+        # 2. Inner Loop Training (H steps across leased DARL phases)
         self.model.train()
         step_count = 0
         loss_sum = 0.0
 
-        for x, y in self.loader:
-            if step_count >= self.inner_steps:
+        while step_count < self.inner_steps:
+            phase = self.darl_source.next_phase()
+            if phase is None:
+                if D.is_leader():
+                    logger.info("DARL dataset leasing complete for this epoch.")
                 break
-            x, y = x.to(self.device), y.to(self.device)
-            self.optimizer.zero_grad()
-            out = self.model(x)
-            loss = nn.functional.cross_entropy(out, y)
-            loss.backward()
 
-            # Reduce local gradients across cluster GPUs (DDP)
-            D.all_reduce_avg_([p.grad for p in self.model.parameters() if p.grad is not None])
+            self.sampler.set_indices(phase.indices)
 
-            self.optimizer.step()
-            loss_sum += loss.item()
-            step_count += 1
+            for x, y in self.loader:
+                if step_count >= self.inner_steps:
+                    break
+                x, y = x.to(self.device), y.to(self.device)
+                self.optimizer.zero_grad()
+                out = self.model(x)
+                loss = nn.functional.cross_entropy(out, y)
+                loss.backward()
+
+                # Reduce local gradients across cluster GPUs (DDP)
+                if D.world_size() > 1:
+                    D.all_reduce_avg_([p.grad for p in self.model.parameters() if p.grad is not None])
+
+                self.optimizer.step()
+                loss_sum += loss.item()
+                step_count += 1
 
         self.darl_source.end_phase()
         self.darl_source.commit()
 
         avg_loss = loss_sum / max(1, step_count)
-        logger.info(f"Completed local inner phase ({step_count} steps), avg loss: {avg_loss:.4f}")
+        if D.is_leader():
+            logger.info(f"Completed local inner phase ({step_count} steps), avg loss: {avg_loss:.4f}")
 
-        # 4. Transmit local parameters to Central Flower Server (FedMom)
         return self.get_parameters(config={}), step_count, {"loss": float(avg_loss)}
+
+    def fit(self, parameters: list, config: dict) -> tuple:
+        if D.world_size() > 1 and D.is_leader():
+            import torch.distributed as dist
+            dist.broadcast_object_list([("FIT", parameters)], src=0)
+
+        return self._execute_local_phase(parameters)
+
+    def run_worker_loop(self) -> None:
+        import torch.distributed as dist
+        while True:
+            box = [None]
+            dist.broadcast_object_list(box, src=0)
+            msg, params = box[0]
+            if msg == "STOP":
+                break
+            elif msg == "FIT":
+                self._execute_local_phase(params)
 
 
 def main() -> None:
@@ -212,6 +232,11 @@ def main() -> None:
             server_address=flower_address,
             client=client,
         )
+        if info.world_size > 1:
+            import torch.distributed as dist
+            dist.broadcast_object_list([("STOP", None)], src=0)
+    else:
+        client.run_worker_loop()
 
     D.cleanup()
 

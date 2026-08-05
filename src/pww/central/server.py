@@ -56,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--server-momentum", type=float, default=0.9, help="FedMom server momentum factor (beta)"
     )
+    parser.add_argument(
+        "--round-timeout", type=float, default=300.0, help="Timeout per round in seconds"
+    )
     return parser
 
 
@@ -79,7 +82,7 @@ def main() -> None:
     logger.info(
         f"Configuration: server_learning_rate={args.server_learning_rate}, "
         f"server_momentum={args.server_momentum}, num_rounds={args.num_rounds}, "
-        f"min_clients={args.min_clients}"
+        f"min_clients={args.min_clients}, round_timeout={args.round_timeout}s"
     )
 
     strategy = FedMom(
@@ -92,7 +95,7 @@ def main() -> None:
 
     fl.server.start_server(
         server_address=server_address,
-        config=fl.server.ServerConfig(num_rounds=args.num_rounds),
+        config=fl.server.ServerConfig(num_rounds=args.num_rounds, round_timeout=args.round_timeout),
         strategy=strategy,
     )
 
