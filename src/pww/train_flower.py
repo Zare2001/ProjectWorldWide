@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,12 +20,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision import datasets
 
 from . import distributed as D
 from .config import add_common_args, apply_config_file, resolve_output_dir, set_seed
 from .darl.space import BlockSpace
 from .darl.torch_data import DARLDataSource, LeasedSampler
-from .data.cifar import NUM_CLASSES, build_cifar10_loaders
+from .data.cifar import NUM_CLASSES, _transforms, build_cifar10_loaders
 from .logging_utils import get_logger, log_environment, setup_logging
 from .models.resnet import RESNET_FACTORY, build_resnet
 from .parallel import wrap_model
@@ -165,7 +167,8 @@ def main() -> None:
         )
 
     # 2. Build dataset and DARL Data Source
-    train_dataset, _ = build_cifar10_loaders(data_root=output_dir, batch_size=args.batch_size)[:2]
+    data_root = args.data_root or str(Path(os.environ.get("PWW_DATA_DIR", "./data")) / "cifar10")
+    train_dataset = datasets.CIFAR10(root=data_root, train=True, download=False, transform=_transforms(True))
     space = BlockSpace(num_samples=len(train_dataset), block_size=1000, seed=args.seed)
 
     sampler = LeasedSampler()
