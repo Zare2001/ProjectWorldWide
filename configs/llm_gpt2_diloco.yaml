@@ -26,5 +26,5 @@ log-every: 10
 seed: 42
 
 # --- DARL Token Dataset Leasing ---
-darl-num-samples: 100000
+darl-num-samples: 115156
 darl-block-size: 100
