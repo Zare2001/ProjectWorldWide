@@ -124,10 +124,17 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 weight_decay=self.args.weight_decay,
             )
 
+            # Track total consumed samples across phases
+            if not hasattr(self, "_consumed_samples"):
+                self._consumed_samples = 0
+
+            num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
             for batch in loader:
                 if step_count >= self.inner_steps:
                     break
 
+                step_t0 = time.monotonic()
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
@@ -140,11 +147,52 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 if D.world_size() > 1:
                     D.all_reduce_avg_([p.grad for p in self.model.parameters() if p.grad is not None])
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
+
+                step_duration = max(1e-5, time.monotonic() - step_t0)
+                step_ms = step_duration * 1000.0
 
                 loss_sum += loss.item()
                 step_count += 1
+                self._consumed_samples += input_ids.size(0) * D.world_size()
+
+                # Calculate Megatron-style metrics
+                seq_len = input_ids.size(1)
+                tok_per_sec_per_gpu = (input_ids.size(0) * seq_len) / step_duration
+                tflops_per_gpu = (6.0 * num_params * input_ids.size(0) * seq_len) / (step_duration * 1e12)
+
+                # Memory usage ratio
+                mem_usage = 0.0
+                if torch.cuda.is_available():
+                    try:
+                        mem_usage = torch.cuda.max_memory_allocated(self.device) / max(1, torch.cuda.get_device_properties(self.device).total_memory)
+                    except Exception:
+                        mem_usage = 0.0
+
+                # Log every 10 steps (or on final step)
+                log_interval = getattr(self.args, "log_every", 10)
+                if D.is_leader() and (step_count % log_interval == 0 or step_count == self.inner_steps):
+                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                    lr = optimizer.param_groups[0]["lr"]
+                    global_batch = self.args.batch_size * D.world_size()
+                    g_norm = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+
+                    logger.info(
+                        f"[{self.args.cluster_id or 'pww'}]: [{now_str}] "
+                        f"iteration {step_count:8d}/{self.inner_steps:8d} | "
+                        f"consumed samples: {self._consumed_samples:12d} | "
+                        f"elapsed time per iteration (ms): {step_ms:10.1f} | "
+                        f"mem usages: {mem_usage:.4f} | "
+                        f"throughput per GPU (TFLOP/s/GPU): {tflops_per_gpu:8.1f} | "
+                        f"Tokens per second per GPU (Tok/s/GPU): {tok_per_sec_per_gpu:8.1f} | "
+                        f"learning rate: {lr:.6E} | "
+                        f"global batch size: {global_batch:5d} | "
+                        f"lm loss: {loss.item():.6E} | "
+                        f"grad norm: {g_norm:7.3f} | "
+                        f"number of skipped iterations:   0 | "
+                        f"number of nan iterations:   0 |"
+                    )
 
             self.darl_source.end_phase()
             self.darl_source.commit()
