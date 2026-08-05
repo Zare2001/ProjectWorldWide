@@ -22,6 +22,9 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
 fi
 source "${PWW_ROOT}/env.sh"
 
+export PYTHONNOUSERSITE=0
+export SINGULARITYENV_PYTHONNOUSERSITE=0
+
 export NCCL_SOCKET_IFNAME=hsn
 export NCCL_NET_GDR_LEVEL=PHB
 export FI_CXI_DEFAULT_CQ_SIZE=131072

@@ -20,6 +20,8 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
 fi
 source "${PWW_ROOT}/env.sh"
 
+export PYTHONNOUSERSITE=0
+
 # Ensure forked Flower repository (fedmom-strategy branch) is installed
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
 if ! pww_run python3 -c "import flwr" 2>/dev/null; then
