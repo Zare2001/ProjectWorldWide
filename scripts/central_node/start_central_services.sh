@@ -62,6 +62,7 @@ fi
 
 NUM_SAMPLES="${NUM_SAMPLES:-50000}"
 BLOCK_SIZE="${BLOCK_SIZE:-1000}"
+SEED="${SEED:-42}"
 # Default DARL epochs set to 1 for single-pass LLM pre-training over tokenized corpora.
 DARL_EPOCHS="${DARL_EPOCHS:-1}"
 
@@ -69,11 +70,12 @@ DARL_EPOCHS="${DARL_EPOCHS:-1}"
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
-    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS})..."
+    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS}, seed: ${SEED})..."
     DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
         --num-samples "${NUM_SAMPLES}" \
         --block-size "${BLOCK_SIZE}" \
         --epochs "${DARL_EPOCHS}" \
+        --seed "${SEED}" \
         --fresh > "${STATE_DIR}/darl.log" 2>&1 &
     echo "DARL started."
 fi
