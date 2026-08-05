@@ -210,6 +210,24 @@ class DARLDataSource:
         """
         return self.session.commit_all() if self.is_leader else 0
 
+    def release_unused(self) -> int:
+        """Release any pre-fetched but un-trained leases back to the pool.
+
+        Call this when the caller is done with its inner steps but the session
+        may still hold blocks from aggressive prefetching. Without this, a fast
+        cluster can hold blocks that a slower cluster needs to complete its
+        epoch, causing a deadlock where the slower cluster spins in
+        'pool drained' waiting for blocks that will never be trained on.
+
+        Leader-only, non-collective.
+        """
+        if not self.is_leader:
+            return 0
+        released = self.session.release_all()
+        if released > 0:
+            get_logger().info("darl: released %d unused leases back to pool", released)
+        return released
+
     # --- internals --------------------------------------------------------
 
     def _acquire_payload(self) -> dict[str, Any] | None:

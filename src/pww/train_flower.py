@@ -140,6 +140,10 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
             self.darl_source.end_phase()
             self.darl_source.commit()
 
+        # Release any pre-fetched but un-used leases so the other cluster
+        # is not blocked waiting for blocks this cluster will never train on.
+        self.darl_source.release_unused()
+
         avg_loss = loss_sum / max(1, step_count)
         if D.is_leader():
             logger.info(f"Completed local inner phase ({step_count} steps), avg loss: {avg_loss:.4f}")
