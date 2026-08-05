@@ -65,7 +65,7 @@ if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/nul
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
     echo "Starting DARL Lease Coordinator on port ${DARL_PORT}..."
-    DARL_PORT="${DARL_PORT}" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
+    DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
         --num-samples 1000000 \
         --block-size 10000 > "${STATE_DIR}/darl.log" 2>&1 &
     echo "DARL started."

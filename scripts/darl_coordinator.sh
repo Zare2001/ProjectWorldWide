@@ -83,7 +83,7 @@ start)
         (umask 077; head -c 24 /dev/urandom | base64 | tr -d '/+=' > "${DARL_TOKEN_FILE}")
         echo "generated token -> ${DARL_TOKEN_FILE}"
     fi
-    export DARL_TOKEN="$(cat "${DARL_TOKEN_FILE}")"
+    export DARL_TOKEN="${DARL_TOKEN-$(cat "${DARL_TOKEN_FILE}")}"
 
     # nohup needs a binary, and pww_run is a shell function, so expand the site's
     # launch prefix here instead. It is empty on Snellius (native) and a
