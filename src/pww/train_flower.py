@@ -124,7 +124,6 @@ def main() -> None:
     g = parser.add_argument_group("federation")
     g.add_argument("--central-ip", type=str, default="145.38.206.143", help="Central node IP")
     g.add_argument("--darl-port", type=int, default=29510, help="DARL HTTP port")
-    g.add_argument("--darl-token", type=str, default=None, help="DARL auth token (default: $DARL_TOKEN)")
     g.add_argument("--flower-port", type=int, default=29511, help="Flower gRPC port")
     g.add_argument("--cluster-id", type=str, default=None, help="snellius or lumi")
     g.add_argument("--inner-steps", type=int, default=100, help="H inner steps")
