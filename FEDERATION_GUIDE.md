@@ -44,6 +44,7 @@ Log in to the central Ubuntu VM (`145.38.206.143`) and execute:
 
 ```bash
 cd ~/ProjectWorldWide
+# (PWW_SITE=central is automatically set by the script)
 ./scripts/central_node/start_central_services.sh
 ```
 

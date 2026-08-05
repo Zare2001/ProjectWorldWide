@@ -10,6 +10,7 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
     exit 1
 fi
 
+export PWW_SITE="${PWW_SITE:-central}"
 source "${PWW_ROOT}/env.sh"
 
 DARL_PORT="${DARL_PORT:-29510}"

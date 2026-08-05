@@ -4,6 +4,7 @@
 set -euo pipefail
 
 : "${PWW_ROOT:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+export PWW_SITE="${PWW_SITE:-central}"
 source "${PWW_ROOT}/env.sh"
 
 STATE_DIR="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/central"

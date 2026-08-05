@@ -18,18 +18,12 @@ pww_detect_site() {
     elif [[ -d /sw/arch ]] || [[ "$(hostname -f 2>/dev/null)" == *snellius* ]]; then
         echo snellius
     else
-        echo unknown
+        echo central
     fi
 }
 
 export PWW_ROOT="${PWW_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 export PWW_SITE="$(pww_detect_site)"
-
-if [[ "${PWW_SITE}" == "unknown" ]]; then
-    echo "ProjectWorldWide: could not detect the site." >&2
-    echo "  Set PWW_SITE=lumi or PWW_SITE=snellius, or add sites/<name>.sh" >&2
-    return 1 2>/dev/null || exit 1
-fi
 
 # --- Site-independent defaults ----------------------------------------------
 # Site files may override any of these; they are set first so a site file can
