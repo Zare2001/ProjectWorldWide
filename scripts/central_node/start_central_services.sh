@@ -62,11 +62,8 @@ fi
 
 NUM_SAMPLES="${NUM_SAMPLES:-50000}"
 BLOCK_SIZE="${BLOCK_SIZE:-1000}"
-# How many times the dataset can be fully traversed. Set high to allow many
-# Flower aggregation rounds within a single dataset. For LLMs doing 1 epoch
-# over a massive corpus, set DARL_EPOCHS=1. For CIFAR-10 with many outer
-# rounds, leave the default high so the dataset recycles automatically.
-DARL_EPOCHS="${DARL_EPOCHS:-1000}"
+# Default DARL epochs set to 1 for single-pass LLM pre-training over tokenized corpora.
+DARL_EPOCHS="${DARL_EPOCHS:-1}"
 
 # 1. Start DARL Coordinator
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
