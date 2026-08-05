@@ -26,7 +26,7 @@ from .darl.space import BlockSpace
 from .darl.torch_data import DARLDataSource, LeasedSampler
 from .data.cifar import NUM_CLASSES, build_cifar10_loaders
 from .logging_utils import get_logger, log_environment, setup_logging
-from .models.resnet import build_resnet
+from .models.resnet import RESNET_FACTORY, build_resnet
 from .parallel import wrap_model
 
 logger = get_logger("pww.train_flower")
