@@ -33,15 +33,17 @@ if [[ -z "${DARL_TOKEN:-}" ]]; then
     elif [[ -s "${PWW_ROOT}/runs/central/darl/token" ]]; then
         export DARL_TOKEN="$(cat "${PWW_ROOT}/runs/central/darl/token")"
     fi
-fi
+export SINGULARITYENV_DARL_TOKEN="${DARL_TOKEN:-}"
 
 echo "Starting LUMI LLM Flower Client -> Central Node IP ${CENTRAL_IP} (DARL: ${DARL_PORT}, Flower: ${FLOWER_PORT})"
 
-srun "${PWW_ROOT}/scripts/task_wrapper.sh" \
-    python3 -m pww.train_llm_flower \
-        --config "${CONFIG}" \
-        --central-ip "${CENTRAL_IP}" \
-        --darl-port "${DARL_PORT}" \
-        --flower-port "${FLOWER_PORT}" \
-        ${DARL_TOKEN:+--darl-token "${DARL_TOKEN}"} \
-        "$@"
+srun --cpu-bind="$(pww_cpu_bind)" \
+    "${PWW_LAUNCH[@]}" \
+        "${PWW_ROOT}/scripts/task_wrapper.sh" \
+            python3 -m pww.train_llm_flower \
+                --config "${CONFIG}" \
+                --central-ip "${CENTRAL_IP}" \
+                --darl-port "${DARL_PORT}" \
+                --flower-port "${FLOWER_PORT}" \
+                ${DARL_TOKEN:+--darl-token "${DARL_TOKEN}"} \
+                "$@"
