@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pww-lumi-llm
-#SBATCH --account=project_462000000
-#SBATCH --partition=standard-g
+#SBATCH --account=project_462000226
+#SBATCH --partition=small-g
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
