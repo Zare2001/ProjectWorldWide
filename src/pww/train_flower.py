@@ -24,6 +24,7 @@ from torchvision import datasets
 
 from . import distributed as D
 from .config import add_common_args, apply_config_file, resolve_output_dir, set_seed
+from .darl.client import LeaseClient, LeaseSession
 from .darl.space import BlockSpace
 from .darl.torch_data import DARLDataSource, LeasedSampler
 from .data.cifar import NUM_CLASSES, _transforms, build_cifar10_loaders
@@ -174,10 +175,17 @@ def main() -> None:
     sampler = LeasedSampler()
     loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2)
 
+    if info.is_master:
+        client = LeaseClient(darl_url, cluster_id)
+        session = LeaseSession(client, space, blocks_per_phase=5)
+    else:
+        session = None
+
     darl_source = DARLDataSource(
-        url=darl_url,
-        cluster_id=cluster_id,
         space=space,
+        session=session,
+        rank=info.rank,
+        world_size=info.world_size,
         blocks_per_phase=5,
     )
 
