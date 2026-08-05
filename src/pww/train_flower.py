@@ -124,6 +124,7 @@ def main() -> None:
     g = parser.add_argument_group("federation")
     g.add_argument("--central-ip", type=str, default="145.38.206.143", help="Central node IP")
     g.add_argument("--darl-port", type=int, default=29510, help="DARL HTTP port")
+    g.add_argument("--darl-token", type=str, default=None, help="DARL auth token (default: $DARL_TOKEN)")
     g.add_argument("--flower-port", type=int, default=29511, help="Flower gRPC port")
     g.add_argument("--cluster-id", type=str, default=None, help="snellius or lumi")
     g.add_argument("--inner-steps", type=int, default=100, help="H inner steps")
@@ -176,7 +177,8 @@ def main() -> None:
     loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2)
 
     if info.is_master:
-        client = LeaseClient(darl_url, cluster_id)
+        darl_token = args.darl_token or os.environ.get("DARL_TOKEN", "")
+        client = LeaseClient(darl_url, cluster_id, token=darl_token)
         session = LeaseSession(client, space, blocks_per_phase=5)
     else:
         session = None

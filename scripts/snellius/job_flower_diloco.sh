@@ -32,12 +32,22 @@ CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
 
+# Resolve DARL_TOKEN if not explicitly set
+if [[ -z "${DARL_TOKEN:-}" ]]; then
+    if [[ -s "${PWW_ROOT}/runs/darl/token" ]]; then
+        export DARL_TOKEN="$(cat "${PWW_ROOT}/runs/darl/token")"
+    elif [[ -s "${PWW_ROOT}/runs/central/darl/token" ]]; then
+        export DARL_TOKEN="$(cat "${PWW_ROOT}/runs/central/darl/token")"
+    fi
+fi
+
 echo "Starting Snellius Flower Client -> Central Node IP ${CENTRAL_IP} (DARL: ${DARL_PORT}, Flower: ${FLOWER_PORT})"
 
 srun "${PWW_ROOT}/scripts/task_wrapper.sh" \
     python3 -m pww.train_flower \
         --central-ip "${CENTRAL_IP}" \
         --darl-port "${DARL_PORT}" \
+        ${DARL_TOKEN:+--darl-token "${DARL_TOKEN}"} \
         --flower-port "${FLOWER_PORT}" \
         --cluster-id "snellius" \
         --config "${PWW_ROOT}/configs/cifar10_resnet18_diloco.yaml" \

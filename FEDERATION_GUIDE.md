@@ -53,11 +53,14 @@ This launches both daemons in the background:
 * **DARL Coordinator** on port `29510`
 * **Flower Aggregator Server** (`FedMom` strategy) on port `29511`
 
-### Step 2: Check Central Node Status
-Verify both daemons are active and ports are listening:
+### Step 2: Check Central Node Status & Retrieve DARL Token
+Verify both daemons are active, check listening ports, and view the generated DARL authentication token:
 
 ```bash
 ./scripts/central_node/status_central_services.sh
+
+# Display DARL token
+cat runs/darl/token
 ```
 
 ### Step 3: Stop Central Node Services
@@ -75,10 +78,12 @@ To stop services after training completes:
 Ensure your Central VM Security Group rule uses **`145.136.63.0/24`** (or **`145.136.0.0/16`**) rather than a single `/32` IP address, because Snellius login nodes (`int1`..`int6`, e.g., `int4` = `145.136.63.190`) and compute nodes have distinct IPs within this subnet.
 
 ### Step 1: Verify Connectivity from Snellius
-Log in to Snellius (`int4.local.snellius.surf.nl` or any login node) and test connection to the Central Node:
+Log in to Snellius (`int4.local.snellius.surf.nl` or any login node), export your central node DARL token, and test connection:
 
 ```bash
-curl -sS -H "X-DARL-Token: <token>" http://145.38.206.143:29510/health
+export DARL_TOKEN="<your-central-darl-token>"  # e.g. from cat runs/darl/token on Central Node
+
+curl -sS -H "X-DARL-Token: $DARL_TOKEN" http://145.38.206.143:29510/health
 # Expected output: {"ok": true, "epoch": 0}
 
 nc -zv 145.38.206.143 29511
@@ -91,24 +96,26 @@ nc -zv 145.38.206.143 29511
 > ```
 
 ### Step 2: Submit Snellius Slurm Job
-Submit the federated DiLoCo job:
+Submit the federated DiLoCo job with `DARL_TOKEN`:
 
 ```bash
 cd ~/ProjectWorldWide
-sbatch scripts/snellius/job_flower_diloco.sh
+DARL_TOKEN="<your-central-darl-token>" sbatch scripts/snellius/job_flower_diloco.sh
 ```
 
-The script will automatically install the forked Flower branch (`Zare2001/flower@fedmom-strategy#subdirectory=framework`) into your Snellius venv (`$HOME/venvs/pww-snellius`) if not already installed.
+The script will automatically install the forked Flower branch (`Zare2001/flower@fedmom-strategy#subdirectory=framework`) into your environment if not already installed.
 
 ---
 
 ## 4. LUMI Cluster Execution (AMD MI250X / EuroHPC)
 
 ### Step 1: Verify Connectivity from LUMI
-Log in to the LUMI login node and test reachability to the Central Node:
+Log in to the LUMI login node, export your central node DARL token, and test reachability to the Central Node:
 
 ```bash
-curl -sS -H "X-DARL-Token: <token>" http://145.38.206.143:29510/health
+export DARL_TOKEN="<your-central-darl-token>"  # e.g. from cat runs/darl/token on Central Node
+
+curl -sS -H "X-DARL-Token: $DARL_TOKEN" http://145.38.206.143:29510/health
 # Expected output: {"ok": true, "epoch": 0}
 
 nc -zv 145.38.206.143 29511
@@ -120,10 +127,15 @@ Submit the federated DiLoCo job:
 
 ```bash
 cd ~/ProjectWorldWide
-sbatch scripts/lumi/job_flower_diloco.sh
+
+# Standard production submission (small-g partition, 1 hour):
+DARL_TOKEN="<your-central-darl-token>" sbatch scripts/lumi/job_flower_diloco.sh
+
+# Fast debug / testing submission (dev-g partition, 15 minutes):
+DARL_TOKEN="<your-central-darl-token>" sbatch --partition=dev-g --time=00:15:00 scripts/lumi/job_flower_diloco.sh
 ```
 
-The script will automatically install the forked Flower branch (`Zare2001/flower@fedmom-strategy#subdirectory=framework`) inside the LUMI container environment.
+The script automatically executes inside the Singularity container (`Python 3.12`) and handles `DARL_TOKEN` and Flower dependencies.
 
 ---
 
