@@ -1,9 +1,9 @@
-# GPT-2 (124M) on WikiText-2 with Federated DiLoCo & DARL
-# Fast testing configuration for multi-site LLM training across Snellius & LUMI
+# GPT-2 (124M) on WikiText-103 (100M tokens, 1,000 blocks) with Federated DiLoCo & DARL
+# Single-pass 1-epoch LLM pre-training across Snellius & LUMI
 
 model: gpt2
 dataset-name: wikitext
-dataset-config: wikitext-2-raw-v1
+dataset-config: wikitext-103-raw-v1
 seq-len: 1024
 batch-size: 4
 
@@ -26,5 +26,5 @@ log-every: 10
 seed: 42
 
 # --- DARL Token Dataset Leasing ---
-darl-num-samples: 2335
+darl-num-samples: 100000
 darl-block-size: 100
