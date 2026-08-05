@@ -83,27 +83,39 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
 
         while step_count < self.inner_steps:
             phase = self.darl_source.next_phase()
+
+            # Handle epoch completion: advance DARL to next epoch and retry
             if phase is None:
                 if D.is_leader():
-                    logger.info("DARL epoch pool drained; attempting epoch advance...")
+                    logger.info("DARL epoch complete; advancing to next epoch...")
                     try:
                         if self.darl_source.session:
-                            self.darl_source.session.client.advance_epoch()
-                    except Exception:
-                        pass
+                            result = self.darl_source.session.client.advance_epoch()
+                            logger.info(f"DARL advance_epoch -> {result}")
+                    except Exception as e:
+                        logger.warning(f"DARL advance_epoch failed: {e}")
+
+                # Reset DARLDataSource state for the new epoch
+                self.darl_source.epoch_complete = False
+                self.darl_source.epoch += 1
+                self.darl_source.phase_index = 0
+                self.darl_source._carry = []
+
                 time.sleep(1.0)
                 phase = self.darl_source.next_phase()
-
                 if phase is None:
-                    if step_count > 0:
-                        break
-                    # Retry acquiring from the new epoch to avoid 0-step returns
-                    for _ in range(5):
-                        time.sleep(1.5)
+                    # Still no blocks: retry with backoff
+                    for attempt in range(10):
+                        time.sleep(2.0)
+                        self.darl_source.epoch_complete = False
                         phase = self.darl_source.next_phase()
                         if phase is not None:
                             break
+                        if D.is_leader():
+                            logger.info(f"DARL retry {attempt+1}/10: waiting for blocks...")
                     if phase is None:
+                        if D.is_leader():
+                            logger.warning("DARL: no blocks available after 10 retries, ending round")
                         break
 
             self.sampler.set_indices(phase.indices)

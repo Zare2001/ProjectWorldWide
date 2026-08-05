@@ -311,6 +311,10 @@ class LeaseClient:
     def release(self, lease_id: str | None = None) -> dict[str, Any]:
         return self._call("/release", {"cluster": self.cluster_id, "lease": lease_id})
 
+    def advance_epoch(self) -> dict[str, Any]:
+        """Tell the coordinator to advance to the next epoch, recycling all blocks."""
+        return self._call("/advance", None)
+
     def status(self) -> dict[str, Any]:
         return self._call("/status")
 

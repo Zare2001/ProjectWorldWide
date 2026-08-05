@@ -62,15 +62,21 @@ fi
 
 NUM_SAMPLES="${NUM_SAMPLES:-50000}"
 BLOCK_SIZE="${BLOCK_SIZE:-1000}"
+# How many times the dataset can be fully traversed. Set high to allow many
+# Flower aggregation rounds within a single dataset. For LLMs doing 1 epoch
+# over a massive corpus, set DARL_EPOCHS=1. For CIFAR-10 with many outer
+# rounds, leave the default high so the dataset recycles automatically.
+DARL_EPOCHS="${DARL_EPOCHS:-1000}"
 
 # 1. Start DARL Coordinator
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
-    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE})..."
+    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS})..."
     DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
         --num-samples "${NUM_SAMPLES}" \
         --block-size "${BLOCK_SIZE}" \
+        --epochs "${DARL_EPOCHS}" \
         --fresh > "${STATE_DIR}/darl.log" 2>&1 &
     echo "DARL started."
 fi
