@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start central node services: DARL Coordinator (port 29510) and Flower Aggregator (port 29511)
-# Run on the central Ubuntu cloud VM (192.168.2.176).
+# Run on the central Ubuntu cloud VM.
 
 set -euo pipefail
 
@@ -21,6 +21,8 @@ mkdir -p "${STATE_DIR}"
 
 DARL_PID_FILE="${STATE_DIR}/darl.pid"
 FLOWER_PID_FILE="${STATE_DIR}/flower.pid"
+VENV_DIR="${STATE_DIR}/.venv"
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
 
 echo "========================================================="
 echo " Starting Central Node Aggregator Services"
@@ -30,6 +32,28 @@ echo " DARL Port:   ${DARL_PORT}"
 echo " Flower Port: ${FLOWER_PORT}"
 echo " State Dir:   ${STATE_DIR}"
 echo "========================================================="
+
+# 0. Setup Environment using uv or venv
+if command -v uv >/dev/null 2>&1; then
+    echo "Using uv for environment management..."
+    if [[ ! -d "${VENV_DIR}" ]]; then
+        uv venv "${VENV_DIR}"
+    fi
+    uv pip install --python "${VENV_DIR}/bin/python" "${FLOWER_REPO}"
+    PYTHON_BIN="${VENV_DIR}/bin/python3"
+else
+    echo "uv not found, using python3 venv..."
+    if [[ ! -d "${VENV_DIR}" ]]; then
+        python3 -m venv "${VENV_DIR}" 2>/dev/null || true
+    fi
+    if [[ -x "${VENV_DIR}/bin/pip" ]]; then
+        "${VENV_DIR}/bin/pip" install "${FLOWER_REPO}"
+        PYTHON_BIN="${VENV_DIR}/bin/python3"
+    else
+        pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || pip install "${FLOWER_REPO}"
+        PYTHON_BIN="python3"
+    fi
+fi
 
 # 1. Start DARL Coordinator
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
@@ -43,14 +67,11 @@ else
 fi
 
 # 2. Start Flower Aggregator Server
-FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
-python3 -c "import flwr" 2>/dev/null || pip install "${FLOWER_REPO}"
-
 if [[ -f "${FLOWER_PID_FILE}" ]] && kill -0 "$(cat "${FLOWER_PID_FILE}")" 2>/dev/null; then
     echo "Flower server already running (PID $(cat "${FLOWER_PID_FILE}"))."
 else
     echo "Starting Flower Aggregator Server on port ${FLOWER_PORT}..."
-    nohup python3 -m pww.central.server \
+    nohup "${PYTHON_BIN}" -m pww.central.server \
         --config "${PWW_ROOT}/configs/central_aggregator.yaml" \
         --port "${FLOWER_PORT}" > "${STATE_DIR}/flower.log" 2>&1 &
     echo $! > "${FLOWER_PID_FILE}"

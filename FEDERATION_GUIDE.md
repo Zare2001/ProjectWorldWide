@@ -44,9 +44,10 @@ Log in to the central Ubuntu VM (`145.38.206.143`) and execute:
 
 ```bash
 cd ~/ProjectWorldWide
-# (PWW_SITE=central is automatically set by the script)
 ./scripts/central_node/start_central_services.sh
 ```
+
+> **Environment Note**: The startup script uses **`uv`** (or creates a dedicated isolated `.venv`) to install your forked Flower branch (`Zare2001/flower@fedmom-strategy`), avoiding Ubuntu 24.04 PEP 668 system-environment restrictions.
 
 This launches both daemons in the background:
 * **DARL Coordinator** on port `29510`

@@ -20,9 +20,15 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
 fi
 source "${PWW_ROOT}/env.sh"
 
-# Ensure forked Flower repository (fedmom-strategy branch) is installed in Snellius virtualenv
+# Ensure forked Flower repository (fedmom-strategy branch) is installed
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
-python3 -c "import flwr" 2>/dev/null || pip install "${FLOWER_REPO}"
+if ! python3 -c "import flwr" 2>/dev/null; then
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install "${FLOWER_REPO}"
+    else
+        pip install "${FLOWER_REPO}"
+    fi
+fi
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
