@@ -148,3 +148,30 @@ Only once this behaves should LUMI enter the picture.
 ## LLM Extension & Utility Helpers
 
 - [ ] **Custom Tokenizer Training (`src/pww/data/tokenizer.py`)**: (Optional) For standard pre-trained LLMs (LLaMA-3, Qwen-2.5, GPT-2), tokenizers are loaded automatically from HuggingFace via `AutoTokenizer.from_pretrained()`. `tokenizer.py` is an optional utility helper if you wish to train a brand-new BPE/SentencePiece tokenizer from scratch on raw text corpora.
+
+## Protocol & Recommendation for Late-Joining Clusters (Third Site Integration)
+
+### Question: If a 3rd cluster joins mid-training, will its model updates weaken/degrade the global model? Should it start from the latest global outer checkpoint?
+
+### 💡 Recommendation & Theoretical Analysis
+
+When a new 3rd site (e.g. MareNostrum 5, Leonardo, or an edge GPU cluster) joins an ongoing DiLoCo run at Round $R$:
+
+1. **Initial State: Must Start from Latest Global Checkpoint ($\theta_{\text{global}}^{(R)}$)**:
+   - The new site **MUST initialize its weights to the latest global outer model $\theta_{\text{global}}^{(R)}$** broadcast by the Central Aggregator at the start of Round $R$.
+   - **Crucial**: It must **NOT** train from initial weights $\theta_0$ or an outdated checkpoint. Training from an outdated checkpoint would produce parameter deltas $\Delta_{\text{new}} = \theta_{\text{new}} - \theta_{\text{old}}$ pointing toward a stale location in parameter space, which *would* poison outer momentum (`FedMom`) and degrade convergence.
+
+2. **Why Starting from $\theta_{\text{global}}^{(R)}$ Does NOT Degrade the Model**:
+   - **Exact Parameter Alignment**: At step 0 of Round $R$, the new site has identical weights ($\theta_{\text{new}}^{(0)} = \theta_{\text{global}}^{(R)}$) to Snellius and LUMI.
+   - **Disjoint Token Leasing (DARL)**: The new site registers with the central DARL coordinator and receives brand-new, un-trained token blocks. It never re-processes tokens that Snellius or LUMI have already trained on.
+   - **Valid Delta Directions**: Because the new cluster starts from $\theta_{\text{global}}^{(R)}$, its local delta $\Delta_{\text{new}} = \theta_{\text{new}}^{(H)} - \theta_{\text{global}}^{(R)}$ represents a clean, valid optimization trajectory computed over fresh dataset tokens in the current loss basin.
+   - **Sample-Weighted Outer Aggregation**: Central aggregation weights each cluster's delta by tokens processed:
+     $$\theta_{\text{global}}^{(R+1)} = \theta_{\text{global}}^{(R)} + \eta_{\text{outer}} \sum_{i=1}^{K} \frac{n_i}{N_{\text{total}}} \Delta_i$$
+     If the new site has lower throughput initially, its delta is proportionally scaled, preventing it from skewing the global trajectory.
+
+### 📋 Checklist for Integrating a New 3rd Site (Site C):
+
+- [ ] **Fetch Checkpoint**: Download the current outer global model $\theta_{\text{global}}^{(R)}$ from the Central Aggregator.
+- [ ] **Register with DARL**: Pass `--cluster-id site_c` so DARL assigns non-overlapping token blocks.
+- [ ] **Match Configurations**: Ensure `seq_len`, tokenizer, model architecture, and precision (`bf16`) match existing sites.
+- [ ] **Connect to Aggregator**: Launch `train_llm_flower` targeting `central_ip:29511`.
