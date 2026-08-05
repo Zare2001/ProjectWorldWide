@@ -20,8 +20,9 @@ if [[ ! -r "${PWW_ROOT}/env.sh" ]]; then
 fi
 source "${PWW_ROOT}/env.sh"
 
-# Ensure Flower is installed in Snellius virtualenv
-python3 -c "import flwr" 2>/dev/null || pip install flwr
+# Ensure forked Flower repository is installed in Snellius virtualenv
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git}"
+python3 -c "import flwr" 2>/dev/null || pip install "${FLOWER_REPO}"
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"

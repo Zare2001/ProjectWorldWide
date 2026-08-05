@@ -26,8 +26,9 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_NET_GDR_LEVEL=PHB
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 
-# Ensure Flower is installed in LUMI environment
-python3 -c "import flwr" 2>/dev/null || pip install --user flwr
+# Ensure forked Flower repository is installed in LUMI environment
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git}"
+python3 -c "import flwr" 2>/dev/null || pip install --user "${FLOWER_REPO}"
 
 CENTRAL_IP="${CENTRAL_IP:-145.38.206.143}"
 DARL_PORT="${DARL_PORT:-29510}"
