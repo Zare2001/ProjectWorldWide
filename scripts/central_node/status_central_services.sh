@@ -8,7 +8,7 @@ export PWW_SITE="${PWW_SITE:-central}"
 source "${PWW_ROOT}/env.sh"
 
 DARL_PORT="${DARL_PORT:-29510}"
-FLOWER_PORT="${FLOWER_PORT:-29511}"
+FLOWER_PORT="${FLOWER_PORT:-29512}"
 STATE_DIR="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/central"
 
 echo "=== DARL Coordinator Status (Port ${DARL_PORT}) ==="
