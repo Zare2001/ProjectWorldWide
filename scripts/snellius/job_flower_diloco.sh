@@ -21,7 +21,7 @@ fi
 source "${PWW_ROOT}/env.sh"
 
 # Ensure forked Flower repository (fedmom-strategy branch) is installed
-FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
 if ! python3 -c "import flwr" 2>/dev/null; then
     if command -v uv >/dev/null 2>&1; then
         uv pip install "${FLOWER_REPO}"

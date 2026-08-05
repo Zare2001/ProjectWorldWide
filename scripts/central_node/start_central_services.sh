@@ -22,7 +22,7 @@ mkdir -p "${STATE_DIR}"
 DARL_PID_FILE="${STATE_DIR}/darl.pid"
 FLOWER_PID_FILE="${STATE_DIR}/flower.pid"
 VENV_DIR="${STATE_DIR}/.venv"
-FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy}"
+FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
 
 echo "========================================================="
 echo " Starting Central Node Aggregator Services"
@@ -33,24 +33,31 @@ echo " Flower Port: ${FLOWER_PORT}"
 echo " State Dir:   ${STATE_DIR}"
 echo "========================================================="
 
-# 0. Setup Environment: uv -> venv -> pip --break-system-packages
+# 0. Setup Environment: uv -> venv -> lightweight venv fallback
 PYTHON_BIN="python3"
 
-if ! python3 -c "import flwr" 2>/dev/null; then
+if ! python3 -c "import flwr" 2>/dev/null && ! "${VENV_DIR}/bin/python3" -c "import flwr" 2>/dev/null; then
     echo "Installing Flower from ${FLOWER_REPO}..."
     if command -v uv >/dev/null 2>&1; then
         echo "Using uv..."
         uv pip install --system "${FLOWER_REPO}" 2>/dev/null || uv pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || true
-    elif python3 -m venv "${VENV_DIR}" 2>/dev/null && [[ -x "${VENV_DIR}/bin/pip" ]]; then
+    elif python3 -m venv "${VENV_DIR}" >/dev/null 2>&1 && [[ -x "${VENV_DIR}/bin/pip" ]]; then
         echo "Using python3 venv..."
         "${VENV_DIR}/bin/pip" install "${FLOWER_REPO}"
         PYTHON_BIN="${VENV_DIR}/bin/python3"
     else
-        echo "Using pip with --break-system-packages..."
-        python3 -m pip install --break-system-packages "${FLOWER_REPO}" 2>/dev/null || \
-        python3 -m pip install --user --break-system-packages "${FLOWER_REPO}" 2>/dev/null || \
-        pip install --break-system-packages "${FLOWER_REPO}"
+        echo "Creating lightweight venv and installing Flower into ${VENV_DIR}..."
+        python3 -m venv --without-pip "${VENV_DIR}" >/dev/null 2>&1 || true
+        PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        SITE_PKGS="${VENV_DIR}/lib/python${PY_VER}/site-packages"
+        mkdir -p "${SITE_PKGS}"
+        python3 -m pip install --target="${SITE_PKGS}" --break-system-packages "${FLOWER_REPO}" 2>/dev/null || \
+        python3 -m pip install --target="${SITE_PKGS}" "${FLOWER_REPO}" 2>/dev/null || \
+        pip install --target="${SITE_PKGS}" "${FLOWER_REPO}"
+        PYTHON_BIN="${VENV_DIR}/bin/python3"
     fi
+elif [[ -x "${VENV_DIR}/bin/python3" ]] && "${VENV_DIR}/bin/python3" -c "import flwr" 2>/dev/null; then
+    PYTHON_BIN="${VENV_DIR}/bin/python3"
 fi
 
 # 1. Start DARL Coordinator

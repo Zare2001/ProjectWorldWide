@@ -44,8 +44,8 @@ def setup_logging(rank: int, output_dir: str | Path | None = None, level: int = 
     return logger
 
 
-def get_logger():
-    return logging.getLogger(_LOGGER_NAME)
+def get_logger(name: str = _LOGGER_NAME):
+    return logging.getLogger(name)
 
 
 class MetricsWriter:

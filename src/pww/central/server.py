@@ -30,6 +30,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, default=29511, help="Port to listen on (open SG port: 29511)"
     )
     parser.add_argument(
+        "--flower-port", type=int, default=None, help="Alias for --port"
+    )
+    parser.add_argument(
+        "--darl-port", type=int, default=29510, help="DARL coordinator port"
+    )
+    parser.add_argument(
+        "--num-samples", type=int, default=1000000, help="DARL total sample count"
+    )
+    parser.add_argument(
+        "--block-size", type=int, default=10000, help="DARL block size"
+    )
+    parser.add_argument(
+        "--darl-state-dir", type=str, default="./runs/darl", help="DARL state directory"
+    )
+    parser.add_argument(
         "--num-rounds", type=int, default=50, help="Number of outer training rounds"
     )
     parser.add_argument(
@@ -45,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    setup_logging()
+    setup_logging(rank=0)
     parser = build_parser()
     args = apply_config_file(parser)
 
@@ -58,7 +73,8 @@ def main() -> None:
         )
         sys.exit(1)
 
-    server_address = f"{args.host}:{args.port}"
+    port = args.flower_port if args.flower_port is not None else args.port
+    server_address = f"{args.host}:{port}"
     logger.info(f"Starting Flower Aggregator Server (FedMom) on {server_address}...")
     logger.info(
         f"Configuration: server_learning_rate={args.server_learning_rate}, "

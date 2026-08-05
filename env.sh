@@ -65,6 +65,9 @@ export APPTAINERENV_PYTHONPATH="${PYTHONPATH}"
 export HF_HOME="${PWW_CACHE_DIR}/huggingface"
 export TORCH_HOME="${PWW_CACHE_DIR}/torch"
 export TRITON_CACHE_DIR="${PWW_CACHE_DIR}/triton"
+export PIP_CACHE_DIR="${PWW_CACHE_DIR}/pip"
+export UV_CACHE_DIR="${PWW_CACHE_DIR}/uv"
+export TMPDIR="${PWW_TMPDIR}"
 
 # --- Helpers ----------------------------------------------------------------
 # Run a command in the project environment on whichever site we are on.
