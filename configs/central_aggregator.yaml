@@ -6,7 +6,7 @@
 #   - Flower gRPC port: 29511
 
 darl-port: 29510
-flower-port: 29512
+flower-port: 29511
 
 # FedMom Strategy Parameters (Huo et al., 2020)
 server-learning-rate: 1.0

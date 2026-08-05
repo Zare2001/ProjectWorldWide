@@ -30,8 +30,8 @@ This guide provides step-by-step instructions for running distributed DiLoCo tra
 
 | Service | Protocol | Open Port | Security Group Rule |
 | :--- | :--- | :--- | :--- |
-| **DARL Lease Coordinator** | HTTP / REST | **`29510`** | `29510` open to LUMI (`193.167.209.128/26`) & Snellius (`145.136.63.192/32`) |
-| **Flower Server (`FedMom`)** | gRPC | **`29511`** | `29511` open to LUMI (`193.167.209.128/26`) & Snellius (`145.136.63.192/32`) |
+| **DARL Lease Coordinator** | HTTP / REST | **`29510`** | `29510` open to LUMI (`193.167.209.128/26`) & Snellius Subnet (`145.136.63.0/24` or `145.136.0.0/16`) |
+| **Flower Server (`FedMom`)** | gRPC | **`29511`** | `29511` open to LUMI (`193.167.209.128/26`) & Snellius Subnet (`145.136.63.0/24` or `145.136.0.0/16`) |
 
 ---
 
@@ -47,7 +47,7 @@ cd ~/ProjectWorldWide
 ./scripts/central_node/start_central_services.sh
 ```
 
-> **Environment Note**: The startup script uses **`uv`** (or creates a dedicated isolated `.venv`) to install your forked Flower branch (`Zare2001/flower@fedmom-strategy`), avoiding Ubuntu 24.04 PEP 668 system-environment restrictions.
+> **Environment Note**: The startup script uses **`uv`** (or creates a dedicated isolated `.venv` / falls back to `--break-system-packages`) to install your forked Flower branch (`Zare2001/flower@fedmom-strategy`), avoiding Ubuntu 24.04 PEP 668 system-environment restrictions.
 
 This launches both daemons in the background:
 * **DARL Coordinator** on port `29510`
@@ -71,12 +71,15 @@ To stop services after training completes:
 
 ## 3. Snellius Cluster Execution (NVIDIA H100 / SURF)
 
+### Security Group Prerequisite
+Ensure your Central VM Security Group rule uses **`145.136.63.0/24`** (or **`145.136.0.0/16`**) rather than a single `/32` IP address, because Snellius login nodes (`int1`..`int6`, e.g., `int4` = `145.136.63.190`) and compute nodes have distinct IPs within this subnet.
+
 ### Step 1: Verify Connectivity from Snellius
-Log in to the Snellius login node (`145.136.63.192`) and test connection to the Central Node:
+Log in to Snellius (`int4.local.snellius.surf.nl` or any login node) and test connection to the Central Node:
 
 ```bash
 curl -sS http://145.38.206.143:29510/health
-# Expected output: {"status": "ok"}
+# Expected output: {"ok": true, "epoch": 0}
 
 nc -zv 145.38.206.143 29511
 # Expected output: Connection to 145.38.206.143 29511 port [tcp/*] succeeded!
