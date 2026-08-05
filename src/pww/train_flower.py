@@ -85,8 +85,26 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
             phase = self.darl_source.next_phase()
             if phase is None:
                 if D.is_leader():
-                    logger.info("DARL dataset leasing complete for this epoch.")
-                break
+                    logger.info("DARL epoch pool drained; attempting epoch advance...")
+                    try:
+                        if self.darl_source.session:
+                            self.darl_source.session.client.advance_epoch()
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+                phase = self.darl_source.next_phase()
+
+                if phase is None:
+                    if step_count > 0:
+                        break
+                    # Retry acquiring from the new epoch to avoid 0-step returns
+                    for _ in range(5):
+                        time.sleep(1.5)
+                        phase = self.darl_source.next_phase()
+                        if phase is not None:
+                            break
+                    if phase is None:
+                        break
 
             self.sampler.set_indices(phase.indices)
 
@@ -117,7 +135,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         num_samples_trained = max(1, step_count * self.loader.batch_size)
         return self.get_parameters(config={}), num_samples_trained, {"loss": float(avg_loss)}
 
-    def evaluate(self, parameters: list, config: dict) -> tuple[float, int, dict]:
+    def _execute_evaluation(self, parameters: list | None) -> tuple[float, int, dict]:
         if parameters:
             self.set_parameters(parameters)
 
@@ -149,6 +167,13 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
 
         return float(avg_loss), total, {"accuracy": float(accuracy)}
 
+    def evaluate(self, parameters: list, config: dict) -> tuple[float, int, dict]:
+        if D.world_size() > 1 and D.is_leader():
+            import torch.distributed as dist
+            dist.broadcast_object_list([("EVAL", parameters)], src=0)
+
+        return self._execute_evaluation(parameters)
+
     def fit(self, parameters: list, config: dict) -> tuple:
         if D.world_size() > 1 and D.is_leader():
             import torch.distributed as dist
@@ -167,7 +192,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
             elif msg == "FIT":
                 self._execute_local_phase(params)
             elif msg == "EVAL":
-                self.evaluate(params, {})
+                self._execute_evaluation(params)
 
 
 def main() -> None:
