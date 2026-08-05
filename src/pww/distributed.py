@@ -101,6 +101,18 @@ def cleanup() -> None:
         dist.destroy_process_group()
 
 
+def is_leader() -> bool:
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return int(os.environ.get("RANK", 0)) == 0
+
+
+def world_size() -> int:
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
 def barrier() -> None:
     if dist.is_initialized():
         dist.barrier()
