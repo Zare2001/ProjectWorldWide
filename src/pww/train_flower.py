@@ -118,13 +118,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Flower + DARL DiLoCo Client")
     add_common_args(parser)
 
-    parser.add_argument("--central-ip", type=str, default="145.38.206.143", help="Central node IP")
-    parser.add_argument("--darl-port", type=int, default=29510, help="DARL HTTP port")
-    parser.add_argument("--flower-port", type=int, default=29511, help="Flower gRPC port")
-    parser.add_argument("--cluster-id", type=str, default=None, help="snellius or lumi")
-    parser.add_argument("--inner-steps", type=int, default=100, help="H inner steps")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.1)
+    g = parser.add_argument_group("federation")
+    g.add_argument("--central-ip", type=str, default="145.38.206.143", help="Central node IP")
+    g.add_argument("--darl-port", type=int, default=29510, help="DARL HTTP port")
+    g.add_argument("--flower-port", type=int, default=29511, help="Flower gRPC port")
+    g.add_argument("--cluster-id", type=str, default=None, help="snellius or lumi")
+
+    g = parser.add_argument_group("model")
+    g.add_argument("--model", type=str, default="resnet18", choices=sorted(RESNET_FACTORY))
+
+    g = parser.add_argument_group("data")
+    g.add_argument("--data-root", type=str, default=None, help="default: $PWW_DATA_DIR/cifar10")
+    g.add_argument("--batch-size", type=int, default=128, help="PER-RANK batch size")
+    g.add_argument("--num-workers", type=int, default=6)
+
+    g = parser.add_argument_group("optimisation")
+    g.add_argument("--epochs", type=int, default=30)
+    g.add_argument("--lr", type=float, default=0.1)
+    g.add_argument("--inner-optimizer", type=str, default="sgd", choices=("sgd", "adamw"))
+    g.add_argument("--momentum", type=float, default=0.9)
+    g.add_argument("--weight-decay", type=float, default=5e-4)
+    g.add_argument("--warmup-epochs", type=int, default=2)
+
+    g = parser.add_argument_group("diloco")
+    g.add_argument("--inner-steps", "--diloco-inner-steps", type=int, default=100, dest="inner_steps", help="H inner steps")
+    g.add_argument("--diloco-replicas", type=int, default=2)
+
+    g = parser.add_argument_group("execution")
+    g.add_argument("--save-every", type=int, default=10)
+    g.add_argument("--log-every", type=int, default=50)
 
     args = apply_config_file(parser)
 
@@ -159,8 +181,10 @@ def main() -> None:
     )
 
     # 3. Model & Optimizer
-    model = build_resnet("resnet18").to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    model = build_resnet(args.model).to(device)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+    )
 
     client = DiLoCoFlowerClient(
         model=model,
