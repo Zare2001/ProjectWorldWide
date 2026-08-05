@@ -70,12 +70,13 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         self.inner_steps = getattr(args, "inner_steps", None) or getattr(args, "diloco_inner_steps", 100)
 
     def get_parameters(self, config: dict) -> list:
-        return [p.detach().cpu().numpy() for p in self.model.parameters() if p.requires_grad]
+        return [p.detach().to(torch.float32).cpu().numpy() for p in self.model.parameters() if p.requires_grad]
 
     def set_parameters(self, parameters: list) -> None:
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         for p, val in zip(trainable_params, parameters):
-            p.data.copy_(torch.from_numpy(val).to(self.device))
+            tensor_val = torch.from_numpy(val).to(device=self.device, dtype=p.dtype)
+            p.data.copy_(tensor_val)
 
     def _execute_local_phase(self, parameters: list | None) -> tuple[list, int, dict]:
         if parameters:
