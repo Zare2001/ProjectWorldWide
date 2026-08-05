@@ -23,4 +23,8 @@ if [[ -f "${FLOWER_PID_FILE}" ]]; then
     rm -f "${FLOWER_PID_FILE}"
 fi
 
+# Ensure ports 29510 and 29511 are completely freed
+fuser -k 29510/tcp 2>/dev/null || true
+fuser -k 29511/tcp 2>/dev/null || true
+
 echo "Central node services stopped."
