@@ -288,7 +288,6 @@ def main() -> None:
     g.add_argument("--model", type=str, default="gpt2", help="HuggingFace model name or path")
     g.add_argument("--attn-implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     g.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
-    g.add_argument("--dtype", type=str, default="bf16", choices=["float32", "fp16", "bf16"])
 
     g = parser.add_argument_group("data")
     g.add_argument("--dataset-name", type=str, default="wikitext", help="HuggingFace dataset name or path")
