@@ -207,8 +207,27 @@ To stop:
 ./scripts/central_node/stop_central_services.sh
 ```
 
-**Restarting resumes; it does not start over.** Both state dirs survive a stop, and the
-coordinator says which it did:
+**Restarting resumes; it does not start over — and a bare restart is enough:**
+
+```bash
+./scripts/central_node/start_central_services.sh          # no variables needed
+```
+
+The script records what it launched with (`runs/darl/space.env`, `runs/central/launch.env`)
+and reuses it, printing `block space: resumed from …` when it does. An explicit variable
+still wins, so the commands above keep working unchanged.
+
+Do not omit them on a *first* start of a new run. Without a recorded launch the fallbacks
+are `NUM_SAMPLES=50000 BLOCK_SIZE=1000` and the **ResNet** aggregator config, which is not
+a torchtitan run: it turns FedMom off (`server-momentum: 0.0` is FedAvg), sets
+`min-clients: 2` so the run blocks until both sites are out of the queue, and cuts
+`num-rounds` to 50 with a 300 s timeout. Check the line the server logs:
+
+```
+transport=inline | server_learning_rate=0.7, server_momentum=0.9 | min_clients=1 | num_rounds=200 (attempts), round_timeout=1800s
+```
+
+Both state dirs survive a stop, and the coordinator says which it did:
 
 ```
 restored coordinator from .../snapshot.json (+0 journal entries): epoch 0, 0/113 blocks committed

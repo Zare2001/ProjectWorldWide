@@ -18,12 +18,32 @@ FLOWER_PORT="${FLOWER_PORT:-29511}"
 BLOB_PORT="${BLOB_PORT:-29512}"
 STATE_DIR="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/central"
 
+# What this script was last launched with, so a restart does not quietly become a
+# different run. Two files, each next to the state it has to stay consistent with:
+# the block geometry lives with the lease table it partitions (see SPACE_FILE below),
+# the run flavour with the global model it produced.
+#
+# Read the comment on SPACE_FILE for why this is not optional. The aggregator config is
+# the sharper edge of the two: omitting AGGREGATOR_CONFIG falls back to the ResNet
+# defaults, which turn FedMom off (momentum 0.0 is algebraically FedAvg), set
+# min-clients to 2 so the run blocks until both sites are out of the queue, and cut
+# num-rounds to 50 with a 300s timeout. Only the momentum change warns; the rest are
+# silent.
+LAUNCH_FILE="${STATE_DIR}/launch.env"
+_remember() {  # $1=file $2=key $3=ERE the value must match entirely
+    [[ -r "$1" ]] || return 1
+    local value
+    value="$(grep -m1 -E "^$2=$3$" "$1" | cut -d= -f2-)" || return 1
+    [[ -n "${value}" ]] || return 1
+    printf '%s' "${value}"
+}
+
 # TRANSPORT=blob moves weights out of band over HTTP instead of inside the Flower
 # gRPC message, which is required above roughly 1B parameters (gRPC caps a single
 # message at 2 GiB and no setting raises it). It adds a third daemon and needs
 # real disk: the global model and the momentum buffer are resident, plus one
 # delta per site transiently. See scripts/titan/README.md for the arithmetic.
-TRANSPORT="${TRANSPORT:-inline}"
+TRANSPORT="${TRANSPORT:-$(_remember "${LAUNCH_FILE}" TRANSPORT '[a-z]+' || echo inline)}"
 # Both under PWW_OUTPUT_DIR by default, and deliberately on the same filesystem:
 # publishing a merged global model into the blob store is then a hard link rather
 # than a copy of up to hundreds of gigabytes.
@@ -84,9 +104,28 @@ elif [[ -x "${VENV_DIR}/bin/python3" ]]; then
     PYTHON_BIN="${VENV_DIR}/bin/python3"
 fi
 
-NUM_SAMPLES="${NUM_SAMPLES:-50000}"
-BLOCK_SIZE="${BLOCK_SIZE:-1000}"
-SEED="${SEED:-42}"
+# The block-space parameters, remembered across restarts.
+#
+# These three define the partitioning, and the coordinator refuses to resume a snapshot
+# that describes a different one. That check is correct, but it made a bare
+# `./start_central_services.sh` unusable after any real run: the constants below are not
+# any run's real geometry, so the defaults silently disagreed with the snapshot and the
+# restart died inside Coordinator.load.
+#
+# They cannot be recovered from the snapshot -- it stores num_blocks and the digest, and a
+# digest is a hash -- so this script records what it launched with and reuses it. An
+# explicit environment variable always wins, so switching corpus is still just
+# NUM_SAMPLES=... DARL_FRESH=1, and the file is inside the DARL state dir on purpose:
+# delete that state and the memory of it goes too.
+SPACE_FILE="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/darl/space.env"
+_remembered() { _remember "${SPACE_FILE}" "$1" '[0-9]+'; }   # geometry is numeric-only
+SPACE_SOURCE="explicit"
+if [[ -z "${NUM_SAMPLES:-}${BLOCK_SIZE:-}${SEED:-}" ]] && [[ -r "${SPACE_FILE}" ]]; then
+    SPACE_SOURCE="resumed from ${SPACE_FILE}"
+fi
+NUM_SAMPLES="${NUM_SAMPLES:-$(_remembered NUM_SAMPLES || echo 50000)}"
+BLOCK_SIZE="${BLOCK_SIZE:-$(_remembered BLOCK_SIZE || echo 1000)}"
+SEED="${SEED:-$(_remembered SEED || echo 42)}"
 # Default DARL epochs set to 1 for single-pass LLM pre-training over tokenized corpora.
 DARL_EPOCHS="${DARL_EPOCHS:-1}"
 
@@ -114,7 +153,8 @@ fi
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
-    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS}, seed: ${SEED}, fresh: ${DARL_FRESH})..."
+    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS}, seed: ${SEED}, fresh: ${DARL_FRESH})"
+    echo "  block space: ${SPACE_SOURCE}"
     # Not backgrounded. darl_coordinator.sh already nohups the server and returns after
     # a liveness check, so the `&` that used to be here threw that check away -- a
     # coordinator that died on a port collision still reported "DARL started." -- and
@@ -127,8 +167,23 @@ else
         ${DARL_EXTRA[@]+"${DARL_EXTRA[@]}"} > "${STATE_DIR}/darl.log" 2>&1; then
         echo "ERROR: DARL coordinator failed to start. Last lines of ${STATE_DIR}/darl.log:" >&2
         tail -n 20 "${STATE_DIR}/darl.log" >&2
+        if grep -q "holds a .*-block epoch but this coordinator was started for" \
+                "${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/darl/coordinator.log" 2>/dev/null; then
+            cat >&2 <<EOF
+
+That is the resume check refusing a snapshot for a different partitioning. Either pass the
+geometry the snapshot was built with, or start a new epoch on purpose:
+
+    NUM_SAMPLES=<windows> BLOCK_SIZE=<n> SEED=<n> $0
+    DARL_FRESH=1 NUM_SAMPLES=<windows> BLOCK_SIZE=<n> SEED=<n> $0
+EOF
+        fi
         exit 1
     fi
+    # Only after a start that survived its liveness check, so a failed launch cannot
+    # overwrite the geometry of the run still recorded in the snapshot.
+    printf 'NUM_SAMPLES=%s\nBLOCK_SIZE=%s\nSEED=%s\n' \
+        "${NUM_SAMPLES}" "${BLOCK_SIZE}" "${SEED}" > "${SPACE_FILE}"
     echo "DARL started."
 fi
 
@@ -184,15 +239,28 @@ else
     # Overridable so a torchtitan/Qwen3 run can use its own strategy settings --
     # notably server-momentum, which configs/central_aggregator.yaml pins to 0.0
     # for ResNet's BatchNorm statistics and which an LLM run wants at 0.9.
-    AGGREGATOR_CONFIG="${AGGREGATOR_CONFIG:-${PWW_ROOT}/configs/central_aggregator.yaml}"
+    AGGREGATOR_CONFIG="${AGGREGATOR_CONFIG:-$(_remember "${LAUNCH_FILE}" AGGREGATOR_CONFIG \
+        '[A-Za-z0-9._/-]+' || echo "${PWW_ROOT}/configs/central_aggregator.yaml")}"
+    if [[ ! -r "${AGGREGATOR_CONFIG}" ]]; then
+        echo "ERROR: aggregator config not readable: ${AGGREGATOR_CONFIG}" >&2
+        exit 1
+    fi
     echo "Starting Flower Aggregator Server on port ${FLOWER_PORT} (${AGGREGATOR_CONFIG})..."
     nohup "${PYTHON_BIN}" -m pww.central.server \
         --config "${AGGREGATOR_CONFIG}" \
         --port "${FLOWER_PORT}" \
         "${SERVER_EXTRA[@]}" > "${STATE_DIR}/flower.log" 2>&1 &
     echo $! > "${FLOWER_PID_FILE}"
-    echo "Flower server started (PID $(cat "${FLOWER_PID_FILE}"))."
     sleep 2
+    if ! kill -0 "$(cat "${FLOWER_PID_FILE}")" 2>/dev/null; then
+        echo "ERROR: Flower server exited immediately. Last lines of ${STATE_DIR}/flower.log:" >&2
+        tail -n 20 "${STATE_DIR}/flower.log" >&2
+        exit 1
+    fi
+    echo "Flower server started (PID $(cat "${FLOWER_PID_FILE}"))."
+    # Same rule as the geometry: only record a launch that survived its liveness check.
+    printf 'TRANSPORT=%s\nAGGREGATOR_CONFIG=%s\n' \
+        "${TRANSPORT}" "${AGGREGATOR_CONFIG}" > "${LAUNCH_FILE}"
 fi
 
 echo ""
