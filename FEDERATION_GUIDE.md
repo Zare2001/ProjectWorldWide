@@ -318,13 +318,43 @@ round 138 merged from 2 cluster(s) in 41.3s (peak ~2.1 GiB, lr=0.7, momentum=0.9
   on 1 sample for 23 consecutive rounds because a `max(1, ...)` floor turned "the
   corpus is exhausted" into "one sample", and the global model sat frozen while the
   log showed no failures.
-- **`drift`** is `||local - global|| / ||global||` per round. It is the number that
-  tells you whether `H` is sensible: near zero means the inner loop is barely
-  moving, and large means the replicas have diverged far enough that averaging them
-  is losing information.
-- **`ppl`** is the perplexity of the training loss. Evaluation reports perplexity
-  under its own name, not as `accuracy` — the old path reported a perplexity of 30
-  in a field labelled accuracy.
+- **`drift`** is `||local - global|| / ||global||` per round, reported as mean **and
+  max**. It is the number `H` should be tuned against: near zero means the inner loop
+  is barely moving and the WAN round trip is not earning its keep; large means the
+  replicas diverged far enough that averaging them destroys rather than combines their
+  progress. Read the **max** — it is the worst replica that decides that, and two sites
+  at 0.01 and 0.30 average to a reassuring 0.155. Averaged unweighted across clusters
+  on purpose: drift is a property of a trajectory, not of a token count, so weighting it
+  by tokens would say a fast site drifted more merely by doing more work.
+- **`ppl`** is the perplexity of the training loss. Evaluation reports perplexity under
+  its own name, not as `accuracy` — the old path reported a perplexity of 30 in a field
+  labelled accuracy.
+
+### Why the metric arithmetic is not obvious
+
+Three things here would produce plausible-looking numbers if they were wrong, so they
+are worth knowing about and are each pinned by a test.
+
+**Perplexity is pooled through the loss, never by averaging perplexities.**
+`ppl = exp(mean NLL per token)`, so the perplexity of the union of the sites' validation
+tokens is `exp()` of their token-weighted mean loss — exactly, since each site reports
+its own mean NLL per token. Averaging per-site perplexities computes `mean(exp(L))`, and
+`exp` is convex, so by Jensen that is always ≥ `exp(mean(L))`. Two sites at loss 2.0 and
+4.0 report **31.0 against a true 20.1**, and the error tracks how unevenly the sites are
+running rather than the model — the worst property a training metric can have.
+
+**Accuracy is *not* treated the same way**, and that is not an inconsistency: accuracy is
+a mean of per-sample 0/1 outcomes, so a sample-weighted mean of per-site accuracies *is*
+the pooled accuracy. Linear, unlike perplexity.
+
+**Tokens and loss are cluster-level, not rank-level.** torchtitan keeps
+`ntokens_seen` and the training loss per rank and globalises them only inside its own
+logging. Both leave the process here, and `num_examples` **is the FedMom merge weight** —
+so a per-rank count would silently collapse token weighting back into uniform `1/k`
+averaging whenever two sites share a per-rank geometry. LUMI's 8 GCDs and Snellius's 4
+report the same rank-0 count at the same `local_batch_size` and `seq_len`, while LUMI
+trained twice the tokens. `FederatedTrainer._cluster_total` all-reduces them over the dp
+mesh once per phase.
 
 DARL coverage:
 
@@ -435,7 +465,7 @@ python3 tests/test_federation.py
 |---|---|---|
 | `test_darl.py` | 45 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
 | `test_titan.py` | 19 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec, config feasibility |
-| `test_federation.py` | 23 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; the outer step against `SGD(nesterov=True)` |
+| `test_federation.py` | 26 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)` |
 | `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
 | `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
 

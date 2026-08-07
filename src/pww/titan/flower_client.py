@@ -219,10 +219,25 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             if parameters:
                 self.set_parameters(parameters)
 
-        loss = self.federated.validate()
+        loss, tokens = self.federated.validate()
         if math.isnan(loss):
             return 0.0, 0, {}
-        return float(loss), 1, {"perplexity": float(math.exp(min(20.0, loss)))}
+        if tokens <= 0:
+            # Should not happen with validation enabled and steps > 0. Reported rather
+            # than dropped, but flagged: the cross-site aggregate is only a token-weighted
+            # mean if the weights are real token counts.
+            logger.warning(
+                "validation produced no token count; this cluster's held-out loss will "
+                "carry weight 1 in the cross-site aggregate instead of its token count"
+            )
+            tokens = 1
+        # `eval_loss` is what the central node aggregates; perplexity is derived there
+        # from the pooled loss. Sent per-cluster too, for visibility -- but it must not be
+        # what gets averaged. See central/server.py::aggregate_eval_metrics.
+        return float(loss), int(tokens), {
+            "eval_loss": float(loss),
+            "perplexity": float(math.exp(min(20.0, loss))),
+        }
 
     # --- blob transport ----------------------------------------------------
 

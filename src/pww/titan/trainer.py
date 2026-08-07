@@ -32,6 +32,8 @@ import contextlib
 import time
 from typing import Any
 
+import torch
+
 from ..logging_utils import get_logger
 
 logger = get_logger("pww.titan.trainer")
@@ -75,14 +77,65 @@ class FederatedTrainer:
         # processor, so the only way to get the held-out loss back out is to
         # intercept where it is logged.
         self._validation_loss = float("nan")
+        self._validation_tokens = 0
+        self._validation_baseline = 0
         processor = trainer.metrics_processor
         original_log_validation = processor.log_validation
 
         def capturing_log_validation(loss, step, *args, **kwargs):
             self._validation_loss = float(loss)
+            # Read here because `log_validation` zeroes the counter on its way out, and
+            # relative to a baseline taken in validate() because training also
+            # accumulates into it between its own log intervals.
+            self._validation_tokens = max(
+                0, processor.ntokens_since_last_log - self._validation_baseline
+            )
             return original_log_validation(loss, step, *args, **kwargs)
 
         processor.log_validation = capturing_log_validation
+
+    # --- cluster-level numbers --------------------------------------------
+
+    def _cluster_total(self, value: float) -> float:
+        """Sum a per-rank quantity across this cluster's data-parallel ranks.
+
+        torchtitan keeps `ntokens_seen` and the training loss **per rank** --
+        `self.ntokens_seen += labels.numel()` on the local batch -- and globalises them
+        only inside its own logging path. That is right there and wrong here, because
+        these numbers leave the process:
+
+        * `num_examples` is the FedMom merge weight. A per-rank count silently collapses
+          token weighting back into uniform 1/k averaging whenever two sites share a
+          per-rank geometry: LUMI's 8 GCDs and Snellius's 4 H100s report the *same*
+          rank-0 token count at the same local_batch_size and seq_len, while LUMI
+          actually trained twice the tokens. The deliberate departure from DiLoCo's
+          uniform average would then have been undone by an accounting bug.
+        * a reported loss that is one rank's rather than the cluster's is then
+          token-weighted across clusters as though it were a cluster-level mean.
+        * throughput understates by the data-parallel degree, so tokens/s looks 8x worse
+          on LUMI than it is.
+
+        Collective, so every rank must reach it the same number of times. Both callers
+        do -- rank 0 through the Flower client, the rest through
+        `flower_client.run_worker_loop`.
+
+        float64 rather than float32 on purpose: a round at 8 ranks x 8 batch x 2048
+        seq_len x 100 steps is ~13M tokens, already near float32's 2**24 exact-integer
+        ceiling.
+        """
+        parallel_dims = getattr(self.trainer, "parallel_dims", None)
+        if parallel_dims is None or not getattr(parallel_dims, "dp_cp_enabled", False):
+            return float(value)
+
+        from torchtitan.distributed import utils as dist_utils
+
+        tensor = torch.tensor(float(value), dtype=torch.float64,
+                              device=self.trainer.device)
+        return float(dist_utils.dist_sum(
+            tensor,
+            parallel_dims.world_mesh["dp_cp"],
+            getattr(getattr(self.trainer, "ft_manager", None), "loss_sync_pg", None),
+        ))
 
     # --- lifecycle --------------------------------------------------------
 
@@ -177,8 +230,16 @@ class FederatedTrainer:
                 committed = self._commit_leases()
 
         elapsed = max(1e-6, time.monotonic() - started)
-        tokens = trainer.ntokens_seen - tokens_before
-        avg_loss = self._loss_sum / self._loss_count if self._loss_count else 0.0
+        # Cluster-level, not rank-level -- see _cluster_total for why that distinction
+        # is load-bearing rather than cosmetic. Three tiny all-reduces once per H steps.
+        tokens = int(self._cluster_total(trainer.ntokens_seen - tokens_before))
+        loss_sum = self._cluster_total(self._loss_sum)
+        loss_count = self._cluster_total(self._loss_count)
+        # Sum of per-rank loss sums over sum of per-rank microbatch counts. Equal to the
+        # token-weighted mean because every microbatch carries the same token count here:
+        # fixed seq_len, fixed local_batch_size, and drop_last=True in the dataloader, so
+        # there are no partial batches to skew it.
+        avg_loss = loss_sum / loss_count if loss_count else 0.0
 
         self.rounds_done += 1
         return {
@@ -235,12 +296,22 @@ class FederatedTrainer:
             logger.warning("darl commit failed: %s", exc)
             return 0
 
-    def validate(self) -> float:
-        """Held-out loss, or nan when validation is disabled."""
+    def validate(self) -> tuple[float, int]:
+        """(held-out loss, tokens it was measured over). Loss is nan when disabled.
+
+        The loss needs no reduction here -- torchtitan's Validator already all-reduces it
+        over the dp mesh, so it is a cluster-level mean. The token count does, and it
+        matters because it is the weight the central node aggregates by: reporting a
+        constant (this returned `1` to Flower) makes the cross-site held-out loss an
+        unweighted mean over clusters, so a site that evaluated a hundred thousand tokens
+        counts exactly as much as one that evaluated a hundred.
+        """
         if not self.job_config.validation.enable:
-            return float("nan")
+            return float("nan"), 0
         trainer = self.trainer
         self._validation_loss = float("nan")
+        self._validation_tokens = 0
+        self._validation_baseline = trainer.metrics_processor.ntokens_since_last_log
         with trainer.loss_fn.no_rescale():
             trainer.validator.validate(trainer.model_parts, trainer.step)
-        return self._validation_loss
+        return self._validation_loss, int(self._cluster_total(self._validation_tokens))

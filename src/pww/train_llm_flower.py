@@ -203,30 +203,45 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
 
         self.darl_source.release_unused()
 
+        # Cluster-level, not rank-level. Both numbers leave this process: the loss is
+        # token-weighted against the other site's, and the count IS the FedMom merge
+        # weight -- so a per-rank count would weight LUMI's 8 GCDs the same as
+        # Snellius's 4 whenever their per-rank geometry matches, which is exactly when
+        # LUMI did twice the work.
         avg_loss = loss_sum / max(1, step_count)
+        if D.world_size() > 1:
+            avg_loss = D.all_reduce_mean(avg_loss, self.device)
+
+        # TOKENS, not sequences. This used to report `step_count * batch_size`, a
+        # sequence count, while the server logged it as "tokens" and weighted the merge
+        # by it. Proportional as long as every site runs the same seq_len -- and silently
+        # wrong the moment one does not.
+        tokens_trained = step_count * self.args.batch_size * self.train_dataset.seq_len
+        if D.world_size() > 1:
+            tokens_trained = int(D.all_reduce_sum(float(tokens_trained), self.device))
+
         if D.is_leader():
-            tokens_processed = step_count * self.args.batch_size * self.train_dataset.seq_len
             logger.info(
-                f"Completed local inner LLM phase ({step_count} steps, {tokens_processed:,} tokens), "
-                f"avg loss: {avg_loss:.4f}, perplexity: {math.exp(min(20, avg_loss)):.2f}"
+                f"Completed local inner LLM phase ({step_count} steps, "
+                f"{tokens_trained:,} tokens), avg loss: {avg_loss:.4f}, "
+                f"perplexity: {math.exp(min(20, avg_loss)):.2f}"
             )
 
         # NOT max(1, ...). That floor is what turned "DARL ran dry and I trained
         # nothing" into "I trained 1 sample at loss 0.0", which FedMom then folded
         # into the average as a real result -- so a run continued for 23 rounds
         # after the corpus was exhausted, reporting no failures while the global
-        # model sat frozen. A truthful zero makes Flower's sample-weighted average
+        # model sat frozen. A truthful zero makes Flower's token-weighted average
         # ignore this cluster instead.
-        num_samples_trained = step_count * self.args.batch_size
         if step_count == 0 and D.is_leader():
             logger.warning(
                 "inner phase ran 0 steps -- DARL has no more blocks for this "
-                "cluster. Reporting 0 samples so this round carries no weight; "
+                "cluster. Reporting 0 tokens so this round carries no weight; "
                 "the server should stop rather than keep aggregating nothing."
             )
         return (
             self.get_parameters(config={}),
-            num_samples_trained,
+            tokens_trained,
             {"loss": float(avg_loss), "steps": step_count, "exhausted": step_count == 0},
         )
 
@@ -247,10 +262,22 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 outputs = self.model(input_ids=input_ids, labels=labels)
-                total_loss += outputs.loss.item() * input_ids.size(0)
-                total_tokens += input_ids.size(0)
+                # Weighted by the tokens the loss was actually averaged over, not by
+                # `input_ids.size(0)` -- that is the batch's *sequence* count, and using
+                # it made a variable called total_tokens hold sequences. Harmless while
+                # every sequence is the same length, wrong as soon as one is not, and
+                # mislabelled either way. -100 is the ignore index, so those positions
+                # contributed nothing to the loss and must not be counted.
+                supervised = int((labels != -100).sum().item())
+                total_loss += outputs.loss.item() * supervised
+                total_tokens += supervised
 
         avg_loss = total_loss / max(1, total_tokens)
+        if D.world_size() > 1:
+            # Cluster-level, so the central node's token weighting is comparing like
+            # with like across sites.
+            avg_loss = D.all_reduce_mean(avg_loss, self.device)
+            total_tokens = int(D.all_reduce_sum(float(total_tokens), self.device))
         perplexity = math.exp(min(20.0, avg_loss))
 
         if D.is_leader():
@@ -263,7 +290,15 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         # the server prints that metric with a % sign, so a log line reading
         # "Test Accuracy: 21.69%" was in fact perplexity 21.69 -- which made a model
         # that never improved look like one at 21% accuracy and climbing.
-        return float(avg_loss), total_tokens, {"perplexity": float(perplexity)}
+        #
+        # `eval_loss` is what the server aggregates; it derives the pooled perplexity
+        # from that rather than averaging these per-cluster perplexities, because exp()
+        # is convex and a mean of perplexities is not the perplexity of the pooled
+        # corpus. See central/server.py::aggregate_eval_metrics.
+        return float(avg_loss), total_tokens, {
+            "eval_loss": float(avg_loss),
+            "perplexity": float(perplexity),
+        }
 
     def evaluate(self, parameters: list, config: dict) -> tuple[float, int, dict]:
         if D.world_size() > 1 and D.is_leader():

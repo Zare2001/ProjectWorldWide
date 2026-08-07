@@ -1150,8 +1150,18 @@ Log outputs report:
   for 23 consecutive rounds, because a `max(1, ...)` floor turned "the corpus is
   exhausted" into "one sample" and the global model sat frozen while the log showed
   no failures.
-* **`drift`** — `||local − global|| / ||global||` per round. The one number that says
-  whether `H` was chosen sensibly.
+* **`drift`** — `||local − global|| / ||global||` per round, as mean and **max**. The one
+  number that says whether `H` was chosen sensibly, and it is the max that matters:
+  two sites at 0.01 and 0.30 average to a reassuring 0.155.
+
+Three pieces of the metric arithmetic are non-obvious enough to be worth knowing, and
+each is pinned by a test because all three produce plausible numbers when wrong:
+perplexity is pooled through the **loss** rather than by averaging perplexities (`exp` is
+convex, so averaging is always pessimistic — two sites at loss 2.0 and 4.0 report 31.0
+against a true 20.1); accuracy deliberately *is* averaged, because it is linear; and
+tokens and loss are all-reduced to **cluster** level, because `num_examples` is the
+FedMom merge weight and a per-rank count would quietly turn token weighting back into
+uniform `1/k`. See [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md) §5.
 
 See [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md) §5 for annotated log excerpts and §6
 for the failure table.

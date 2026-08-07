@@ -28,6 +28,7 @@ ends when DARL runs out of tokens, not when Flower runs out of round numbers.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -121,6 +122,97 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_metric_aggregators():
+    """The two metric aggregation callbacks, as a pair.
+
+    Module level and returned rather than closed over inside `main` so the
+    arithmetic is reachable from tests. The perplexity pooling in particular is the
+    kind of thing that is wrong for years if nothing asserts it -- it produces a
+    plausible number either way.
+    """
+    def aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
+        """Token-weighted training loss, plus how far replicas drifted."""
+        total = sum(n for n, _ in metrics)
+        if total == 0:
+            logger.info("  >> no tokens trained this round")
+            return {}
+        avg_loss = sum(n * m.get(proto.LOSS, 0.0) for n, m in metrics) / total
+        out = {"loss": avg_loss}
+        drifts = [float(m["drift_ratio"]) for _, m in metrics if "drift_ratio" in m]
+        detail = ""
+        if drifts:
+            # Unweighted across clusters, and deliberately: drift is ||local - global|| /
+            # ||global||, a property of a replica's trajectory rather than of its tokens,
+            # so weighting it by token count would say a fast site drifted more simply by
+            # doing more work.
+            out["drift_ratio"] = sum(drifts) / len(drifts)
+            # The max is the actionable one. This is the quantity H should be tuned
+            # against -- once a replica's local update approaches the norm of the weights
+            # themselves, averaging replicas destroys rather than combines their progress
+            # -- and it is the *worst* replica that decides that, not the average. Two
+            # sites at 0.01 and 0.30 average to a reassuring 0.155.
+            out["drift_ratio_max"] = max(drifts)
+            detail = f", drift {out['drift_ratio']:.4f} (max {max(drifts):.4f})"
+        names = ", ".join(str(m.get(proto.CLUSTER, "?")) for _, m in metrics)
+        logger.info(
+            "  >> Training loss %.4f  (%d cluster(s) [%s], %s tokens%s)",
+            avg_loss, len(metrics), names, f"{total:,}", detail,
+        )
+        return out
+
+    def aggregate_eval_metrics(metrics: list[tuple[int, dict]]) -> dict:
+        """Pooled held-out perplexity, and accuracy for the CIFAR path.
+
+        Report each under its own name: an earlier version logged perplexity as
+        "Test Accuracy: 21.69%", which made a model that never improved look like one at
+        21% accuracy and climbing.
+        """
+        total = sum(n for n, _ in metrics)
+        if total == 0:
+            return {}
+
+        # Perplexity is aggregated through the LOSS, never by averaging perplexities.
+        #
+        # ppl = exp(mean NLL per token), so the perplexity of the union of the clusters'
+        # validation tokens is exp() of their token-weighted mean loss -- exactly, when
+        # each cluster reports its own mean NLL per token, which it does. Averaging
+        # per-cluster perplexities instead computes mean(exp(L)), and exp is convex, so
+        # by Jensen that is always >= exp(mean(L)): a pessimistic number, wrong by more
+        # the further apart the clusters are. Two sites at loss 2.0 and 4.0 report 31.0
+        # against a true 20.1, and the error moves with cluster skew rather than with the
+        # model, which is the worst property a training metric can have.
+        losses = [(n, float(m["eval_loss"])) for n, m in metrics if "eval_loss" in m]
+        if losses:
+            weight = sum(n for n, _ in losses)
+            pooled_loss = sum(n * v for n, v in losses) / weight
+            pooled_ppl = math.exp(min(20.0, pooled_loss))
+            per_cluster = ", ".join(
+                f"{math.exp(min(20.0, v)):.2f}" for _, v in losses
+            )
+            logger.info(
+                "  >> Perplexity %.2f  (held-out loss %.4f; per-cluster ppl [%s], "
+                "%s eval tokens)",
+                pooled_ppl, pooled_loss, per_cluster, f"{weight:,}",
+            )
+            return {"eval_loss": pooled_loss, "perplexity": pooled_ppl}
+
+        values = [(n, float(m["accuracy"])) for n, m in metrics if "accuracy" in m]
+        if values:
+            # Accuracy is a mean of per-sample 0/1 outcomes, so a sample-weighted mean of
+            # per-cluster accuracies *is* the pooled accuracy. Linear, unlike perplexity.
+            weight = sum(n for n, _ in values)
+            pooled = sum(n * v for n, v in values) / weight
+            per_cluster = ", ".join(f"{v:.2f}%" for _, v in values)
+            logger.info(
+                "  >> Test accuracy %.2f%%  (per-cluster: [%s], %s samples)",
+                pooled, per_cluster, f"{weight:,}",
+            )
+            return {"accuracy": pooled}
+        return {}
+
+    return aggregate_fit_metrics, aggregate_eval_metrics
+
+
 def main() -> None:
     setup_logging(rank=0)
     args = apply_config_file(build_parser())
@@ -197,52 +289,7 @@ def main() -> None:
             "a BatchNorm model; for an LLM this switches FedMom off."
         )
 
-    def aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
-        """Token-weighted training loss, plus how far replicas drifted."""
-        total = sum(n for n, _ in metrics)
-        if total == 0:
-            logger.info("  >> no tokens trained this round")
-            return {}
-        avg_loss = sum(n * m.get(proto.LOSS, 0.0) for n, m in metrics) / total
-        out = {"loss": avg_loss}
-        drifts = [m["drift_ratio"] for _, m in metrics if "drift_ratio" in m]
-        detail = ""
-        if drifts:
-            out["drift_ratio"] = sum(drifts) / len(drifts)
-            # The quantity H should be tuned against: once a replica's local update
-            # approaches the norm of the weights themselves, averaging replicas starts
-            # destroying rather than combining their progress.
-            detail = f", drift {out['drift_ratio']:.4f}"
-        names = ", ".join(str(m.get(proto.CLUSTER, "?")) for _, m in metrics)
-        logger.info(
-            "  >> Training loss %.4f  (%d cluster(s) [%s], %s tokens%s)",
-            avg_loss, len(metrics), names, f"{total:,}", detail,
-        )
-        return out
-
-    def aggregate_eval_metrics(metrics: list[tuple[int, dict]]) -> dict:
-        total = sum(n for n, _ in metrics)
-        if total == 0:
-            return {}
-        # LLM clients report perplexity; the CIFAR client reports accuracy. Whichever
-        # arrives, report it under its own name -- an earlier version logged perplexity
-        # as "Test Accuracy: 21.69%", which made a model that never improved look like
-        # one at 21% accuracy and climbing.
-        for key, label, fmt in (
-            ("perplexity", "Perplexity", "{:.2f}"),
-            ("accuracy", "Test accuracy", "{:.2f}%"),
-        ):
-            values = [(n, m[key]) for n, m in metrics if key in m]
-            if not values:
-                continue
-            weighted = sum(n * v for n, v in values) / sum(n for n, _ in values)
-            per_cluster = ", ".join(fmt.format(v) for _, v in values)
-            logger.info(
-                "  >> %s %s  (per-cluster: [%s], %s samples)",
-                label, fmt.format(weighted), per_cluster, f"{total:,}",
-            )
-            return {key: weighted}
-        return {}
+    aggregate_fit_metrics, aggregate_eval_metrics = build_metric_aggregators()
 
     strategy = FedMom(
         min_fit_clients=args.min_clients,

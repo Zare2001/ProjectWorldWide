@@ -23,6 +23,7 @@ tests/test_titan.py's sibling checks), and any actual training.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -408,6 +409,94 @@ def _():
         # one bfloat16 delta per site
         assert budget["transient"] == numel * 2 * 2, budget
         assert budget["free"] > 0
+
+
+@check("pooled perplexity comes from the pooled loss, not from averaging perplexities")
+def _():
+    """The metric bug that moves with cluster skew rather than with the model.
+
+    ppl = exp(mean NLL per token), so the perplexity of the union of the clusters'
+    validation tokens is exp() of their token-weighted mean loss -- exactly, since each
+    cluster reports its own mean NLL per token. Averaging per-cluster perplexities
+    computes mean(exp(L)) instead, and exp is convex, so by Jensen that is always at
+    least exp(mean(L)): pessimistic, and wrong by more the further apart the clusters
+    are. A metric whose error tracks how unevenly the sites are running, rather than the
+    model, is worse than no metric.
+    """
+    from pww.central.server import build_metric_aggregators
+
+    _fit, aggregate_eval = build_metric_aggregators()
+
+    # Equal token counts, losses 2.0 and 4.0.
+    out = aggregate_eval([
+        (1000, {"eval_loss": 2.0, "perplexity": math.exp(2.0)}),
+        (1000, {"eval_loss": 4.0, "perplexity": math.exp(4.0)}),
+    ])
+    assert abs(out["eval_loss"] - 3.0) < 1e-9, out
+    assert abs(out["perplexity"] - math.exp(3.0)) < 1e-6, out
+    # The wrong answer, for the record: mean(exp(2), exp(4)) = 31.0 against exp(3) = 20.1.
+    naive = (math.exp(2.0) + math.exp(4.0)) / 2
+    assert naive > out["perplexity"] * 1.5, (naive, out["perplexity"])
+
+    # Token weighting: the site that evaluated ten times as much should dominate.
+    out = aggregate_eval([
+        (100, {"eval_loss": 5.0}),
+        (1000, {"eval_loss": 2.0}),
+    ])
+    expected = (100 * 5.0 + 1000 * 2.0) / 1100
+    assert abs(out["eval_loss"] - expected) < 1e-9, out
+    assert abs(out["perplexity"] - math.exp(expected)) < 1e-6, out
+
+    # A single cluster is the degenerate case and must be exact.
+    out = aggregate_eval([(500, {"eval_loss": 1.25})])
+    assert abs(out["perplexity"] - math.exp(1.25)) < 1e-9, out
+
+    # Nothing evaluated: no metric rather than a divide by zero.
+    assert aggregate_eval([(0, {"eval_loss": 3.0})]) == {}
+
+
+@check("accuracy stays a sample-weighted mean, which for a linear metric is correct")
+def _():
+    """The CIFAR path shares this aggregator, and accuracy must NOT get the same
+    treatment: it is a mean of per-sample 0/1 outcomes, so a sample-weighted mean of
+    per-cluster accuracies *is* the pooled accuracy. Linear, unlike perplexity.
+    """
+    from pww.central.server import build_metric_aggregators
+
+    _fit, aggregate_eval = build_metric_aggregators()
+    out = aggregate_eval([(100, {"accuracy": 90.0}), (300, {"accuracy": 70.0})])
+    assert abs(out["accuracy"] - 75.0) < 1e-9, out
+    assert "perplexity" not in out, "accuracy must not be exponentiated"
+
+
+@check("training loss is token-weighted across clusters")
+def _():
+    """A cluster that trained ten times the tokens should move the reported loss ten
+    times as much. Unweighted would let a site that managed two steps before walltime
+    drag the number as far as one that ran a full phase.
+    """
+    from pww.central.server import build_metric_aggregators
+
+    aggregate_fit, _eval = build_metric_aggregators()
+    out = aggregate_fit([
+        (1_000_000, {proto.LOSS: 2.0, proto.CLUSTER: "lumi"}),
+        (100_000, {proto.LOSS: 7.0, proto.CLUSTER: "snellius"}),
+    ])
+    expected = (1_000_000 * 2.0 + 100_000 * 7.0) / 1_100_000
+    assert abs(out["loss"] - expected) < 1e-9, out
+    # And a round where nothing was trained reports nothing, rather than a loss of 0.0 --
+    # which is what let 23 consecutive no-op rounds look like progress.
+    assert aggregate_fit([(0, {proto.LOSS: 0.0})]) == {}
+
+    # Drift is reported as both mean and max, because it is the worst replica that
+    # decides whether H is too large, and two sites at 0.01 and 0.30 average to a
+    # reassuring 0.155.
+    out = aggregate_fit([
+        (1000, {proto.LOSS: 2.0, "drift_ratio": 0.01}),
+        (1000, {proto.LOSS: 2.0, "drift_ratio": 0.30}),
+    ])
+    assert abs(out["drift_ratio"] - 0.155) < 1e-9, out
+    assert abs(out["drift_ratio_max"] - 0.30) < 1e-9, out
 
 
 @check("the outer step is Nesterov momentum on DiLoCo's outer gradient")
