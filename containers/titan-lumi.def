@@ -1,8 +1,15 @@
 Bootstrap: localimage
-From: /appl/local/containers/sif-images/lumi-pytorch-rocm-6.4.4-python-3.12-pytorch-v2.9.1.sif
+From: /appl/local/laifs/containers/lumi-multitorch-u24r64f21m43t29-20260319_153422/lumi-multitorch-full-u24r64f21m43t29-20260319_153422.sif
 
 # LUMI (ROCm) image for the torchtitan path. Adds the pure-Python packages
-# torchtitan needs on top of a ROCm 6.4.4 / PyTorch 2.9.1 base.
+# torchtitan needs on top of a ROCm 6.4 / PyTorch 2.9.1 base.
+#
+# The base comes from LAIF (/appl/local/laifs/containers/), not from LUMI's
+# maintained /appl/local/containers/sif-images/, which tops out at torch 2.7.1.
+# Its naming encodes the versions: u24=Ubuntu 24, r64=ROCm 6.4, t29=torch 2.9.
+# `full` is picked over `torch` because it already carries datasets, tokenizers,
+# safetensors, transformers, sentencepiece and tensorboard, leaving only five
+# packages to install below.
 #
 # Why a new image at all: LUMI's container this repo otherwise uses is on torch
 # 2.7.1, and torchtitan at the pinned commit (bb308da6) needs >= 2.9 for FSDP2 and
@@ -20,9 +27,11 @@ From: /appl/local/containers/sif-images/lumi-pytorch-rocm-6.4.4-python-3.12-pyto
 #               per site: PyPI's torchft==0.1.1 predates DiLoCo, and a
 #               maturin-built wheel has to match each image's glibc and Python.
 #
-# If the FROM image above does not exist, list what LUMI currently ships:
-#   ls /appl/local/containers/sif-images/ | grep -i pytorch
-# and pick the newest with pytorch >= 2.9.
+# If the FROM image above does not exist, LAIF has rebuilt or rotated it. List
+# what is there and pick the newest whose tag still says t29 -- NOT the newest
+# overall. t210 (torch 2.10) would break parity with Snellius's 2.9.1, which is
+# the whole point of pinning a minor version at both sites:
+#   ls -d /appl/local/laifs/containers/lumi-multitorch-*t29-*/
 
 %post
     set -eux
@@ -74,7 +83,7 @@ print('fsdp2 + dtensor + deps: ok')
 "
 
 %labels
-    Base lumi-pytorch-rocm-6.4.4-python-3.12-pytorch-v2.9.1
+    Base lumi-multitorch-full-u24r64f21m43t29-20260319_153422 (LAIF, ROCm 6.4 / torch 2.9.1)
     Adds torchdata, tyro, datasets, tokenizers, safetensors, flwr
     Purpose ProjectWorldWide torchtitan path (torchft deliberately absent)
 

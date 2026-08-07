@@ -33,6 +33,15 @@ mkdir -p "$(dirname "${OUT}")"
 # there is no root and no --fakeroot user namespace setup.
 module load CrayEnv PRoot 2>/dev/null || true
 
+# env.sh exports SINGULARITY_BIND for *running* on LUMI: Slingshot, Lustre and
+# /var/spool/slurmd. Singularity applies it to the %post container too, where it
+# is both useless and fatal -- a bind fails outright if the destination does not
+# already exist in the image, and a base image is under no obligation to carry
+# LUMI's runtime paths. The maintained lumi-pytorch image happens to, which is why
+# this only appears when building on a base from anywhere else:
+#   FATAL: mount /var/spool/slurmd -> destination doesn't exist in container
+unset SINGULARITY_BIND SINGULARITY_BINDPATH APPTAINER_BIND APPTAINER_BINDPATH
+
 # Both on scratch: a build stages several GB of layers, and $HOME on LUMI is a
 # ~20 GB quota that a single failed build fills.
 export SINGULARITY_TMPDIR="${PWW_TMPDIR}/singularity-build-${SLURM_JOB_ID}"

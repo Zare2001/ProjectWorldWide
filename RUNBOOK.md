@@ -56,12 +56,20 @@ The torchtitan path needs **its own** torch >= 2.9 environment, separate from th
 sbatch scripts/lumi/build_titan_container.sh           # -> $PWW_SCRATCH/containers/pww-titan.sif
 ```
 
-Verify before spending a queue slot:
+Verify before spending a queue slot. At a **site**, go through `pww_run` rather than a
+bare `python3` — LUMI's login nodes are on python 3.6, which cannot parse the tests.
+The central VM has no container and uses its own venv instead:
 
 ```bash
 # at a site
-PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" python3 tests/test_titan.py
-PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" python3 tests/test_darl.py
+source env.sh
+pww_run python3 tests/test_darl.py
+
+# test_titan.py imports torchtitan, so it needs the 2.9 environment, not the
+# 2.7.1 one. LUMI: point PWW_CONTAINER at the container built above.
+PWW_CONTAINER="$PWW_SCRATCH/containers/pww-titan.sif" \
+PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" \
+  pww_run python3 tests/test_titan.py
 
 # on the central VM -- no torchtitan, so use its own venv
 PYTHONPATH="$PWD/src" runs/central/.venv/bin/python3 tests/test_federation.py   # 26
@@ -78,9 +86,18 @@ four `torch_data` checks need torch. That is not a failure.
 Compute nodes at both sites have **no internet**, so everything the run reads must be on
 scratch first. Do this once per `(corpus, tokenizer, seq_len)`.
 
+This part is **not** independent of Part 0 on LUMI: `tokenize_c4.sh` imports
+`pww.titan`, which imports torchtitan, so it needs the 2.9 container. Only the
+tokenizer download runs in the default 2.7.1 one. Export this for the rest of the
+section — `PWW_CONTAINER` is what `PWW_LAUNCH` is built from, so it redirects every
+`pww_run` beneath it:
+
 ```bash
 source env.sh
+export PWW_CONTAINER="$PWW_SCRATCH/containers/pww-titan.sif"   # LUMI only
+```
 
+```bash
 # 1. Tokenizer. Prints the vocab size that becomes the embedding.
 ./scripts/titan/download_tokenizer.sh                  # -> $PWW_DATA_DIR/tokenizers/tokenizer-128k
 
@@ -329,7 +346,8 @@ were invisible in a single run.
 ```bash
 source env.sh
 pww_run python3 tests/test_darl.py          # 46 checks
-pww_run python3 tests/test_titan.py         # 19
+pww_run python3 tests/test_titan.py         # 19 -- needs the 2.9 env; on LUMI
+                                            #    set PWW_CONTAINER, see Part 0
 python3 tests/test_federation.py            # 26 -- central VM, no torchtitan needed
 pww_run python3 tests/test_local.py         # 28
 pww_run python3 tests/test_diloco_gloo.py   # 14
