@@ -30,6 +30,21 @@ git submodule update --init --recursive        # third_party/torchtitan
 source env.sh && pww_summary                    # confirm site detection and paths
 ```
 
+Two things to check before moving on:
+
+```bash
+ls -ld runs data          # BOTH must be symlinks into scratch, not directories
+```
+
+If either already exists as a real directory, `ln -sfn` puts the link *inside* it — you
+get `runs/runs` — and every path in Part 4 silently points at nothing. Move the directory
+aside and re-run `bootstrap.sh`.
+
+On the **central VM**, bootstrap exits 1 on its last step, `import torch, torchvision,
+transformers`. That is expected and fine: the central node has no GPU stack, the
+directories and symlinks are created before that check, and the aggregator runs from its
+own venv under `runs/central/.venv`.
+
 The torchtitan path needs **its own** torch >= 2.9 environment, separate from this repo's
 2.7.1 pin. Read [scripts/titan/README.md](scripts/titan/README.md) before running either:
 
@@ -44,9 +59,17 @@ sbatch scripts/lumi/build_titan_container.sh           # -> $PWW_SCRATCH/contain
 Verify before spending a queue slot:
 
 ```bash
+# at a site
 PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" python3 tests/test_titan.py
 PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" python3 tests/test_darl.py
+
+# on the central VM -- no torchtitan, so use its own venv
+PYTHONPATH="$PWD/src" runs/central/.venv/bin/python3 tests/test_federation.py   # 26
+PYTHONPATH="$PWD/src" runs/central/.venv/bin/python3 tests/test_darl.py         # 46
 ```
+
+`test_darl.py` under the system python3 reports **42 passed, 1 skipped** instead — the
+four `torch_data` checks need torch. That is not a failure.
 
 ---
 
@@ -132,8 +155,18 @@ Then confirm, and take the token the sites need:
 cat runs/darl/token
 ```
 
-`SEED` must equal `darl.space_seed` in the run's TOML, and `NUM_SAMPLES` the window count
-from Part 1. Disagreement is refused at registration by the block-space digest.
+`SEED` must equal `darl.space_seed` in the run's TOML, `BLOCK_SIZE` must equal
+`darl.block_size`, and `NUM_SAMPLES` the window count from Part 1. Disagreement is refused
+at registration by the block-space digest. Confirm the startup line agrees with the run
+you meant to launch:
+
+```
+block space: 115,156 samples / 1,024 per block = 113 blocks | digest 7029d22cecd74aa3
+darl coordinator on http://0.0.0.0:29510 | 113 blocks | epoch 0/1 | token yes
+```
+
+`token yes` is the one to read. `token NO -- anyone can lease` means every endpoint on
+that port is open, including on the public IP.
 
 To stop:
 
@@ -141,14 +174,32 @@ To stop:
 ./scripts/central_node/stop_central_services.sh
 ```
 
-State under `--state-dir` survives that, so stopping and restarting the aggregator does
-**not** lose the run. See [FEDERATION_GUIDE.md § 2](FEDERATION_GUIDE.md).
+**Restarting resumes; it does not start over.** Both state dirs survive a stop, and the
+coordinator says which it did:
+
+```
+restored coordinator from .../snapshot.json (+0 journal entries): epoch 0, 0/113 blocks committed
+```
+
+If that line is absent, the lease table was **discarded** and already-trained windows are
+free to be handed out again. Only ask for that when the corpus itself changed:
+
+```bash
+DARL_FRESH=1 NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+```
+
+Changing `NUM_SAMPLES`/`BLOCK_SIZE`/`SEED` does not need the flag — the restore compares
+the block-space digest and refuses a snapshot describing a different partitioning.
+
+See [FEDERATION_GUIDE.md § 2](FEDERATION_GUIDE.md).
 
 ---
 
 ## Part 3 — submit at each site
 
-Check reachability from the login node first — a firewall problem found here costs
+Check reachability **from each site's login node** — a firewall problem found here costs
 seconds instead of a queue wait:
 
 ```bash
@@ -158,6 +209,15 @@ curl -sS -H "X-DARL-Token: $DARL_TOKEN" http://145.38.206.143:29510/health
 nc -zv 145.38.206.143 29511
 nc -zv 145.38.206.143 29512      # blob transport only
 ```
+
+Two ways to misread the result:
+
+* **Do not run this on the central VM itself.** `145.38.206.143` is a floating IP that is
+  not on any of that host's interfaces, and there is no hairpin route, so the curl times
+  out there even when both daemons are healthy and every site can reach them. Check the
+  central side with `127.0.0.1` and `ss -tlnp` instead.
+* **Omitting the token gives `401`, not a connection error.** That is the reachability
+  check succeeding and the token being enforced.
 
 Submit. Both scripts default to `configs/titan/qwen3_0.6b_c4_diloco.toml`:
 
@@ -247,9 +307,17 @@ hit:
 | `503 cluster_busy` at startup | another live process holds that cluster id. Pass `--replica`. If it is a requeue after a hard crash, it clears within one TTL by itself. |
 | `digest mismatch` at registration | the two sites tokenised differently, or `SEED`/`NUM_SAMPLES` disagree. Re-check Part 1. |
 | `every delta for round N was stale` | expected after a walltime kill. The next round is current. Nothing to do. |
+| `401 bad or missing X-DARL-Token` | the site's `DARL_TOKEN` is not the value in `runs/darl/token`. Copy it across again. |
 
 Nothing here needs the run to be restarted from scratch. A killed site requeues and
-rejoins; a stopped aggregator restarts from `--state-dir` at the same merge round.
+rejoins; a stopped aggregator restarts from `--state-dir` at the same merge round, and the
+coordinator resumes its lease table from the same snapshot.
+
+Those two are separate state dirs, and only one of them is guarded by the round counter,
+so check both after any restart of the central services: the merge round in
+`status_central_services.sh`, and the `restored coordinator` line in Part 2. A restart that
+resumed the global model but wiped the lease table looks like a clean resume and quietly
+trains the same windows twice.
 
 ---
 

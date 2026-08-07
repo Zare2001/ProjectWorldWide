@@ -90,18 +90,67 @@ SEED="${SEED:-42}"
 # Default DARL epochs set to 1 for single-pass LLM pre-training over tokenized corpora.
 DARL_EPOCHS="${DARL_EPOCHS:-1}"
 
+# Resume by default; --fresh has to be asked for by name.
+#
+# --fresh makes the coordinator ignore the snapshot in its state dir and start a new
+# epoch with every block free again. Passing it unconditionally made restarting this
+# script hand out spans that were already trained -- and silently, which is the worst
+# part: the Flower server has no --fresh and DOES resume from its own --state-dir, so
+# the merge round picks up where it left off and the restart looks clean while the
+# exactly-once partitioning that is the entire point of the lease table is gone.
+#
+#   DARL_FRESH=1 ./scripts/central_node/start_central_services.sh   # new run, new corpus
+#
+# Note that changing NUM_SAMPLES/BLOCK_SIZE/SEED does not need this flag: the restore
+# checks the block-space digest and refuses a snapshot that describes a different
+# partitioning, which is a loud failure rather than a quiet one.
+DARL_FRESH="${DARL_FRESH:-0}"
+DARL_EXTRA=()
+if [[ "${DARL_FRESH}" == "1" ]]; then
+    DARL_EXTRA+=(--fresh)
+fi
+
 # 1. Start DARL Coordinator
 if [[ -f "${DARL_PID_FILE}" ]] && kill -0 "$(cat "${DARL_PID_FILE}")" 2>/dev/null; then
     echo "DARL coordinator already running (PID $(cat "${DARL_PID_FILE}"))."
 else
-    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS}, seed: ${SEED})..."
-    DARL_PORT="${DARL_PORT}" DARL_TOKEN="" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
+    echo "Starting DARL Lease Coordinator on port ${DARL_PORT} (samples: ${NUM_SAMPLES}, block_size: ${BLOCK_SIZE}, epochs: ${DARL_EPOCHS}, seed: ${SEED}, fresh: ${DARL_FRESH})..."
+    # Not backgrounded. darl_coordinator.sh already nohups the server and returns after
+    # a liveness check, so the `&` that used to be here threw that check away -- a
+    # coordinator that died on a port collision still reported "DARL started." -- and
+    # left step 2 racing the creation of the token file it reads.
+    if ! DARL_PORT="${DARL_PORT}" "${PWW_ROOT}/scripts/darl_coordinator.sh" start \
         --num-samples "${NUM_SAMPLES}" \
         --block-size "${BLOCK_SIZE}" \
         --epochs "${DARL_EPOCHS}" \
         --seed "${SEED}" \
-        --fresh > "${STATE_DIR}/darl.log" 2>&1 &
+        ${DARL_EXTRA[@]+"${DARL_EXTRA[@]}"} > "${STATE_DIR}/darl.log" 2>&1; then
+        echo "ERROR: DARL coordinator failed to start. Last lines of ${STATE_DIR}/darl.log:" >&2
+        tail -n 20 "${STATE_DIR}/darl.log" >&2
+        exit 1
+    fi
     echo "DARL started."
+fi
+
+# The shared secret, for the blob store below and for the sites. Previously this
+# script forced DARL_TOKEN="" into the coordinator, and because darl_coordinator.sh
+# expands it with `-` rather than `:-`, that empty value survived the token-file
+# fallback: the token was generated, written and never enforced. DarlHandler treats an
+# empty token as "no auth configured" and authorises everything, so every endpoint on
+# this port was open, not just /health.
+#
+# Setting DARL_TOKEN in the environment still wins, including to opt out explicitly:
+#   DARL_TOKEN="" ./scripts/central_node/start_central_services.sh   # no auth, deliberate
+DARL_TOKEN_FILE="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/darl/token"
+if [[ -z "${DARL_TOKEN+set}" && -s "${DARL_TOKEN_FILE}" ]]; then
+    DARL_TOKEN="$(cat "${DARL_TOKEN_FILE}")"
+fi
+export DARL_TOKEN
+if [[ -n "${DARL_TOKEN:-}" ]]; then
+    echo "DARL token enforced (${DARL_TOKEN_FILE}) -- the sites need this value."
+else
+    echo "WARNING: no DARL token: any process that can reach port ${DARL_PORT} can lease," \
+         "commit and release blocks in this run." >&2
 fi
 
 # 2. Start the blob store (blob transport only)

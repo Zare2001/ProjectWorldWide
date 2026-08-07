@@ -159,6 +159,16 @@ Two mechanisms make joining and leaving safe:
   mid-round, requeued hours later, has that first delta rejected rather than
   averaged in stale. Its next round is current and contributes normally.
 
+There are **two** durable state dirs, and only the model's is guarded by a round counter:
+`runs/central/global` holds the global weights and the momentum buffer, `runs/darl` holds
+the lease table. Restarting the central services resumes both, but they resume
+independently, and a lease table that came back empty is not detectable from the model
+side — the merge round continues from where it stopped either way, and the run trains
+windows it has already trained. The coordinator prints `restored coordinator from
+.../snapshot.json` when it resumed; that line is the check. `DARL_FRESH=1` is what
+deliberately discards it, for a genuinely new corpus, and it is not the default precisely
+because the failure is silent.
+
 On a cold start with no state on disk, the server asks exactly **one** site to
 upload its initial weights and adopts them as the global model — the central node
 cannot invent an architecture. Every later site is checked against those keys and
