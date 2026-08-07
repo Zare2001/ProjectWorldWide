@@ -155,6 +155,9 @@ three guards and what each catches.
 
 ### The operational workflow
 
+The shape of it, in one view. **[RUNBOOK.md](RUNBOOK.md) is the copy with the actual
+commands** — including first-time setup, which this omits.
+
 ```
   ONCE, offline (login node, no allocation)
     scripts/titan/download_tokenizer.sh     OpenEuroLLM 128k
@@ -186,8 +189,9 @@ three guards and what each catches.
 | getting weights across | [src/pww/titan/params.py](src/pww/titan/params.py) inline, [src/pww/delta.py](src/pww/delta.py) out-of-band |
 | single-site DiLoCo (no WAN) | [src/pww/diloco.py](src/pww/diloco.py) — same algorithm as a collective inside one allocation |
 
-Operational detail is in **[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**; the torchtitan
-environment requirements are in **[scripts/titan/README.md](scripts/titan/README.md)**.
+Step-by-step commands are in **[RUNBOOK.md](RUNBOOK.md)**, the reference behind them in
+**[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**, and the torchtitan environment
+requirements in **[scripts/titan/README.md](scripts/titan/README.md)**.
 
 ## Layout
 
@@ -1004,10 +1008,10 @@ layout.
 
 ## Extending to LLM Training
 
-Two client paths share the same central node. **Prefer torchtitan for new work** —
-it is the only one that scales past ~1B parameters, and the operational detail is in
-**[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)** with the environment requirements in
-[scripts/titan/README.md](scripts/titan/README.md).
+Two client paths share the same central node. **Prefer torchtitan for new work** — it is
+the only one that scales past ~1B parameters. To run it: **[RUNBOOK.md](RUNBOOK.md)** for
+the steps, [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md) for what the knobs mean,
+[scripts/titan/README.md](scripts/titan/README.md) for the environment.
 
 | | inner loop | model | config | torch |
 |---|---|---|---|---|

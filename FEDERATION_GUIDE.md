@@ -1,8 +1,9 @@
 # Running a multi-site DiLoCo job (LUMI + Snellius + central node)
 
-Operations guide for the cross-site outer step: what to start on the central VM
-(`145.38.206.143`), what to submit at each site, and how to tell from the logs
-whether it is actually training.
+**Looking for the steps? [RUNBOOK.md](RUNBOOK.md).** That is the ordered command path,
+first-time setup included. This file is the reference behind it: what each knob means,
+why the choices are what they are, and how to read the output. Every runbook step links
+back to a section here, so the reasoning lives in one place and the commands in the other.
 
 There are **two client paths** and they share the whole central node:
 
