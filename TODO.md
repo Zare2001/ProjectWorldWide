@@ -110,7 +110,30 @@ is the smallest thing that exercises it.
       batch across two sites is roughly twice one site's. Whether to scale for that
       is a research question, not an infrastructure one.
 
-### 6. Smaller things
+### 6. Concurrent jobs at one site need a protocol decision
+
+Two jobs submitted to one facility can share a node, and the DARL cluster id defaults
+to the site name alone. `--replica a` / `--replica b` on `scripts/titan/run_train.sh`
+works today and is documented, but it is opt-in: forget it and the failure is silent
+(the first job to exit releases the second's live leases; both upload deltas to the
+same blob name and one overwrites the other). Both behaviours are pinned in
+`tests/test_darl.py`.
+
+Closing it properly means the coordinator must distinguish "the requeued me" from "a
+second concurrent me", and those look identical today — which is not an oversight:
+excluding the job id from the cluster id is what lets a requeued job keep the measured
+throughput that sizes its grants.
+
+- [ ] decide between: (a) leave it opt-in and rely on `--replica`; (b) add a random
+      per-session incarnation token, sent with register/heartbeat/release, so a release
+      is scoped to the incarnation that made it and a new incarnation supersedes an old
+      one; (c) refuse a second concurrent registration outright, which is simplest but
+      would break the requeue-while-stale-leases-exist case, i.e. the normal walltime
+      path
+- [ ] whichever is chosen, the delta blob name needs the same distinction, or two jobs
+      still overwrite each other on the central node
+
+### 7. Smaller things
 
 - [ ] `--keep-rounds` prunes old blobs; confirm the pruning actually keeps disk
       bounded over a 200-round run rather than only in the test

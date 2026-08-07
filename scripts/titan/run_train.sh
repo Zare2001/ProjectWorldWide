@@ -8,6 +8,10 @@
 #
 #   scripts/titan/run_train.sh --config configs/titan/qwen3_0.6b_smoke.toml
 #
+# Running TWO jobs at the same site at the same time: pass --replica a and --replica b.
+# Without it both register with the coordinator under the same cluster id and silently
+# corrupt each other's leases and deltas. See the --replica block below.
+#
 #   scripts/titan/run_train.sh \
 #       --config configs/titan/qwen3_0.6b_c4_diloco.toml \
 #       --shards $PWW_DATA_DIR/c4-tokenizer-128k-2048 \
@@ -35,6 +39,9 @@ NPROC=""
 NNODES="${SLURM_NNODES:-1}"
 DUMP=""
 SITE_OVERRIDE=""
+# Distinguishes concurrent jobs at ONE site. Empty means "the only job here", which
+# is the common case; see the block that consumes it below for why it matters.
+REPLICA="${REPLICA:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --nproc) NPROC="$2"; shift 2 ;;
         --dump) DUMP="$2"; shift 2 ;;
         --site) SITE_OVERRIDE="$2"; shift 2 ;;
+        --replica) REPLICA="$2"; shift 2 ;;
         --) shift; break ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1 (use -- to pass flags to torchtitan)" >&2; exit 1 ;;
@@ -81,16 +89,41 @@ export APPTAINERENV_PYTHONPATH="${PYTHONPATH}"
 NPROC="${NPROC:-${SLURM_GPUS_PER_NODE:-${PWW_GPUS_PER_NODE}}}"
 SITE="${SITE_OVERRIDE:-${PWW_SITE}}"
 
-# Derived rather than fixed, so two jobs on the same node cannot collide on the
-# rendezvous port. Same trick the existing per-site job scripts use.
+# The torchrun rendezvous port. Two jobs of this repo landing on the same node is
+# routine -- both sites allow partial-node allocations, so submitting two 2-GPU jobs
+# to one facility can put them on the same host -- and a shared port makes the second
+# job's rendezvous fail, or worse, join the first job's.
+#
+# Multi-node and single-node need different answers, because every node running
+# torchrun must agree on the port:
+#
+#   NNODES > 1   it has to be *derived*, identically on every node, so probing is not
+#                an option. Derived from SLURM_JOB_ID, which is unique among
+#                concurrent jobs, over a wide range: a collision needs two live jobs
+#                whose ids differ by exactly the modulus. This used to be `% 400`,
+#                which is only about 1 in 400 per pair of co-resident jobs -- small,
+#                but these are multi-hour queue waits to lose.
+#   NNODES = 1   ask the kernel for a free port, which cannot collide at all. Safe
+#                here because this script runs once per job (the shipped job scripts
+#                are --nodes=1 --ntasks-per-node=1 and call it directly, not via srun).
 JOB_ID="${SLURM_JOB_ID:-0}"
-MASTER_PORT=$(( 29600 + (JOB_ID % 400) ))
+MASTER_PORT=$(( 29600 + (JOB_ID % 20000) ))
 if [[ "${NNODES}" -gt 1 ]]; then
     HEAD_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
     RDZV_ENDPOINT="${HEAD_NODE}:${MASTER_PORT}"
 else
+    # Bind port 0, read what the kernel picked, release it. There is a small window
+    # between releasing and torchrun binding; the derived port is the fallback if the
+    # probe itself fails (no python on PATH, a hostile sandbox).
+    PROBED=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()' 2>/dev/null || true)
+    [[ -n "${PROBED}" ]] && MASTER_PORT="${PROBED}"
     RDZV_ENDPOINT="localhost:${MASTER_PORT}"
 fi
+echo "rendezvous  : ${RDZV_ENDPOINT}"
 
 overrides=()
 [[ -n "${TOKENIZER}" ]] && overrides+=(--model.hf_assets_path "${TOKENIZER}")
@@ -101,6 +134,26 @@ overrides=()
 # a plain single-site torchtitan run through this launcher needs no coordinator.
 if grep -qE '^[[:space:]]*dataset[[:space:]]*=[[:space:]]*"pww_tokens"' "${CONFIG}"; then
     overrides+=(--darl.url "http://${CENTRAL}:${DARL_PORT}" --darl.site "${SITE}")
+    # --replica is REQUIRED when you run more than one job at the same site at the
+    # same time, and it is not a performance knob -- it is a correctness one.
+    #
+    # The DARL cluster id defaults to the site name alone ("lumi"), deliberately, so
+    # that a job killed at walltime and requeued is recognised as the same cluster and
+    # keeps its measured throughput -- which is what sizes its grants. The cost is
+    # that two *concurrent* jobs at one site both call themselves "lumi", and the
+    # coordinator cannot tell them apart. Two things then go wrong silently:
+    #
+    #   * /release with no lease id releases every lease held by that cluster id, so
+    #     the first job to finish hands back the second job's live leases. The second
+    #     keeps training blocks that are back in the free pool -- duplicate work, and
+    #     no assertion anywhere catches it.
+    #   * the delta blob is named by (run, round, cluster), so both jobs upload to the
+    #     same object each round and one silently overwrites the other. A whole round
+    #     of one job's work disappears.
+    #
+    # Passing --replica a makes the id "lumi-a", which is unique per job and still
+    # stable across that job's own requeues.
+    [[ -n "${REPLICA}" ]] && overrides+=(--darl.cluster_id "${SITE}-${REPLICA}")
 fi
 if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flower\]/,/^\[/p' "${CONFIG}"); then
     overrides+=(--flower.server_address "${CENTRAL}:${FLOWER_PORT}")

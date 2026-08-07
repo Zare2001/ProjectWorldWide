@@ -874,9 +874,26 @@ The rest of this section documents the legacy path, which still runs unchanged.
 
 Membership is **elastic**: zero live replicas (every site queued), one, or several
 are all normal states, and the run survives a restart of the aggregator itself.
-Weights move either inline in the gRPC message (capped at 2 GiB, so up to ~1B
-parameters) or out of band through the blob store, streamed one tensor at a time so
-peak memory tracks the largest tensor rather than the model.
+
+Weights move either inline in the gRPC message or out of band through the blob store.
+The gRPC cap is 2,147,483,647 bytes exactly — a protocol limit, not a setting — which
+puts the inline ceiling at 1,073,741,823 parameters in float16. Measured against the
+Qwen3 flavors this repo ships configs for, with the 128k tokenizer's vocabulary padded
+to 131,328 rows:
+
+| flavor | actual parameters | fp16 wire | transport |
+|---|---|---|---|
+| 0.6B | 709,427,200 | 1.3 GiB | inline (float16 only — float32 is 2.6 GiB, over the cap) |
+| 1.7B | 1,947,329,536 | 3.6 GiB | blob |
+| 8B | 8,021,914,624 | 14.9 GiB | blob |
+| 32B | 32,551,097,344 | 60.6 GiB | blob |
+
+The names understate the sizes: at the 0.6B flavor the embedding and output projection
+are ~38% of the model, because a 131,328-row vocabulary is far larger than Qwen's own
+defaults assume. Blob transport streams one tensor at a time, so peak memory tracks
+the largest tensor and stops growing once the embedding dimension does — 14B and 32B
+have identical merge peaks (~10 GiB, against 271 GiB and 606 GiB held densely). Full
+table in [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md).
 
 ---
 

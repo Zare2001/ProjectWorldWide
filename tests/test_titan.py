@@ -694,6 +694,88 @@ def _():
         assert fresh.max_seq_len == 128, fresh.max_seq_len
 
 
+# --- the shipped configs -----------------------------------------------------
+
+GRPC_CAP = 2**31 - 1
+WIRE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
+
+
+def _shipped_configs() -> list[tuple[str, dict]]:
+    import tomllib
+
+    directory = ROOT / "configs" / "titan"
+    return [(path.name, tomllib.loads(path.read_text()))
+            for path in sorted(directory.glob("*.toml"))]
+
+
+@check("every shipped config points at the tokenizer the download script creates")
+def _():
+    """Caught three configs naming a directory nothing produces.
+
+    scripts/titan/download_tokenizer.sh writes to
+    $PWW_DATA_DIR/tokenizers/$(basename $REPO_ID), and the repo id is
+    openeurollm/tokenizer-128k -- so the only correct leaf name is 'tokenizer-128k'.
+    Three configs said 'oellm-128k', which no script creates: the run would have
+    failed at model build, after the queue wait.
+    """
+    script = (ROOT / "scripts" / "titan" / "download_tokenizer.sh").read_text()
+    assert 'REPO_ID="openeurollm/tokenizer-128k"' in script, (
+        "the tokenizer repo id moved; this check needs updating with it"
+    )
+    expected = "tokenizer-128k"
+
+    for name, config in _shipped_configs():
+        assets = config["model"]["hf_assets_path"]
+        assert assets.rstrip("/").split("/")[-1] == expected, (
+            f"{name}: model.hf_assets_path is {assets!r}, but download_tokenizer.sh "
+            f"creates a directory ending in {expected!r}"
+        )
+
+
+@check("no shipped config asks for a transport its model cannot fit through")
+def _():
+    """The inline transport puts a full parameter set in one gRPC message, and the
+    2 GiB cap is a protocol limit rather than a setting.
+
+    Caught configs/titan/qwen3_1.7b_scaling.toml declaring transport = "inline" for a
+    flavor that is 1,947,329,536 parameters with this vocabulary -- 3.6 GiB in
+    float16. The client refuses at startup, so it was never going to silently corrupt
+    a round, but it would have failed after the queue wait for a reason a config check
+    can catch in milliseconds.
+
+    Built on the meta device: shapes only, no weights, no GPU.
+    """
+    import torch
+    from torchtitan.models.qwen3 import Qwen3Model, qwen3_args
+
+    for name, config in _shipped_configs():
+        flower = config.get("flower", {})
+        if flower.get("transport", "inline") != "inline":
+            continue
+        flavor = config["model"]["flavor"]
+        assert flavor in qwen3_args, f"{name}: unknown flavor {flavor!r}"
+
+        # The vocabulary the model is actually built with: the tokenizer's id count
+        # padded up, which is what makes these flavors bigger than their names.
+        pad = config.get("titan", {}).get("pad_vocab_to_multiple_of", 256)
+        vocab = -(-131073 // pad) * pad if pad > 1 else 131073
+
+        args = qwen3_args[flavor]
+        args.vocab_size = vocab
+        with torch.device("meta"):
+            model = Qwen3Model(args)
+        numel = sum(p.numel() for p in model.parameters())
+
+        dtype = flower.get("wire_dtype", "float16")
+        assert dtype in WIRE_BYTES, f"{name}: unknown wire_dtype {dtype!r}"
+        wire = numel * WIRE_BYTES[dtype]
+        assert wire <= GRPC_CAP, (
+            f"{name} declares transport='inline' with wire_dtype={dtype!r}, but "
+            f"flavor {flavor} is {numel:,} parameters = {wire / 2**30:.1f} GiB, over "
+            f"the {GRPC_CAP:,}-byte gRPC cap. Use transport='blob'."
+        )
+
+
 def main() -> int:
     print(__doc__.strip().splitlines()[0])
     print()

@@ -109,18 +109,35 @@ class Flower:
     follow the server, which is the normal case."""
 
     max_message_length: int = 2_147_483_647
-    """gRPC message cap in bytes. A full parameter set crosses the wire each round,
-    so this is the real ceiling on model size for this transport -- see
-    `flower_client` module docstring for the arithmetic and what to do past it."""
+    """gRPC message cap in bytes, and a protocol limit rather than a tunable -- raising
+    this number does not raise the ceiling.
+
+    A full parameter set crosses the wire each round, so it is the real ceiling on
+    model size for the inline transport: 1,073,741,823 parameters at float16,
+    536,870,911 at float32. Measured against the flavors this repo ships configs for
+    (meta device, vocabulary padded to 131328), only 0.6B fits, and only at float16:
+
+        0.6B     709,427,200 params    1.3 GiB fp16    2.6 GiB fp32
+        1.7B   1,947,329,536 params    3.6 GiB fp16
+        8B     8,021,914,624 params   14.9 GiB fp16
+
+    Anything else needs `transport = "blob"`."""
 
     wire_dtype: str = "float16"
     """Dtype parameters are serialised in, for the inline transport only.
 
     float16 halves WAN traffic and is exact for weights of normal magnitude, but its
-    range is much smaller than bfloat16's: anything below ~6e-08 flushes toward zero.
-    That costs nothing in practice and is covered by a test. float32 keeps every
-    value at twice the bytes. Either way the central node holds its momentum state
-    and the authoritative global model in float32 (see central/strategy.py)."""
+    range is much smaller than bfloat16's. Measured: fp16's smallest subnormal is
+    5.96e-08, so 3e-08 rounds up to it and anything at or below 2e-08 goes to zero --
+    about 1 element in 819,200 of a randn tensor moves. That costs nothing in practice
+    and is pinned by a test.
+
+    float32 is *not* simply the same thing at twice the bytes: it halves the parameter
+    ceiling above, and at 2.6 GiB even the 0.6B flavor no longer fits in a gRPC
+    message. Use blob transport instead of reaching for float32 here.
+
+    Either way the central node holds its momentum state and the authoritative global
+    model in float32 (see central/strategy.py)."""
 
 
 @dataclass

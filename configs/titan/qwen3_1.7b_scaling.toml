@@ -1,26 +1,28 @@
 # Qwen3 1.7B, single site, DARL-leased. A scaling test for the *compute* half.
 #
-# Read this before using it: flower.enable is false and cannot simply be turned on.
+# What this config is for: proving that FSDP2, activation checkpointing and the DARL
+# dataloader carry a model this size on one facility, and measuring tokens/s/GPU
+# there. That is the part this repo's own code has to get right, and it is orthogonal
+# to the outer step, so flower.enable stays false.
 #
-# 1.7B parameters is 3.4 GiB in float16, and gRPC cannot carry more than 2 GiB in
-# a single message -- no setting of flower.max_message_length changes that, it is a
-# protocol limit. The Flower transport in src/pww/titan/flower_client.py exchanges a
-# full parameter set per round, so it tops out somewhere below 1B parameters. The
-# client checks this at startup and refuses with the arithmetic rather than failing
-# mid-round on a truncated message.
+# If you do turn the federation on here, it must be with transport = "blob". The
+# flavor called "1.7B" is 1,947,329,536 parameters once the embedding and output
+# projection are sized to the 128k tokenizer's padded 131328-row vocabulary -- 3.6 GiB
+# in float16, against a gRPC message cap of 2 GiB exactly (2**31-1). That cap is a
+# protocol limit; no flower.max_message_length setting moves it, and the inline
+# transport exchanges a full parameter set per round. The client checks this at startup
+# and refuses with the arithmetic rather than failing mid-round on a truncated message.
 #
-# So what this config is for: proving that FSDP2, activation checkpointing and the
-# DARL dataloader carry a 1.7B model on one facility, and measuring tokens/s/GPU
-# there. That is the part this repo's own code has to get right. Making the *outer*
-# step work at this size is a transport change -- exchanging checkpoint files out of
-# band instead of putting weights in gRPC messages -- and is not implemented here.
+# Out-of-band transport removes the ceiling entirely -- see configs/titan/
+# qwen3_8b_c4_diloco.toml for a config that uses it, and FEDERATION_GUIDE.md for the
+# measured table of which flavors fit which transport.
 #
 #   scripts/titan/run_train.sh --config configs/titan/qwen3_1.7b_scaling.toml
 #
 # Larger flavors (4B, 8B, 14B, 32B) exist in torchtitan's table and this config
 # reaches them by changing model.flavor plus, past 4B or so,
-# parallelism.tensor_parallel_degree -- the same caveat about the outer step applies,
-# more so.
+# parallelism.tensor_parallel_degree. Streaming keeps the merge cost flat as they
+# grow: 14B and 32B have the same largest tensor, so the same peak memory.
 
 [job]
 dump_folder = "./outputs/qwen3-1.7b-scaling"
@@ -99,8 +101,10 @@ epochs = 1
 space_seed = 42
 
 [flower]
-# See the header: not a tuning choice at this model size.
+# See the header: this config exists to measure the compute half on one site.
 enable = false
-# Declared even though flower.enable is false, so it is where you expect it if
-# you turn the federation on: must match the central node's --transport.
-transport = "inline"
+# "blob", not "inline", even though flower.enable is false -- so that turning the
+# federation on here works rather than tripping the 2 GiB gRPC cap on the first round.
+# 1.95B parameters is 3.6 GiB in float16. Must match the central node's --transport,
+# which for blob also brings up the blob store on 29512.
+transport = "blob"

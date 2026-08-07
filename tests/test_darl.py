@@ -692,6 +692,95 @@ def _():
         assert not server.coordinator.table.leases
 
 
+@check("HTTP: two concurrent jobs sharing a cluster id corrupt each other's leases")
+def _():
+    """Documents a hazard rather than a fixed bug, so it asserts what DOES happen.
+
+    Both HPCs allow partial-node allocations, so submitting two jobs to one facility
+    can land them on the same node -- and the DARL cluster id defaults to the site name
+    alone, on purpose, so a requeued job keeps the throughput history that sizes its
+    grants. The consequence is that two *concurrent* jobs at one site are indis-
+    tinguishable to the coordinator, and /release with no lease id is scoped to the
+    cluster id: the first job to exit hands back the second job's live leases, which
+    then get handed to someone else while the second job is still training them.
+
+    Nothing downstream catches that, which is why scripts/titan/run_train.sh has
+    --replica and why it is documented as a correctness flag. If the protocol ever
+    grows a per-incarnation token (see TODO.md) this check should start failing, and
+    the fix is to assert isolation instead.
+    """
+    space = BlockSpace(num_samples=400, block_size=10)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        table = server.coordinator.table
+
+        # Two jobs, same site, no --replica: the same cluster id.
+        job_a = LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
+                             space, blocks_per_phase=2, heartbeat=False)
+        job_b = LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
+                             space, blocks_per_phase=2, heartbeat=False)
+
+        granted_a = job_a.acquire(wait=False)
+        granted_b = job_b.acquire(wait=False)
+        assert granted_a.granted and granted_b.granted
+        # Disjoint spans, so the coordinator is at least not double-granting.
+        blocks_a = {p for s in granted_a.spans for p in range(s.start, s.end)}
+        blocks_b = {p for s in granted_b.spans for p in range(s.start, s.end)}
+        assert not (blocks_a & blocks_b), "the coordinator granted the same block twice"
+
+        # Job A hits walltime and releases on the way out, as it should.
+        job_a.release_all()
+
+        # Job B is still running and still believes it holds its span -- but the
+        # coordinator has already given those blocks back to the free pool.
+        assert job_b.spans, "job B still thinks it holds a lease"
+        for lease_id in job_b.spans:
+            assert lease_id not in table.leases, (
+                "expected job A's release to have taken job B's lease with it; if this "
+                "now holds, the protocol gained per-job isolation and this check "
+                "should be inverted"
+            )
+        # Which is the actual damage: every one of job B's blocks is back in the free
+        # pool, claimable by anyone, while job B goes on training them. Asserted against
+        # the block states rather than by acquiring again -- the allocator prefers a
+        # cluster's cursor, so where a third cluster happens to be handed blocks from
+        # says nothing about which ones are claimable.
+        from pww.darl.table import BlockState
+
+        assert all(table._state[p] == BlockState.UNASSIGNED for p in blocks_b), (
+            "job B's blocks should be back in the pool after job A's release"
+        )
+
+
+@check("HTTP: distinct replica ids keep two jobs at one site isolated")
+def _():
+    """The fix available today: --replica in scripts/titan/run_train.sh.
+
+    With distinct cluster ids the release is scoped to the job that made it, which is
+    what makes two concurrent jobs at one facility safe.
+    """
+    space = BlockSpace(num_samples=400, block_size=10)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        table = server.coordinator.table
+        job_a = LeaseSession(LeaseClient(server.url, "lumi-a", retries=1, timeout=5.0),
+                             space, blocks_per_phase=2, heartbeat=False)
+        job_b = LeaseSession(LeaseClient(server.url, "lumi-b", retries=1, timeout=5.0),
+                             space, blocks_per_phase=2, heartbeat=False)
+        assert job_a.acquire(wait=False).granted
+        granted_b = job_b.acquire(wait=False)
+        assert granted_b.granted
+
+        job_a.release_all()
+
+        for lease_id in job_b.spans:
+            assert lease_id in table.leases, (
+                f"job A's release took lease {lease_id} from job B despite distinct "
+                f"cluster ids"
+            )
+        assert all(l.cluster == "lumi-b" for l in table.leases.values())
+
+
 @check("HTTP: the token is enforced")
 def _():
     from pww.darl.client import DarlError

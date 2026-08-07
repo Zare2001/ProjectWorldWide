@@ -68,20 +68,53 @@ silently producing two different meanings for position *p*.
 ### Which transport, and why the choice exists
 
 Inline transport all-gathers the full parameter set onto every rank and puts it in
-one gRPC message, which is capped at 2 GiB (`2**31 - 1`). Beyond roughly 1B
-parameters in float16 that cap is the binding constraint, and the gather itself
-becomes the problem — a 70B model gathered onto every rank of a node is ~1.1 TB of
-host RAM.
+one gRPC message, capped at **2,147,483,647 bytes** (`2**31 - 1`). That is a protocol
+limit; no `flower.max_message_length` setting moves it. Dividing through, the ceiling
+is exactly:
+
+| wire dtype | ceiling |
+|---|---|
+| `float16` | 1,073,741,823 parameters |
+| `float32` | 536,870,911 parameters |
+
+Measured against the flavors this repo ships configs for, built on the meta device
+with the 128k tokenizer's vocabulary padded to 131,328:
+
+| flavor | actual parameters | largest tensor | fp16 wire | fp32 wire | inline? |
+|---|---|---|---|---|---|
+| 0.6B | 709,427,200 | (131328, 1024) | 1.3 GiB | 2.6 GiB | **fp16 only** |
+| 1.7B | 1,947,329,536 | (131328, 2048) | 3.6 GiB | 7.3 GiB | no |
+| 4B | 4,305,911,296 | (131328, 2560) | 8.0 GiB | 16.0 GiB | no |
+| 8B | 8,021,914,624 | (131328, 4096) | 14.9 GiB | 29.9 GiB | no |
+| 14B | 14,557,281,280 | (131328, 5120) | 27.1 GiB | 54.2 GiB | no |
+| 32B | 32,551,097,344 | (131328, 5120) | 60.6 GiB | 121.3 GiB | no |
+
+Two things there are worth knowing before you pick a transport:
+
+- **Only the 0.6B flavor fits inline at all, and only in float16.** Its float32 wire
+  is 2.6 GiB, over the cap — so `flower.wire_dtype = "float32"` is not a
+  precision-for-bandwidth trade at this size, it simply does not fit.
+- **The names understate the sizes.** The flavor called 0.6B is 709M parameters here
+  and 1.7B is 1.95B, because a 131,328-row embedding and output projection are much
+  larger than Qwen's own defaults intend. At 0.6B the embedding and output projection
+  together are ~38% of the model.
 
 Blob transport instead streams **one tensor at a time**: the client writes
-`local - global` per tensor to a file and HTTP-PUTs it; the server merges the same
-way. Peak memory is then a small multiple of the largest single tensor — the
-embedding — rather than of the model:
+`local - global` per tensor to a file and HTTP-PUTs it; the server merges per key.
+Peak memory then tracks the largest single tensor — the embedding — not the model,
+so it stops growing once the embedding dimension does:
 
-| | embedding, fp32 | server peak at merge |
-|---|---|---|
-| 7B | 131328 x 4096 = 2.1 GiB | ~9 GiB |
-| 70B | 131328 x 8192 = 4.3 GiB | ~17 GiB |
+| flavor | largest tensor, fp32 | streaming merge peak | dense equivalent (2 sites) |
+|---|---|---|---|
+| 0.6B | 513 MiB | ~2.0 GiB | 13.2 GiB |
+| 8B | 2.0 GiB | ~8.0 GiB | 149.4 GiB |
+| 14B | 2.5 GiB | ~10.0 GiB | 271.2 GiB |
+| 32B | 2.5 GiB | ~10.0 GiB | 606.3 GiB |
+
+14B and 32B share a largest tensor, so their streaming peak is identical — which is
+the property that makes this approach scale at all. The dense column is what holding
+the global model, the momentum buffer, the weighted mean and one delta per site whole
+in float32 would cost; that is the wall this replaces.
 
 Disk, not RAM, becomes the binding constraint. `GlobalState.log_disk_budget` prints
 the requirement at startup and logs an error if the volume cannot hold it, because
@@ -165,8 +198,23 @@ Substituting `m = v_t - v_(t-1)` gives `m_next = beta*m - eta*Delta` with `Delta
 evaluated at `w = v + beta*m`, i.e. Nesterov's accelerated gradient in two-sequence
 form. It matches `torch.optim.SGD(momentum=beta, nesterov=True)` fed DiLoCo's outer
 gradient, including PyTorch's first-step convention.
-`tests/test_federation.py` pins that equivalence numerically against a heavy-ball
-control, so it cannot drift.
+
+Measured rather than argued, both sides driven by an identical prescribed sequence of
+outer gradients so that any divergence is the update rule alone:
+
+| | max abs difference |
+|---|---|
+| ours vs `SGD(momentum=0.9, nesterov=True)` | **1.9e-06** |
+| ours vs `SGD(momentum=0.9, nesterov=False)` — heavy ball | **4.9e-01** |
+
+over 6 rounds on weights of magnitude ~4, with non-uniform token weights. The
+heavy-ball row is the one that makes the first meaningful: without it, an
+implementation where momentum did nothing at all would also "match".
+`tests/test_federation.py` pins both, so this cannot drift silently.
+
+Separately, the streaming per-tensor merge agrees with a dense reference
+implementation to **4.8e-07** over 3 rounds — i.e. splitting the merge tensor by
+tensor to bound memory costs nothing numerically.
 
 `server-momentum: 0.0` with `server-learning-rate: 1.0` collapses the outer step to
 plain FedAvg parameter averaging, `w_next = w_avg`. That is the control arm for any
@@ -292,6 +340,42 @@ all times; the coordinator asserts this internally.
 
 ## 6. Troubleshooting
 
+### Running two jobs at the same site at once
+
+Both facilities allow partial-node allocations, so submitting two jobs to one site can
+put them on the same node. That is fine for the rendezvous — `run_train.sh` derives the
+torchrun port from the Slurm job id on multi-node runs and asks the kernel for a free
+one on single-node runs — but it is **not** fine for the DARL cluster id, and this is a
+correctness issue rather than a performance one.
+
+The cluster id defaults to the site name alone (`lumi`), deliberately: a job killed at
+walltime and requeued must be recognised as the same cluster so it keeps the measured
+throughput that sizes its grants. The cost is that two *concurrent* jobs at one site
+are indistinguishable to the coordinator, and two things then go wrong silently:
+
+- `/release` with no lease id is scoped to the cluster id, so the first job to exit
+  hands back the second job's **live** leases. The second keeps training blocks that
+  are back in the free pool — duplicate work, and nothing downstream catches it.
+- the delta blob is named `(run, round, cluster)`, so both jobs upload to the same
+  object each round and one silently overwrites the other. A whole round of one job's
+  work disappears.
+
+So pass `--replica`:
+
+```bash
+scripts/titan/run_train.sh --replica a --config ...   # cluster id "lumi-a"
+scripts/titan/run_train.sh --replica b --config ...   # cluster id "lumi-b"
+```
+
+Both are pinned in `tests/test_darl.py` — one check asserts the collision happens
+without distinct ids, the other that distinct ids isolate the two jobs. Closing the
+hazard properly needs a per-incarnation token in the protocol so the coordinator can
+tell "the requeued me" from "a second concurrent me"; that trade is recorded in
+TODO.md rather than made unilaterally, because the requeue behaviour it would touch is
+load-bearing.
+
+### Failures
+
 | symptom | cause | what to do |
 |---|---|---|
 | server waits, no rounds start | `min-clients: 2` in the aggregator config | set it to 1. Only require 2 if you specifically want to force both sites. |
@@ -301,6 +385,7 @@ all times; the coordinator asserts this internally.
 | `blob store: 507` | the volume behind `--blob-root` is below its reserve | point `--state-dir`/`BLOB_ROOT` at a larger volume. `GlobalState.log_disk_budget` prints the requirement at startup. |
 | lease expiry after a walltime kill | Slurm killed a site mid-epoch | self-healing: uncommitted blocks return to the pool on TTL expiry, and the surviving site finishes the epoch. Releasing on SIGTERM makes it milliseconds instead of a full TTL. |
 | `Connection refused` on 29511 | daemons not running | `./scripts/central_node/start_central_services.sh` |
+| two jobs at one site, one loses a round of work or trains duplicate blocks | both registered under the same DARL cluster id | pass `--replica a` / `--replica b`. See above. |
 
 ---
 
@@ -321,11 +406,19 @@ so it runs on the central node directly:
 python3 tests/test_federation.py
 ```
 
-| suite | covers |
-|---|---|
-| `test_darl.py` | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race |
-| `test_titan.py` | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec |
-| `test_federation.py` | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; the outer step against `SGD(nesterov=True)` |
+| suite | checks | covers |
+|---|---|---|
+| `test_darl.py` | 39 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race |
+| `test_titan.py` | 17 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec |
+| `test_federation.py` | 21 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; the outer step against `SGD(nesterov=True)` |
+| `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
+| `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
+
+Run them **repeatedly**, not once. Both bugs fixed in this round of work were
+invisible in a single run: the DARL lease deadlock surfaced in roughly 1 run in 10,
+and a fixed rendezvous port in `test_diloco_gloo.py` in 1 in 35. A green single run is
+not evidence of stability. The last full sweep was 50 runs (10 per suite) with 0
+failures.
 
 What these **cannot** cover, because it needs GPUs and a process group: FSDP2
 wrapping, the real Qwen3 forward pass, and the DTensor gather/scatter in
