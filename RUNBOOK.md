@@ -149,6 +149,10 @@ PY
 If the two sites print different digests, stop here — a job would be refused at
 registration anyway, and finding out now costs seconds instead of a queue wait.
 
+If a coordinator is **already running on a different corpus** — which it is, on the
+wikitext-103 placeholder — it does not pick this count up by itself. Restart it with
+`DARL_FRESH=1` before any real training: [Part 2, switching corpus](#part-2--start-the-central-vm).
+
 ---
 
 ## Part 2 — start the central VM
@@ -189,6 +193,11 @@ block space: 115,156 samples / 1,024 per block = 113 blocks | digest 7029d22cecd
 darl coordinator on http://0.0.0.0:29510 | 113 blocks | epoch 0/1 | token yes
 ```
 
+⚠️ **Those numbers are a wikitext-103 placeholder, not a target.** 115,156 windows /
+113 blocks / digest `7029d22c` is what the coordinator was first brought up on, and any
+site that tokenises C4 computes a different digest and is **refused at registration**.
+The count has to come from your own Part 1 output. See below for the changeover.
+
 `token yes` is the one to read. `token NO -- anyone can lease` means every endpoint on
 that port is open, including on the public IP.
 
@@ -214,8 +223,33 @@ AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
   ./scripts/central_node/start_central_services.sh
 ```
 
-Changing `NUM_SAMPLES`/`BLOCK_SIZE`/`SEED` does not need the flag — the restore compares
-the block-space digest and refuses a snapshot describing a different partitioning.
+**Switching corpus — the one time `DARL_FRESH=1` is required.** Going from the
+placeholder space to real C4 is exactly this case, so do it once after Part 1 has run at
+a site and **before any real training**:
+
+```bash
+./scripts/central_node/stop_central_services.sh
+DARL_FRESH=1 NUM_SAMPLES=<windows from tokenize_c4.sh> BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+```
+
+The old lease table is not stale, it is *meaningless*: its committed positions index a
+different corpus. Leave the flag off for every other restart, or a resume turns into a
+silent re-issue of already-trained windows.
+
+Changing `NUM_SAMPLES`/`BLOCK_SIZE`/`SEED` without the flag is **refused, not adapted to**
+— the restore compares the block-space digest and raises rather than falling back to a
+fresh table:
+
+```
+snapshot.json was written for block-space digest 7029d22cecd7... but this one is
+a1b2c3d4e5f6...; the permutation changed, so committed positions no longer mean
+the same samples
+```
+
+That is the guard working. It also means the coordinator does not come up at all until
+you either pass `DARL_FRESH=1` or point `--state-dir` somewhere else.
 
 See [FEDERATION_GUIDE.md § 2](FEDERATION_GUIDE.md).
 
