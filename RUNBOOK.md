@@ -66,15 +66,22 @@ source env.sh
 pww_run python3 tests/test_darl.py
 
 # test_titan.py imports torchtitan, so it needs the 2.9 environment, not the
-# 2.7.1 one. LUMI: point PWW_CONTAINER at the container built above.
-PWW_CONTAINER="$PWW_SCRATCH/containers/pww-titan.sif" \
-PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan" \
-  pww_run python3 tests/test_titan.py
+# 2.7.1 one. On LUMI, replace PWW_LAUNCH with the container built above -- the
+# same swap scripts/lumi/job_titan_diloco.sh makes.
+PWW_LAUNCH=(singularity exec --bind "$PWW_SCRATCH" "$PWW_SCRATCH/containers/pww-titan.sif")
+export PYTHONPATH="$PWD/src:$PWD/third_party/torchtitan"
+export SINGULARITYENV_PYTHONPATH="$PYTHONPATH"
+pww_run python3 tests/test_titan.py
 
 # on the central VM -- no torchtitan, so use its own venv
 PYTHONPATH="$PWD/src" runs/central/.venv/bin/python3 tests/test_federation.py   # 26
 PYTHONPATH="$PWD/src" runs/central/.venv/bin/python3 tests/test_darl.py         # 46
 ```
+
+Setting `PWW_CONTAINER` instead does **nothing here**, which is worth knowing before
+it costs you an hour: `env.sh` reads it while building `PWW_LAUNCH`, so by the time
+you have a shell it has already been consumed. It works only for a *child script*
+that sources `env.sh` itself — which is exactly the Part 1 case below.
 
 `test_darl.py` under the system python3 reports **42 passed, 1 skipped** instead — the
 four `torch_data` checks need torch. That is not a failure.
@@ -89,8 +96,8 @@ scratch first. Do this once per `(corpus, tokenizer, seq_len)`.
 This part is **not** independent of Part 0 on LUMI: `tokenize_c4.sh` imports
 `pww.titan`, which imports torchtitan, so it needs the 2.9 container. Only the
 tokenizer download runs in the default 2.7.1 one. Export this for the rest of the
-section — `PWW_CONTAINER` is what `PWW_LAUNCH` is built from, so it redirects every
-`pww_run` beneath it:
+section. Each script below sources `env.sh` in its own shell, so it picks the
+exported value up while building `PWW_LAUNCH`:
 
 ```bash
 source env.sh

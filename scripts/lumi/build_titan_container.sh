@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
 
@@ -17,6 +17,11 @@
 # writes a multi-GB image, both of which login nodes are the wrong place for. It
 # needs internet, which LUMI's small partition has and the GPU compute nodes do
 # not.
+#
+# Three hours, not one: the LAIF base is ~13 GB, and "Creating SIF file" -- the
+# squashfs pass, after %post and %test have both already passed -- is most of the
+# runtime on Lustre. At one hour it is killed there, which looks like a build
+# failure while actually being a nearly-finished image.
 
 set -euo pipefail
 
