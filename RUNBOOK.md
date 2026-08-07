@@ -253,6 +253,18 @@ AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
   ./scripts/central_node/start_central_services.sh
 ```
 
+Better, if you can copy one small file: point at the manifest and let the count be read
+rather than retyped. The central node never reads the corpus, so `manifest.json` alone is
+enough, and it removes the one transcription the digest guard would otherwise catch only
+after a site had already spent its queue wait.
+
+```bash
+scp <site>:.../c4-tokenizer-128k-2048/manifest.json /tmp/
+DARL_FRESH=1 MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+```
+
 The old lease table is not stale, it is *meaningless*: its committed positions index a
 different corpus. Leave the flag off for every other restart, or a resume turns into a
 silent re-issue of already-trained windows.

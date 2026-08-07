@@ -104,6 +104,26 @@ elif [[ -x "${VENV_DIR}/bin/python3" ]]; then
     PYTHON_BIN="${VENV_DIR}/bin/python3"
 fi
 
+# NUM_SAMPLES read from a manifest instead of retyped.
+#
+#   MANIFEST=/path/to/c4-tokenizer-128k-2048/manifest.json DARL_FRESH=1 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# The window count is the one number that has to agree between this node and every site,
+# and the block-space digest catches a disagreement only at registration -- correct, but
+# by then a site has already spent its queue wait. The central node never reads the
+# corpus, so copying just this one small file across is enough to take the transcription
+# step out of the loop entirely.
+if [[ -n "${MANIFEST:-}" && -z "${NUM_SAMPLES:-}" ]]; then
+    if ! NUM_SAMPLES="$(python3 -c 'import json,sys
+raw = json.load(open(sys.argv[1]))
+print(int(raw["num_windows"]))' "${MANIFEST}" 2>&1)"; then
+        echo "ERROR: could not read num_windows from ${MANIFEST}: ${NUM_SAMPLES}" >&2
+        exit 1
+    fi
+    echo "num_samples ${NUM_SAMPLES} read from ${MANIFEST}"
+fi
+
 # The block-space parameters, remembered across restarts.
 #
 # These three define the partitioning, and the coordinator refuses to resume a snapshot

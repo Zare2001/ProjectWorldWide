@@ -67,12 +67,58 @@ CONFIG="${CONFIG:-${PWW_ROOT}/configs/titan/qwen3_0.6b_c4_diloco.toml}"
 TOKENIZER="${TOKENIZER:-${PWW_DATA_DIR}/tokenizers/tokenizer-128k}"
 SHARDS="${SHARDS:-${PWW_DATA_DIR}/c4-tokenizer-128k-2048}"
 
+# The token, and it has to be here rather than discovered later.
+#
+# These candidate paths only ever exist on the central VM, which is where the file is
+# written. At a site, $PWW_ROOT/runs points into that site's own scratch, so the loop
+# finds nothing and leaves DARL_TOKEN empty. That used to be harmless because the
+# coordinator ran without a token and authorised everything; now that it enforces one, an
+# empty value means every request is refused. Failing here costs a second. Failing at
+# registration costs the queue wait plus the allocation.
 if [[ -z "${DARL_TOKEN:-}" ]]; then
     for candidate in "${PWW_ROOT}/runs/darl/token" "${PWW_ROOT}/runs/central/darl/token"; do
         [[ -s "${candidate}" ]] && export DARL_TOKEN="$(cat "${candidate}")" && break
     done
 fi
-export SINGULARITYENV_DARL_TOKEN="${DARL_TOKEN:-}"
+if [[ -z "${DARL_TOKEN:-}" ]]; then
+    cat >&2 <<EOF
+ERROR: DARL_TOKEN is empty and the coordinator enforces it, so every request from this
+job would be refused with 401.
+
+Pass it explicitly at submit time -- the fallback paths this script checks exist only on
+the central VM, not here:
+
+    DARL_TOKEN="\$(<the token from the central node>)" sbatch $0
+
+On the central VM the value is in runs/darl/token.
+EOF
+    exit 1
+fi
+export SINGULARITYENV_DARL_TOKEN="${DARL_TOKEN}"
+
+# Reachability and auth, before srun claims eight GCDs. A wrong token or an unreachable
+# coordinator otherwise surfaces well into the run, after the allocation is already spent.
+# Run outside the container on purpose: this is about the node's route to the WAN.
+if command -v curl >/dev/null 2>&1; then
+    darl_probe="$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
+        -H "X-DARL-Token: ${DARL_TOKEN}" \
+        "http://${CENTRAL_IP}:${PWW_DARL_PORT:-29510}/health" 2>/dev/null)" || true
+    # curl writes 000 through -w *and* exits non-zero when it cannot connect, so a
+    # fallback echo inside the substitution would append a second 000 and miss the case
+    # below. Normalise instead of guessing.
+    [[ "${darl_probe}" =~ ^[0-9]{3}$ ]] || darl_probe=000
+    case "${darl_probe}" in
+        200) echo "darl: coordinator reachable at ${CENTRAL_IP}, token accepted" ;;
+        401) echo "ERROR: the coordinator rejected this DARL_TOKEN. Re-copy it from" \
+                  "runs/darl/token on the central node." >&2; exit 1 ;;
+        # Not fatal: LUMI compute nodes reach the outside world through a proxy, so a
+        # failed probe here does not prove the client cannot connect.
+        000) echo "WARNING: could not reach http://${CENTRAL_IP}:${PWW_DARL_PORT:-29510}/health" \
+                  "from this node -- continuing, but expect the client to fail if the" \
+                  "central node is not up." >&2 ;;
+        *)   echo "WARNING: coordinator answered HTTP ${darl_probe} on /health." >&2 ;;
+    esac
+fi
 
 # LUMI kills jobs at walltime, which for a long DiLoCo run is the normal way a job
 # ends rather than an exception. Forwarding SIGTERM lets the DARL session release
