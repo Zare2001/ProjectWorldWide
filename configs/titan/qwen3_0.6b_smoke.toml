@@ -1,0 +1,103 @@
+# Smoke test: Qwen3 0.6B, bundled c4_test fixture, one site, no central node.
+#
+# What this proves and what it does not. It exercises the whole local half --
+# tokenizer-driven vocab override, FSDP2 wrapping, the DARL dataloader reading
+# real memmapped shards, checkpoint write, DARL commit ordering -- against a
+# corpus small enough to tokenise in seconds. It does *not* exercise Flower, the
+# WAN, or FedMom, because flower.enable is false here: this runs torchtitan's own
+# train() loop. Get this green on a site before pointing that site at the
+# federation.
+#
+#   scripts/titan/tokenize_c4.sh --dataset c4_test --seq-len 2048
+#   scripts/titan/run_train.sh --config configs/titan/qwen3_0.6b_smoke.toml
+#
+# The DARL coordinator is still required, since the dataloader leases from it --
+# start one locally if the central VM is not reachable (this one does take flags;
+# the central_node wrapper script is the one driven by environment variables):
+#   python3 -m pww.darl.server --port 29510 --num-samples <windows> --block-size 32
+# `tokenize_c4.sh` prints the window count it produced.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-smoke"
+description = "Qwen3 0.6B smoke test on the bundled c4_test fixture"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 1
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 5
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+# 2 rather than 8: the default OOMs at the first checkpoint write on a single
+# MI250x GCD, which sits at ~97% memory during normal steps and needs headroom on
+# top of that for checkpoint staging. This is a pipeline test, not a throughput
+# measurement -- qwen3_0.6b_c4_diloco.toml's batch size is the tuning question.
+local_batch_size = 2
+seq_len = 2048
+steps = 20
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4_test-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+# On deliberately, and early: a checkpoint write is the step most likely to OOM
+# and the one the DARL commit ordering depends on, so a smoke test that skips it
+# proves the least interesting part of the run.
+enable = true
+interval = 10
+last_save_model_only = false
+
+[comm]
+train_timeout_seconds = 300
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 10
+steps = 2
+
+[fault_tolerance]
+enable = false
+
+[darl]
+url = ""
+site = ""
+inner_steps = 10
+# Small blocks so the 2000-document fixture still yields several leasable blocks
+# and the phase/lease/commit cycle actually runs more than once.
+block_size = 32
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = false
+# Declared even though flower.enable is false, so it is where you expect it if
+# you turn the federation on: must match the central node's --transport.
+transport = "inline"

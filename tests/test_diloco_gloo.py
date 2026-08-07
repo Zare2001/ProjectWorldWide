@@ -22,7 +22,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -245,9 +247,16 @@ CHECKS = (
 )
 
 
-def _worker(rank: int, world_size: int, num_replicas: int, port: str, results) -> None:
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size,
+def _worker(rank: int, world_size: int, num_replicas: int, rendezvous: str,
+            results) -> None:
+    if rendezvous.startswith("file://"):
+        init_method = rendezvous
+    else:
+        # TCP rendezvous, only when a port was asked for explicitly. See main().
+        os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=rendezvous)
+        init_method = None
+    dist.init_process_group(backend="gloo", init_method=init_method, rank=rank,
+                            world_size=world_size,
                             timeout=datetime.timedelta(seconds=120))
     try:
         replicas = build_replicas(num_replicas)
@@ -272,7 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--world-size", type=int, default=None)
     p.add_argument("--replicas", type=int, default=None)
-    p.add_argument("--port", type=str, default="29577")
+    p.add_argument(
+        "--port", type=str, default=None,
+        help="Force a TCP rendezvous on this port. Left unset, ranks meet through a "
+             "temporary file instead, which is what makes back-to-back runs of this "
+             "suite safe -- see main().",
+    )
     args = p.parse_args(argv)
 
     if args.world_size and args.replicas:
@@ -283,17 +297,45 @@ def main(argv: list[str] | None = None) -> int:
         # inner group is a singleton and the outer group is the whole world.
         layouts = [(4, 2), (4, 4)]
 
+    # A file rendezvous rather than a TCP one, unless --port forces the old path.
+    #
+    # The ranks used to meet on a port derived arithmetically from --port, which made
+    # it *fixed* across invocations: every run of this suite used the same two ports.
+    # A just-torn-down rendezvous lingers in TIME_WAIT for ~60s, so running the suite
+    # twice in quick succession -- which is exactly what checking for flakiness
+    # involves -- could fail to bind. Observed once in 35 runs, and not reproducible
+    # in isolation, which is the signature of a collision with the previous run rather
+    # than of anything in the code under test.
+    #
+    # The old expression also folded `len(failures)` into the port, so a failure in
+    # the first layout silently moved the second one somewhere else. A FileStore has
+    # no port, no TIME_WAIT and no arithmetic.
     failures = []
-    for world_size, num_replicas in layouts:
-        print(f"\nworld_size={world_size} k={num_replicas} "
-              f"({world_size // num_replicas} ranks per replica)")
-        with mp.Manager() as manager:
-            results = manager.list()
-            # Fresh port per layout: a just-torn-down rendezvous can linger.
-            port = str(int(args.port) + len(failures) + world_size + num_replicas)
-            mp.spawn(_worker, args=(world_size, num_replicas, port, results),
-                     nprocs=world_size, join=True)
-            failures.extend(results)
+    rendezvous_dir = tempfile.mkdtemp(
+        prefix="pww-gloo-", dir=os.environ.get("PWW_TEST_TMPDIR") or None
+    )
+    try:
+        for index, (world_size, num_replicas) in enumerate(layouts):
+            print(f"\nworld_size={world_size} k={num_replicas} "
+                  f"({world_size // num_replicas} ranks per replica)")
+            # Per layout either way. The file must not exist yet -- FileStore creates
+            # it, and reusing one across layouts would have the second rendezvous read
+            # the first's stale keys. On the TCP path the port still has to step, for
+            # the TIME_WAIT reason above, but by layout index only: folding the failure
+            # count in is what made the second layout's port depend on whether the
+            # first one passed.
+            rendezvous = (
+                str(int(args.port) + index) if args.port
+                else f"file://{rendezvous_dir}/layout-{index}"
+            )
+            with mp.Manager() as manager:
+                results = manager.list()
+                mp.spawn(_worker,
+                         args=(world_size, num_replicas, rendezvous, results),
+                         nprocs=world_size, join=True)
+                failures.extend(results)
+    finally:
+        shutil.rmtree(rendezvous_dir, ignore_errors=True)
 
     print(f"\n{len(layouts) * len(CHECKS)} checks across {len(layouts)} layouts: "
           f"{len(set(failures))} failed")

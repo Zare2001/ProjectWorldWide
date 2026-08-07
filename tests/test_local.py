@@ -193,15 +193,47 @@ def _():
 
 @check("shipped configs/ files all parse")
 def _():
-    """Guards against a config that only fails once it is submitted to a queue."""
+    """Guards against a config that only fails once it is submitted to a queue.
+
+    Routed by consumer, because `configs/` holds three unrelated kinds of file and
+    every parser rejects unknown keys -- so checking them all against the CIFAR
+    trainer's parser reports valid configs as broken:
+
+      cifar10_*.yaml            the CIFAR trainer
+      llm_*.yaml                pww.train_llm_flower (--seq-len, --attn-implementation)
+      central_aggregator*.yaml  pww.central.server on the central VM; no epochs or
+                                batch size at all
+
+    TOML configs under `configs/titan/` belong to torchtitan's own ConfigManager and
+    are covered by tests/test_titan.py instead.
+    """
+    from pww.central.server import build_parser as build_aggregator_parser
+    from pww.config import apply_config_file
     from pww.train_cifar import parse_args
+    from pww.train_llm_flower import build_parser as build_llm_parser
 
     config_dir = Path(__file__).resolve().parents[1] / "configs"
     files = sorted(config_dir.glob("*.yaml"))
     assert files, f"no configs found in {config_dir}"
-    for path in files:
+
+    aggregator = [p for p in files if p.name.startswith("central_aggregator")]
+    llm = [p for p in files if p.name.startswith("llm_")]
+    trainer = [p for p in files if p not in aggregator and p not in llm]
+    for group, label in ((aggregator, "aggregator"), (llm, "llm"), (trainer, "trainer")):
+        assert group, f"no {label} configs found in {config_dir}"
+
+    for path in trainer:
         args = parse_args(["--config", str(path)])
         assert args.epochs > 0 and args.batch_size > 0, f"{path.name}: {args}"
+
+    for path in llm:
+        args = apply_config_file(build_llm_parser(), ["--config", str(path)])
+        assert args.batch_size > 0 and args.seq_len > 0, f"{path.name}: {args}"
+
+    for path in aggregator:
+        args = apply_config_file(build_aggregator_parser(), ["--config", str(path)])
+        assert args.num_rounds > 0, f"{path.name}: num_rounds={args.num_rounds}"
+        assert args.min_clients > 0, f"{path.name}: min_clients={args.min_clients}"
 
 
 @check("lr schedule warms up then decays to ~0")

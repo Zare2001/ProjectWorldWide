@@ -1,0 +1,148 @@
+"""The `[darl]` and `[flower]` sections added to torchtitan's JobConfig.
+
+torchtitan merges this module's `JobConfig` with its own when a run sets
+``job.custom_config_module = "pww.titan.config"`` (see
+`torchtitan/config/manager.py::_merge_configs`). Extra top-level sections come
+through as new fields, and tyro exposes every one on the CLI as
+``--darl.<field>`` / ``--flower.<field>``, so anything here can be overridden per
+site without touching the TOML.
+"""
+
+# Deliberately no `from __future__ import annotations`. torchtitan's
+# ConfigManager._merge_configs inspects `dataclasses.fields(...)[i].type` and calls
+# `is_dataclass()` on it to decide whether to merge a section recursively. With
+# postponed evaluation those types are strings, `is_dataclass("DARL")` is False,
+# and the merged config ends up with unresolvable string annotations -- which
+# surfaces as `NameError: name 'DARL' is not defined` when tyro builds the CLI.
+# torchtitan's own custom config module omits it for the same reason.
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DARL:
+    """Dynamic dataset leasing: which tokens this cluster is allowed to train on."""
+
+    url: str = ""
+    """Coordinator base URL, e.g. http://145.38.206.143:29510. Required when
+    training.dataset is 'pww_tokens'."""
+
+    token: str = ""
+    """Shared secret the coordinator was started with. Falls back to $DARL_TOKEN."""
+
+    site: str = ""
+    """Site name used to derive this cluster's coordinator identity (lumi, snellius)."""
+
+    cluster_id: str = ""
+    """Overrides the derived identity outright. Keep it stable across requeues --
+    the coordinator sizes grants from a cluster's measured throughput, and a new
+    id on every resubmission throws that history away."""
+
+    block_size: int = 1024
+    """Windows per leasable block. The leasing granularity: too small and the
+    coordinator becomes the bottleneck, too large and the tail of an epoch is
+    lumpy. At seq_len 2048 this is ~2M tokens per block."""
+
+    blocks_per_phase: int = 0
+    """Blocks leased per inner phase. 0 derives it from inner_steps and the batch
+    geometry via darl.space.blocks_for_phase, which is what makes a lease boundary
+    land exactly on an outer step. Set it explicitly only to debug."""
+
+    inner_steps: int = 100
+    """H: optimiser steps between outer aggregations. Also sizes the lease."""
+
+    epochs: int = 1
+    """Passes over the corpus. Reaching the end of the last one ends training."""
+
+    space_seed: int = 42
+    """Seeds the global block permutation. Must be identical on every site --
+    BlockSpace.digest makes a mismatch a registration error rather than silent
+    duplicate work."""
+
+    commit_policy: str = "checkpoint"
+    """When this cluster tells the coordinator a leased span is finished.
+
+    'checkpoint' is the exact one: spans are committed only after the work is
+    inside a durable checkpoint, so {weights, committed blocks} fail together and a
+    crash loses the same work from both sides. The cost is that a cluster holds
+    every lease since its last checkpoint, so `checkpoint.interval` should stay a
+    small multiple of `inner_steps` -- otherwise a cluster accumulates uncommitted
+    leases and can drain the pool for everyone else near the end of an epoch.
+
+    'consumption' commits at the end of each phase instead. One fewer dependency
+    and spans recycle sooner, at the cost of an exactness window of one lease: a
+    crash after committing but before checkpointing drops those windows from the
+    epoch. See darl.client.CommitPolicy."""
+
+    shuffle: bool = True
+    """False gives the identity permutation, so a lease maps to a readable window
+    range. Debugging only."""
+
+    use_proxy: bool = False
+    """Route coordinator RPCs through http_proxy. Needed only when the coordinator
+    is outside the facility and the site forces egress through a gateway."""
+
+
+@dataclass
+class Flower:
+    """Cross-site outer step: Flower gRPC + the FedMom strategy on the central node."""
+
+    enable: bool = False
+    """False runs plain single-cluster torchtitan, DARL still leasing. Useful for
+    validating a site before involving the WAN."""
+
+    server_address: str = ""
+    """host:port of the Flower server, e.g. 145.38.206.143:29511."""
+
+    transport: str = "inline"
+    """Which weight transport this cluster expects: 'inline' or 'blob'.
+
+    Must match what the central node was started with (`--transport`), and a mismatch
+    is a startup error rather than something to paper over. It exists because the
+    inline path needs a parameter ordering built from a full gather of the model, and
+    that gather is precisely the operation blob transport avoids -- all-gathering a
+    70B model onto every rank is 1.1 TB of host RAM across a node. Declaring the
+    transport lets the client skip it entirely when the weights are going out of band."""
+
+    rounds: int = 0
+    """Outer rounds this client will participate in before disconnecting. 0 means
+    follow the server, which is the normal case."""
+
+    max_message_length: int = 2_147_483_647
+    """gRPC message cap in bytes. A full parameter set crosses the wire each round,
+    so this is the real ceiling on model size for this transport -- see
+    `flower_client` module docstring for the arithmetic and what to do past it."""
+
+    wire_dtype: str = "float16"
+    """Dtype parameters are serialised in, for the inline transport only.
+
+    float16 halves WAN traffic and is exact for weights of normal magnitude, but its
+    range is much smaller than bfloat16's: anything below ~6e-08 flushes toward zero.
+    That costs nothing in practice and is covered by a test. float32 keeps every
+    value at twice the bytes. Either way the central node holds its momentum state
+    and the authoritative global model in float32 (see central/strategy.py)."""
+
+
+@dataclass
+class Titan:
+    """Model-build settings that torchtitan's own sections have no field for."""
+
+    pad_vocab_to_multiple_of: int = 256
+    """Round the embedding up to a multiple of this after taking the vocabulary
+    size from the tokenizer.
+
+    Not cosmetic. OpenEuroLLM's 128k tokenizer reports 131073 ids (131072 plus one
+    added token) -- an odd number, which misaligns every embedding and output-projection
+    GEMM, and is not divisible by any tensor-parallel degree above 1, so
+    `parallelism.tensor_parallel_degree > 1` would fail outright. Padding to 256
+    gives 131328 here: 255 rows no token can ever index, ~0.2% of the embedding,
+    against correct sharding and aligned matmuls.
+
+    Set to 0 or 1 to use the tokenizer's count verbatim."""
+
+
+@dataclass
+class JobConfig:
+    darl: DARL = field(default_factory=DARL)
+    flower: Flower = field(default_factory=Flower)
+    titan: Titan = field(default_factory=Titan)

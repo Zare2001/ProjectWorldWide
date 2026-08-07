@@ -1,0 +1,106 @@
+# Qwen3 1.7B, single site, DARL-leased. A scaling test for the *compute* half.
+#
+# Read this before using it: flower.enable is false and cannot simply be turned on.
+#
+# 1.7B parameters is 3.4 GiB in float16, and gRPC cannot carry more than 2 GiB in
+# a single message -- no setting of flower.max_message_length changes that, it is a
+# protocol limit. The Flower transport in src/pww/titan/flower_client.py exchanges a
+# full parameter set per round, so it tops out somewhere below 1B parameters. The
+# client checks this at startup and refuses with the arithmetic rather than failing
+# mid-round on a truncated message.
+#
+# So what this config is for: proving that FSDP2, activation checkpointing and the
+# DARL dataloader carry a 1.7B model on one facility, and measuring tokens/s/GPU
+# there. That is the part this repo's own code has to get right. Making the *outer*
+# step work at this size is a transport change -- exchanging checkpoint files out of
+# band instead of putting weights in gRPC messages -- and is not implemented here.
+#
+#   scripts/titan/run_train.sh --config configs/titan/qwen3_1.7b_scaling.toml
+#
+# Larger flavors (4B, 8B, 14B, 32B) exist in torchtitan's table and this config
+# reaches them by changing model.flavor plus, past 4B or so,
+# parallelism.tensor_parallel_degree -- the same caveat about the outer step applies,
+# more so.
+
+[job]
+dump_folder = "./outputs/qwen3-1.7b-scaling"
+description = "Qwen3 1.7B single-site scaling test (DARL, no cross-site outer step)"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "1.7B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+# Lower than 0.6B's 3e-4, as capacity goes up.
+lr = 1.5e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 500
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+# Halved against 0.6B to hold activation memory roughly constant as the model
+# grows. Expect to tune this per facility -- an MI250x GCD has 64 GB against an
+# H100's 80.
+local_batch_size = 4
+seq_len = 2048
+steps = 50000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+# Still 1: 1.7B shards fine under pure FSDP2. Tensor parallelism starts paying for
+# its extra collectives somewhere around 4B-8B, and only within a node.
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+interval = 1000
+last_save_model_only = false
+
+[comm]
+train_timeout_seconds = 300
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 1000
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+url = ""
+site = ""
+inner_steps = 100
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+# See the header: not a tuning choice at this model size.
+enable = false
+# Declared even though flower.enable is false, so it is where you expect it if
+# you turn the federation on: must match the central node's --transport.
+transport = "inline"

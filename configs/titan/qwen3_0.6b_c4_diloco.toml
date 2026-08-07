@@ -1,0 +1,144 @@
+# Qwen3 0.6B on C4, DARL-leased, cross-site DiLoCo via Flower + FedMom.
+#
+# The real run. Launch on each site with scripts/titan/run_train.sh, which fills
+# in the paths that differ per facility (tokenizer directory, token shard
+# directory, dump folder, DARL/Flower endpoints) as CLI overrides -- TOML does not
+# expand environment variables, and hardcoding one site's Lustre paths here is
+# exactly what the sites/*.sh abstraction exists to avoid.
+#
+# Prerequisites, in order:
+#   1. scripts/titan/download_tokenizer.sh          (once, per site)
+#   2. scripts/titan/tokenize_c4.sh                 (once, per site -- or rsync
+#                                                    one site's output to the other)
+#   3. scripts/central_node/start_central_services.sh   (on the central VM)
+#
+# Model shape is torchtitan's own built-in "0.6B" Qwen3 flavor -- this repo does
+# not hand-roll a model. See third_party/torchtitan/torchtitan/models/qwen3/__init__.py
+# for the flavor table. vocab_size and eos_id are overridden at build time from
+# whatever tokenizer model.hf_assets_path points at (see src/pww/titan/__init__.py),
+# because the tokenizer here is OpenEuroLLM's 128k and the flavor's own default is
+# Qwen's 151936.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-diloco"
+description = "Qwen3 0.6B C4 cross-site DiLoCo (DARL + Flower/FedMom)"
+# Adds the [darl] and [flower] sections to torchtitan's JobConfig.
+custom_config_module = "pww.titan.config"
+
+[experimental]
+# Registers the pww_qwen3 train spec and the pww dataset entries.
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+# Overridden by run_train.sh with the site's tokenizer directory.
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+
+[lr_scheduler]
+# Warmup matters more here than in a single-site run. Every outer round replaces
+# the local weights with the FedMom average, so an un-warmed high LR in the first
+# steps after a replacement amplifies the discontinuity instead of settling into
+# it. The schedule is over *global* steps and survives outer rounds, unlike
+# train_llm_flower.py which had no schedule at all and rebuilt AdamW from scratch
+# every phase.
+warmup_steps = 200
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+# Total optimiser steps across the whole run, not per round. With
+# darl.inner_steps = 100 this is 200 outer rounds, so the Flower server needs
+# --num-rounds >= 200 (see scripts/central_node/start_central_services.sh).
+steps = 20000
+max_norm = 1.0
+# 'pww_tokens' selects the DARL-leased dataloader over pre-tokenised shards.
+# dataset_path is overridden by run_train.sh with the site's shard directory.
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+# 1 = pure FSDP2 over every rank in the job, which is what a 0.6B model wants:
+# it fits comfortably sharded and tensor parallelism would add collectives for
+# nothing. Raise tensor_parallel_degree only once a flavor stops fitting.
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+# 'selective' trades a little recompute for a lot of activation memory, and is
+# what makes the larger flavors fit at seq_len 2048 at all.
+mode = "selective"
+
+[checkpoint]
+enable = true
+# Every 5 outer rounds at H=100. DARL commits are gated on this write (see
+# src/pww/titan/trainer.py), so a longer interval means more work re-leased after
+# a crash -- and a shorter one means more Lustre traffic. 500 is a compromise;
+# tune it against how long a round actually takes on the slower site.
+interval = 500
+last_save_model_only = false
+
+[comm]
+# Generous relative to a single-site run: the outer step gathers a full parameter
+# set and pushes it over the WAN, so a rank can legitimately sit in a collective
+# for far longer than any intra-node operation would take.
+train_timeout_seconds = 300
+
+[validation]
+enable = true
+# Not pww_tokens: the shards are the training partition, and validating on them
+# would report training loss. c4_test is the bundled offline fixture, which is
+# held out from a real C4 run by construction.
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 500
+steps = 20
+
+[fault_tolerance]
+# torchft is deliberately off: Flower + FedMom does the outer step here, so
+# torchft's own DiLoCo/lighthouse machinery would be a second, conflicting
+# implementation of the same thing. With this false, FTManager short-circuits and
+# torchft is never imported -- which is why it is not a dependency of this repo.
+enable = false
+
+[darl]
+# url/site are supplied per site by run_train.sh.
+url = ""
+site = ""
+# H. One lease covers exactly one phase, so there is zero coordinator traffic
+# while the GPUs are busy and a lease boundary lands where the ranks are already
+# synchronised for the outer step.
+inner_steps = 100
+# 1024 windows = ~2M tokens per leasable block at seq_len 2048.
+block_size = 1024
+# 0 = derive from inner_steps and the batch geometry (darl.space.blocks_for_phase).
+blocks_per_phase = 0
+epochs = 1
+# Must be identical on every site; BlockSpace.digest turns a mismatch into a
+# registration error rather than two clusters silently training the same tokens.
+space_seed = 42
+
+[flower]
+enable = true
+# server_address is supplied by run_train.sh.
+server_address = ""
+# float16 halves WAN traffic and keeps a 0.6B parameter set (1.2 GiB) inside the
+# 2 GiB gRPC message cap. The central node keeps its momentum state and the
+# authoritative global weights in float32 regardless (see central/strategy.py).
+# Weights ride inside the gRPC message. Fine at 0.6B (1.2 GiB in float16,
+# under the 2 GiB cap); see configs/titan/qwen3_8b_c4_diloco.toml for the
+# out-of-band transport that any larger model needs.
+transport = "inline"
+wire_dtype = "float16"

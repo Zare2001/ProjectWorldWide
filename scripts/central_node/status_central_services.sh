@@ -9,6 +9,7 @@ source "${PWW_ROOT}/env.sh"
 
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
+BLOB_PORT="${BLOB_PORT:-29512}"
 STATE_DIR="${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/central"
 
 echo "=== DARL Coordinator Status (Port ${DARL_PORT}) ==="
@@ -33,5 +34,50 @@ else
 fi
 
 echo ""
+echo "=== Blob Store Status (Port ${BLOB_PORT}) ==="
+BLOB_PID_FILE="${STATE_DIR}/blob.pid"
+if [[ -f "${BLOB_PID_FILE}" ]] && kill -0 "$(cat "${BLOB_PID_FILE}")" 2>/dev/null; then
+    echo "Blob store is RUNNING (PID $(cat "${BLOB_PID_FILE}"))."
+    curl -sS "http://127.0.0.1:${BLOB_PORT}/health" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    usage = json.load(sys.stdin).get("usage", {})
+except Exception:
+    sys.exit()
+gib = 2 ** 30
+print(f"  blobs {usage.get(\"blobs\", 0)} | {usage.get(\"bytes\", 0) / gib:.2f} GiB used "
+      f"| {usage.get(\"disk_free\", 0) / gib:.2f} GiB free")
+print(f"  transferred: {usage.get(\"bytes_in\", 0) / gib:.2f} GiB in, "
+      f"{usage.get(\"bytes_out\", 0) / gib:.2f} GiB out")
+' || true
+else
+    echo "Blob store is STOPPED (only needed for TRANSPORT=blob)."
+fi
+
+echo ""
+echo "=== Global Model State ==="
+GLOBAL_STATE_DIR="${GLOBAL_STATE_DIR:-${STATE_DIR}/global}"
+if [[ -s "${GLOBAL_STATE_DIR}/meta.json" ]]; then
+    # The merge counter, not Flower's round counter: this is how many times the
+    # global model actually changed, and it is what deltas are validated against.
+    python3 -c '
+import json, sys
+meta = json.load(open(sys.argv[1]))
+print(f"  merge round   {meta.get(\"round\", 0)}")
+print(f"  parameters    {meta.get(\"model_numel\", 0):,} in {len(meta.get(\"keys\", []))} tensors "
+      f"({meta.get(\"storage_dtype\", \"?\")})")
+print(f"  tokens merged {meta.get(\"total_tokens\", 0):,}")
+for name, rec in sorted((meta.get("clusters") or {}).items()):
+    print(f"  {name:12s} joined r{rec.get(\"first_seen_round\", 0)}, "
+          f"last seen r{rec.get(\"last_seen_round\", 0)}, "
+          f"{rec.get(\"rounds_contributed\", 0)} rounds, "
+          f"{rec.get(\"tokens_total\", 0):,} tokens, "
+          f"{rec.get(\"stale_rejected\", 0)} stale rejected")
+' "${GLOBAL_STATE_DIR}/meta.json" || true
+else
+    echo "  no durable global state yet (cold start, or --state-dir unset)"
+fi
+
+echo ""
 echo "=== Open Port Listener Check ==="
-ss -tulpn 2>/dev/null | grep -E "${DARL_PORT}|${FLOWER_PORT}" || true
+ss -tulpn 2>/dev/null | grep -E "${DARL_PORT}|${FLOWER_PORT}|${BLOB_PORT}" || true

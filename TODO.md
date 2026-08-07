@@ -1,6 +1,6 @@
 # TODO: federated training across LUMI and Snellius
 
-## Where this starts from
+## Where this stands
 
 Both sites run the same code independently, verified end to end:
 
@@ -10,168 +10,165 @@ Both sites run the same code independently, verified end to end:
 | all-reduce, 1 node / 2 nodes | 123 / 88 GB/s | 300.8 / 133.1 GB/s |
 | torch | 2.7.1+rocm6.2.4 | 2.7.1+cu126 |
 
-**Nothing below requires changing how either site runs.** This is additive.
+The cross-site mechanism is built and CPU-verified: **DARL** partitions the corpus
+by lease so the sites cover it exactly once, and **Flower + `PWWFedMom`** does the
+DiLoCo outer step on the central VM. What has *not* happened is a real multi-site
+run of the torchtitan path on GPUs. That is the whole of the open work below.
 
-The goal is federated: each site trains locally, sites exchange weights every K
-epochs, checkpoints are the transport. No cross-site collectives.
+---
 
-## Three facts that make this tractable
+## Done, and what it replaced
 
-1. **Checkpoints are portable between the sites.** Both run torch 2.7.1 (that
-   pin was deliberate), and a consolidated checkpoint is plain CPU tensors.
-2. **Consolidated checkpoints are world-size independent.** LUMI's 8 ranks and
-   Snellius's 4 exchange freely; `set_model_state_dict` reshards on load.
-3. **They are small.** ResNet-18 consolidated = **85 MiB** (model + SGD
-   momentum). Trivial per round over a WAN. For a 7B LLM this becomes 28 GB
-   (56 GB with optimizer state), which is what should drive the choice of K.
+The original plan here was checkpoint averaging driven over SSH from Snellius,
+with an `src/pww/federated.py` merging consolidated checkpoints. That design is
+**superseded**; recording the substitution because the shape of the code no longer
+matches the plan it came from.
 
-## Phase 1 -- trainer changes
+| original plan | what happened instead |
+|---|---|
+| `--site-index i` / `--site-count N` to pre-partition CIFAR-10 | DARL. The partition is decided at run time by a coordinator that knows who is alive, so a site that joins late or dies at walltime still yields exactly-once coverage. A static split cannot do that. `train_flower.py` leases like the LLM path. |
+| `--round-epochs K` to bound a round without wrecking the LR schedule | a Flower round *is* the bound: `fit` runs H inner steps and returns. torchtitan's LR schedule is global and continues across rounds. |
+| `average_checkpoints(paths, weights)` in a new `federated.py` | `central/strategy.py` (the round protocol) and `central/globalstate.py` (the durable global model and the streaming per-tensor merge). Averaging whole checkpoints was never going to reach 7B: three dense copies is 84 GB at 7B in float32 on a VM with tens of GB of RAM. |
+| average BatchNorm buffers, handle `num_batches_tracked` | only `named_parameters()` is exchanged. Correct for Qwen3, which is RMSNorm with learned weights and no accumulated statistics; its buffers are RoPE tables recomputed at init. This is also exactly why the ResNet path pins outer momentum to 0.0 — a BatchNorm model *would* need its buffers, and momentum can push averaged weights outside the convex hull of the client weights. A model with learned buffer state needs this revisited. |
+| SSH push/pull between sites, Snellius orchestrating | Flower gRPC on 29511, plus an HTTP blob store on 29512 for models above ~1B. Neither site talks to the other; both talk to the central VM. |
+| "if one site's job dies, does the round stall or proceed?" | proceeds. `min-clients: 1`, and 0/1/N live replicas are all normal states. A requeued site's first stale delta is rejected by `base_round` rather than averaged in. |
 
-Three concrete gaps. All testable on CPU, no allocation needed.
+Verified by measurement, CPU-only (`tests/test_darl.py`, `test_titan.py`,
+`test_federation.py`):
 
-### 1.1 Sites train on identical data (`src/pww/data/cifar.py`)
+- [x] consolidated and sharded checkpoints round-trip across differing world sizes
+      (4 ranks -> 1 and 4 -> 2, on Snellius alone; loss continued at 1.31/1.45 from a
+      cold start of ~2.5, so the weights really loaded)
+- [x] exactly-once corpus coverage under concurrent clusters, expiry, stealing and
+      quarantine
+- [x] the streaming FedMom merge equals a dense reference to 4.8e-07 over 3 rounds
+- [x] the outer step equals `torch.optim.SGD(momentum=0.9, nesterov=True)` on
+      DiLoCo's outer gradient to 1.9e-06, and is distinguishable from heavy ball
+- [x] 0 / 1 / N live replicas, restart durability, stale-delta rejection,
+      mismatched-model refusal
+- [x] per-tensor DTensor gather/scatter on 2 gloo ranks with genuinely sharded
+      parameters
 
-`build_cifar10_loaders` hands every site the full CIFAR-10 and shards it with
-`DistributedSampler` across *that site's* ranks only. Run it on both machines
-and you get two redundant runs, not federated training.
+---
 
-- [ ] Add `--site-index i` / `--site-count N`, partition the dataset before the
-      sampler sees it (`torch.utils.data.Subset` over a deterministic split).
-- [ ] Keep the split reproducible from the seed alone, so both sites derive the
-      same partition without communicating.
-- [ ] Offset `set_seed` by site index too (`src/pww/config.py:74`), or the two
-      sites apply identical augmentation to their shards.
+## Open
 
-### 1.2 No way to run K epochs without wrecking the LR schedule
+### 1. Stand up the torch 2.9 environments — blocking everything else
 
-The loop is `range(start_epoch, args.epochs)` (`train_cifar.py:223`), and
-`args.epochs` *also* sets the cosine horizon (`build_scheduler`,
-`train_cifar.py:65`). Capping a round by lowering `--epochs` makes the LR decay
-to ~0 at every round boundary.
+torchtitan at the pinned commit needs torch >= 2.9; this repo pins 2.7.1 on both
+sites for numerical comparability. The scripts exist but have not been run on the
+real machines.
 
-- [ ] Add `--round-epochs K`: train K epochs from `start_epoch`, then exit.
-- [ ] Leave `--epochs` as the schedule horizon, untouched.
+- [ ] Snellius: `./scripts/titan/setup_venv_snellius.sh` (torch 2.9.1+cu128)
+- [ ] LUMI: `sbatch scripts/lumi/build_titan_container.sh` (ROCm 6.4.4 / torch 2.9.1)
+- [ ] **Re-establish parity at the new version.** Both sites on the same torch
+      *minor* version, and the CIFAR-10 comparison re-run there. The 0.2-point
+      agreement between sites is the evidence that the port is correct, and it does
+      not carry over from 2.7.1 by assumption.
 
-Already works in our favour: resume reads `epoch` from checkpoint meta and
-fast-forwards the scheduler (`train_cifar.py:213-218`), so once this split
-exists, a merged checkpoint continues the *global* schedule for free.
+### 2. GPU verification of what CPU tests cannot reach
 
-### 1.3 Verify cross-world-size resume actually round-trips -- DONE
+Everything in this list is untested on hardware. `configs/titan/qwen3_0.6b_smoke.toml`
+is the smallest thing that exercises it.
 
-- [x] Test consolidated save/load across differing world sizes.
-- [x] Do it on Snellius alone first (4 ranks -> 1 rank via the debug job).
+- [ ] FSDP2 wrapping of Qwen3 through torchtitan's `TrainSpec`
+- [ ] a real Qwen3 forward/backward against the 128k-vocab embedding, padded to a
+      multiple of 256
+- [ ] the DTensor gather/scatter in `titan/params.py` and `delta.py` on real shards
+      across 8 GCDs and 4 H100s — verified on gloo, not on ROCm or NCCL
+- [ ] `bf16` numerics on MI250X vs H100 for the same config
+- [ ] DCP checkpoint save/load across the two sites' differing rank counts
 
-Both formats round-trip onto a different world size, tested on Snellius alone:
+### 3. Corpus staging at scale
 
-| written by | reloaded on | format | result |
-|---|---|---|---|
-| 4 ranks | 1 rank | consolidated | resumed at epoch 4, loss continued at 1.31 |
-| 4 ranks | 2 ranks | sharded | resumed at epoch 4, loss continued at 1.45 |
+- [ ] run `stage_c4.sh` / `tokenize_c4.sh` on real C4, not `c4_test`, and record the
+      window count both sites must agree on
+- [ ] confirm the manifest digest matches across sites before the first run — a
+      mismatch is refused at registration, which is the intended behaviour, but
+      better to find out on a login node
+- [ ] measure the tokenisation pass: it is offline and one-off, but it is also the
+      only step whose cost scales with the corpus rather than the run
 
-The loss values are the check that matters: a cold ResNet-18 starts near 2.5, so
-picking up at 1.3-1.4 means the weights really loaded rather than the run
-silently restarting. `set_model_state_dict` reshards on load exactly as fact 2
-above claims.
+### 4. The first real cross-site run
 
-Still untested: the *cross-site* direction, LUMI's 8 ranks -> Snellius's 4. That
-needs a checkpoint physically moved between the sites, so it belongs to Phase 4
-rather than here.
+- [ ] 0.6B, inline transport, both sites, and confirm from the logs that `merge
+      round` advances with nonzero tokens from both
+- [ ] deliberately kill one site at walltime mid-round and confirm the survivor
+      continues and the requeued site's stale delta is rejected once, then rejoins
+- [ ] 8B, blob transport, and measure the actual WAN transfer time per round
+      against the H that was chosen
 
-## Phase 2 -- `src/pww/federated.py`
+### 5. Hyperparameters that are guesses until measured
 
-Nothing merges checkpoints today; `checkpoint.py` only saves and loads.
+- [ ] **H.** `inner_steps: 100` follows the paper. `drift` per round is the number
+      to read: near zero means H is too small to be worth the WAN round trip, large
+      means the replicas diverged far enough that averaging loses information.
+- [ ] **Outer LR.** Now 0.7 with momentum 0.9, the paper's values, and consistent
+      with `src/pww/diloco.py`. Worth an A/B against `1.0 / 0.0` (exact FedAvg),
+      which is the control arm.
+- [ ] **Whether the federated batch should change the inner LR.** The effective
+      batch across two sites is roughly twice one site's. Whether to scale for that
+      is a research question, not an infrastructure one.
 
-- [ ] `average_checkpoints(paths, weights) -> merged` weighted by samples seen
-      per site (not uniform -- sites may run different numbers of steps).
-- [ ] Average model weights **and BatchNorm buffers**. `get_model_state_dict`
-      returns buffers, so `running_mean`/`running_var` are included; skipping
-      them is a common and silent FedAvg bug.
-- [ ] Handle `num_batches_tracked` (integer counter -- sum or take max, do not
-      average into a float).
-- [ ] Write merged output with `epoch` set to the round boundary so `--resume`
-      continues the global schedule.
-- [ ] Decide optimizer state: average momentum, or reset per round.
-- [ ] Unit tests on CPU: averaging two identical checkpoints must be a no-op;
-      averaging two known-different ones must give the exact midpoint.
+### 6. Smaller things
 
-## Phase 3 -- validate on Snellius alone, before touching LUMI
+- [ ] `--keep-rounds` prunes old blobs; confirm the pruning actually keeps disk
+      bounded over a 200-round run rather than only in the test
+- [ ] wire `release_all()` to SIGTERM in the torchtitan job scripts, as the legacy
+      path does. Slurm sends SIGTERM before the walltime kill, and releasing there
+      returns blocks in milliseconds instead of after a full TTL.
+- [ ] a third site is already supported with no special handling (see below), but it
+      has never been tried
 
-Simulate two sites as two Snellius jobs on disjoint shards. Same mechanism, zero
-cross-site networking, and a bug costs one queue wait instead of two.
-
-- [ ] Baseline: 1 job, 2 nodes, 8 GPUs, 30 epochs (the existing multinode run).
-- [ ] Federated: 2 jobs x 4 GPUs, disjoint shards, sync every K epochs.
-- [ ] Sweep K in {1, 2, 5, 10} and find where accuracy departs from baseline.
-- [ ] Sanity check: K=1 should track the baseline closely; K=30 is just two
-      independent runs averaged once, and should be clearly worse.
-
-Only once this behaves should LUMI enter the picture.
-
-## Phase 4 -- cross-site transport
-
-- [ ] Confirm SSH key auth Snellius -> LUMI actually works. Verified so far:
-      outbound TCP/22 to `lumi.csc.fi` is **open**, and `~/.ssh/id_ed25519`
-      exists. Whether that key is authorised on LUMI is **not yet tested**.
-- [ ] **Snellius orchestrates.** MFA makes automated inbound SSH to Snellius
-      painful, so drive rounds from Snellius: it pushes and pulls checkpoints,
-      and LUMI only ever runs `sbatch`.
-- [ ] Round driver: submit both sites, wait for both checkpoints, merge,
-      redistribute, repeat. Plain shell or Python on a login node -- it is
-      waiting on Slurm, not computing.
-- [ ] Decide failure behaviour: if one site's job dies, does the round stall,
-      or proceed with the surviving site?
-- [ ] Checksum checkpoints after transfer. A truncated 85 MiB file loads as a
-      confusing shape error deep inside a queued job.
-
-## Open decisions
-
-| question | proposed default | rationale |
-|---|---|---|
-| average optimizer momentum? | no -- weights + BN buffers only | classic FedAvg, halves transfer |
-| data split | disjoint shards | otherwise it is local-SGD, not federated |
-| sync interval K | start at 1 epoch, sweep up | find where it breaks |
-| LR scaling | keep each site's own global batch | the *federated* batch is 2x one site's; whether to scale for that is a research question, not an infra one |
+---
 
 ## Notes on the machines
 
 - **Snellius multi-node must take whole nodes.** A multi-node GPU job asking for
-  fewer than 4 GPUs/node is rejected; `--exclusive` bills for them anyway. So
-  each federated site on Snellius is a whole node minimum.
+  fewer than 4 GPUs/node is rejected; `--exclusive` bills for them anyway. So each
+  federated site on Snellius is a whole node minimum.
 - **Snellius single-node partial allocations start instantly** (1 GPU + 16 cores).
-  `scripts/snellius/job_cifar_debug.sh` is the fast iteration loop -- use it for
-  every Phase 1 and 2 change before spending a full-node queue wait.
-- **`/scratch-shared` is purged at ~14 days.** Round checkpoints that matter
-  belong in `/projects`, or they will vanish mid-experiment.
+  `scripts/snellius/job_cifar_debug.sh` is the fast iteration loop.
+- **`/scratch-shared` is purged at ~14 days.** Checkpoints that matter belong in
+  `/projects`. This includes the central node's `--state-dir`: it holds the *only*
+  copy of the global model.
 - **Snellius priority is ~98% fairshare** with a 1-day decay half-life. A long
-  federated sweep will steadily lower your own queue priority.
+  federated sweep steadily lowers your own queue priority.
+- **LUMI's first epoch is ~25x slower than steady state** because MIOpen autotunes
+  for unseen shapes. Do not read anything into round 1 throughput.
 
-## LLM Extension & Utility Helpers
+---
 
-- [ ] **Custom Tokenizer Training (`src/pww/data/tokenizer.py`)**: (Optional) For standard pre-trained LLMs (LLaMA-3, Qwen-2.5, GPT-2), tokenizers are loaded automatically from HuggingFace via `AutoTokenizer.from_pretrained()`. `tokenizer.py` is an optional utility helper if you wish to train a brand-new BPE/SentencePiece tokenizer from scratch on raw text corpora.
+## A third site joining mid-run
 
-## Protocol & Recommendation for Late-Joining Clusters (Third Site Integration)
+This needed a protocol when the transport was checkpoint averaging. It does not
+now — the elastic membership path handles it, and there is no separate code for it.
 
-### Question: If a 3rd cluster joins mid-training, will its model updates weaken/degrade the global model? Should it start from the latest global outer checkpoint?
+A site joining at round *R* must start from the current global model
+θ_global^(R), and it does, unavoidably: `configure_fit` sends the current global
+weights to every participant before it trains, so a client cannot contribute a delta
+derived from θ₀ or from a stale checkpoint even if it tried. That is what makes the
+join safe rather than corrupting:
 
-### 💡 Recommendation & Theoretical Analysis
+- **Exact alignment.** At inner step 0 of round *R* the new site holds identical
+  weights to every other participant, so its delta θ_new^(H) − θ_global^(R) is a
+  valid trajectory in the current loss basin.
+- **Disjoint tokens.** It registers with DARL under its own cluster id and receives
+  blocks nobody has trained on. It cannot re-process another site's tokens.
+- **Proportional weight.** The merge weights each delta by tokens contributed, so a
+  site that is initially slow contributes proportionally less rather than skewing
+  the average.
+- **A stale delta cannot slip in.** `base_round` is checked, and a mismatch is
+  rejected with the reason logged, not averaged.
 
-When a new 3rd site (e.g. MareNostrum 5, Leonardo, or an edge GPU cluster) joins an ongoing DiLoCo run at Round $R$:
+Checklist for adding one:
 
-1. **Initial State: Must Start from Latest Global Checkpoint ($\theta_{\text{global}}^{(R)}$)**:
-   - The new site **MUST initialize its weights to the latest global outer model $\theta_{\text{global}}^{(R)}$** broadcast by the Central Aggregator at the start of Round $R$.
-   - **Crucial**: It must **NOT** train from initial weights $\theta_0$ or an outdated checkpoint. Training from an outdated checkpoint would produce parameter deltas $\Delta_{\text{new}} = \theta_{\text{new}} - \theta_{\text{old}}$ pointing toward a stale location in parameter space, which *would* poison outer momentum (`FedMom`) and degrade convergence.
-
-2. **Why Starting from $\theta_{\text{global}}^{(R)}$ Does NOT Degrade the Model**:
-   - **Exact Parameter Alignment**: At step 0 of Round $R$, the new site has identical weights ($\theta_{\text{new}}^{(0)} = \theta_{\text{global}}^{(R)}$) to Snellius and LUMI.
-   - **Disjoint Token Leasing (DARL)**: The new site registers with the central DARL coordinator and receives brand-new, un-trained token blocks. It never re-processes tokens that Snellius or LUMI have already trained on.
-   - **Valid Delta Directions**: Because the new cluster starts from $\theta_{\text{global}}^{(R)}$, its local delta $\Delta_{\text{new}} = \theta_{\text{new}}^{(H)} - \theta_{\text{global}}^{(R)}$ represents a clean, valid optimization trajectory computed over fresh dataset tokens in the current loss basin.
-   - **Sample-Weighted Outer Aggregation**: Central aggregation weights each cluster's delta by tokens processed:
-     $$\theta_{\text{global}}^{(R+1)} = \theta_{\text{global}}^{(R)} + \eta_{\text{outer}} \sum_{i=1}^{K} \frac{n_i}{N_{\text{total}}} \Delta_i$$
-     If the new site has lower throughput initially, its delta is proportionally scaled, preventing it from skewing the global trajectory.
-
-### 📋 Checklist for Integrating a New 3rd Site (Site C):
-
-- [ ] **Fetch Checkpoint**: Download the current outer global model $\theta_{\text{global}}^{(R)}$ from the Central Aggregator.
-- [ ] **Register with DARL**: Pass `--cluster-id site_c` so DARL assigns non-overlapping token blocks.
-- [ ] **Match Configurations**: Ensure `seq_len`, tokenizer, model architecture, and precision (`bf16`) match existing sites.
-- [ ] **Connect to Aggregator**: Launch `train_llm_flower` targeting `central_ip:29511`.
+- [ ] match `model.flavor`, `training.seq_len`, the tokenizer, and
+      `titan.pad_vocab_to_multiple_of` — mismatches are refused at the merge, by
+      key and by shape
+- [ ] match `darl.space_seed` and the corpus window count, or registration is
+      refused by digest
+- [ ] give it a **stable** `darl.cluster_id` across requeues: the coordinator sizes
+      grants from a cluster's measured throughput, and a fresh id on every
+      resubmission throws that history away
+- [ ] set `flower.transport` to whatever the server is running

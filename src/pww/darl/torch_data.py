@@ -233,6 +233,11 @@ class DARLDataSource:
     def _acquire_payload(self) -> dict[str, Any] | None:
         session = self.session
         blocks = self.blocks_per_phase
+        # Collects a prefetch that is still in flight rather than issuing a second,
+        # competing acquire: two requests from one cluster race for the same blocks,
+        # and at the end of an epoch only one of them can win. Bounded inside the
+        # session by one RPC timeout, after which asking directly is no worse. See
+        # LeaseSession.take_prefetched.
         result: Acquisition | None = session.take_prefetched()
         if result is not None and not result.granted:
             result = None                          # prefetch came back empty; ask properly

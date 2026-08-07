@@ -6,13 +6,24 @@ the other ranks over the existing process group -- see `torch_data.py`. Ten
 thousand ranks hammering a coordinator with per-rank requests is exactly the
 "naive dynamic assignment" failure mode the design contrasts DARL against.
 
-Three things here are load-bearing and easy to get wrong:
+Four things here are load-bearing and easy to get wrong:
 
 **Acquires carry an idempotency key.** Every other RPC is naturally idempotent,
 so a lost reply can be retried. An acquire is not: retrying it blind after a
 dropped response leaks a lease -- blocks marked LEASED that nobody is working on
 until the TTL expires. So each acquire carries a `request_id` and the coordinator
 replies with the cached grant if it sees the same key twice.
+
+**One acquire in flight per session.** The prefetch runs on a background thread, so
+it is easy for a phase's foreground acquire to overlap it -- and then two requests
+from the same cluster are queued at the coordinator, competing for the same blocks.
+At the tail of an epoch only one can win, the loser is told `drain`, and if the
+loser is the foreground caller it waits on blocks its own prefetch just took. That
+deadlocks: the thread that would consume and commit them is the one asleep, and the
+heartbeat keeps renewing the lease so the TTL never breaks it either. Two things
+prevent it -- `take_prefetched` waits for a request already in flight instead of
+racing it, and `acquire` consumes a pending prefetch grant rather than sleeping on a
+drain.
 
 **The heartbeat reply is an instruction, not an acknowledgement.** It carries the
 coordinator's authoritative `end` for each lease, which may have shrunk because
@@ -366,6 +377,10 @@ class LeaseSession:
         self._thread: threading.Thread | None = None
         self._prefetch: Acquisition | None = None
         self._prefetch_thread: threading.Thread | None = None
+        # Set when a prefetch has stored its outcome, so a caller that wants the
+        # next span can wait for the one already in flight instead of racing it
+        # with a second acquire. See `take_prefetched`.
+        self._prefetch_done = threading.Event()
         self._phase_started = 0.0
 
         reply = self.client.register(space, ranks=ranks)
@@ -475,6 +490,17 @@ class LeaseSession:
         remaining block is held by someone who is still working on it, so the
         right behaviour is to sleep until the next lease boundary and ask again,
         not to exit an epoch that is not finished.
+
+        One `drain` must never be waited out, though: the one where the outstanding
+        blocks are **this session's own**, won by a prefetch whose result nobody has
+        collected yet. Sleeping there is a deadlock rather than patience -- the only
+        thread that would ever commit those blocks is the one asleep in this loop,
+        and the heartbeat keeps renewing the lease, so not even the TTL breaks it.
+        The pool looks drained from the outside while the session is sitting on the
+        very span it is waiting for. So a pending prefetch grant is adopted instead
+        of slept on. Observed in practice: the tail of an epoch, where the last
+        acquire and the prefetch of the phase before it are in flight together and
+        only one of them can win the remaining blocks.
         """
         blocks = self.blocks_per_phase if blocks is None else blocks
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -488,12 +514,31 @@ class LeaseSession:
                 self.epoch = result.epoch
                 if result.status == "epoch_complete":
                     self.epoch_complete = True
+                elif result.granted:
+                    # A grant proves the epoch is not over. Without this the flag
+                    # stays set across an epoch boundary and anything keyed off it
+                    # misreads the next epoch as already finished.
+                    self.epoch_complete = False
                 for span in result.spans:
                     self.spans[span.lease_id] = span
                     self.server_ttl = span.ttl or self.server_ttl
                 self._phase_started = time.monotonic()
             if result.granted or result.epoch_complete or not wait:
                 return result
+
+            # A peek, not a wait: blocking here could overrun the caller's own
+            # `timeout`, and it is not needed. A prefetch still in flight will have
+            # landed by the next pass through this loop, which is at least a second
+            # away, and the peek picks it up then.
+            pending = self.take_prefetched(wait=0.0)
+            if pending is not None and pending.granted:
+                get_logger().info(
+                    "darl: pool reported drained, but a prefetch of this session "
+                    "already holds %d block(s) -- consuming those instead of waiting",
+                    pending.blocks,
+                )
+                return pending
+
             if deadline is not None and time.monotonic() > deadline:
                 return result
             delay = max(1.0, result.retry_after)
@@ -516,21 +561,54 @@ class LeaseSession:
             if self._prefetch is not None or (self._prefetch_thread
                                               and self._prefetch_thread.is_alive()):
                 return
+            self._prefetch_done.clear()
 
         def run() -> None:
+            result: Acquisition | None = None
             try:
                 result = self.acquire(blocks, wait=False)
             except DarlError as exc:
                 get_logger().warning("darl prefetch failed: %s", exc)
-                return
-            with self._lock:
-                self._prefetch = result
+            finally:
+                # Signalled even on failure: a caller in `take_prefetched(wait=...)`
+                # is waiting to find out whether a span is coming, and "it failed"
+                # is an answer. Without the `finally` it would wait out its whole
+                # bound for a thread that has already given up.
+                with self._lock:
+                    self._prefetch = result
+                self._prefetch_done.set()
 
         self._prefetch_thread = threading.Thread(target=run, name="darl-prefetch",
                                                  daemon=True)
         self._prefetch_thread.start()
 
-    def take_prefetched(self) -> Acquisition | None:
+    def take_prefetched(self, *, wait: float | None = None) -> Acquisition | None:
+        """Collect the prefetched work vector, waiting for one that is in flight.
+
+        Waiting is the default, and it is what keeps a session to **one acquire at a
+        time**. The alternative -- returning None while the prefetch RPC is
+        outstanding, so the caller goes and issues its own acquire -- puts two
+        requests from the same cluster in the coordinator's queue at once, and near
+        the end of an epoch only one of them can win the remaining blocks. The loser
+        is told `drain`, and if it is the foreground caller it then waits on blocks
+        its own prefetch just won. `acquire` recovers from that now; not causing it
+        is better, and it also saves the wasted round trip and the second lease.
+
+        Bounded rather than unbounded, at one RPC timeout: a prefetch retrying
+        against a coordinator that is not answering must not hold the training loop,
+        and past the bound the caller's own acquire has the same prospects and better
+        error reporting. `wait=0.0` is a non-blocking peek.
+        """
+        wait = self.client.timeout if wait is None else wait
+        if wait > 0:
+            with self._lock:
+                inflight = (
+                    self._prefetch is None
+                    and self._prefetch_thread is not None
+                    and self._prefetch_thread.is_alive()
+                )
+            if inflight:
+                self._prefetch_done.wait(wait)
         with self._lock:
             result, self._prefetch = self._prefetch, None
             return result
@@ -600,6 +678,10 @@ class LeaseSession:
         """
         with self._lock:
             if not self.spans:
+                # Still drop a stale prefetch: `release` covers every lease this
+                # cluster holds at the coordinator, so an uncollected grant here
+                # describes blocks that are back in the pool.
+                self._prefetch = None
                 return 0
         try:
             reply = self.client.release(None)
@@ -608,6 +690,11 @@ class LeaseSession:
             return 0
         with self._lock:
             self.spans.clear()
+            # Must not survive the release. Whatever the prefetcher won was released
+            # along with everything else, so handing it to a phase would train blocks
+            # that another cluster is now free to lease -- a duplicate, and one that
+            # no assertion downstream would catch.
+            self._prefetch = None
         return int(reply.get("released", 0))
 
     # --- lifecycle --------------------------------------------------------

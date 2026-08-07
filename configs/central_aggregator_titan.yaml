@@ -1,0 +1,100 @@
+# Central node aggregator settings for the torchtitan / Qwen3 DiLoCo runs.
+#
+#   AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+#   NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# NUM_SAMPLES/BLOCK_SIZE/SEED are environment variables read by that script, not
+# fields here -- and NUM_SAMPLES is the **window** count printed by
+# scripts/titan/tokenize_c4.sh, not a document or token count. It must match what
+# the clients compute or BlockSpace.digest rejects them at registration, which is
+# the intended behaviour: a silent disagreement about what position p means would
+# void every disjointness guarantee.
+
+darl-port: 29510
+flower-port: 29511
+
+# --- The outer optimiser (DiLoCo line 14, OuterOpt) --------------------------
+# These two numbers ARE DiLoCo's OuterOpt, and they are the paper's own values:
+# Nesterov momentum, outer lr 0.7, outer momentum 0.9 (arXiv 2311.08105 s4, the
+# setting that beat SGD, Adam and plain momentum in their sweep). The same pair are
+# DEFAULT_OUTER_LR / DEFAULT_OUTER_MOMENTUM in src/pww/diloco.py, which is the
+# single-site path -- the two must agree or the same run means two different things
+# depending on whether it crossed a WAN.
+#
+# The FedMom update this server applies,
+#     v_next = w - eta * (w - w_avg)
+#     w_next = v_next + beta * (v_next - v_prev)
+# is not merely momentum-like; it is *algebraically* Nesterov. Substituting
+# m = v_t - v_(t-1) gives m_next = beta*m - eta*g with the gradient evaluated at
+# w = v + beta*m, which is Nesterov's accelerated gradient in its two-sequence form
+# and matches torch.optim.SGD(momentum=beta, nesterov=True) exactly -- including
+# PyTorch's first-step convention, where v_prev = w makes round 1 momentum-free.
+# tests/test_federation.py pins that equivalence numerically so it cannot drift.
+#
+# So: server-momentum 0.0 with server-learning-rate 1.0 is the FedAvg baseline,
+#     v = w - 1.0*(w - w_avg) = w_avg,  w_next = v + 0.0*(v - v_prev) = w_avg
+# which is what the WikiText run was actually doing while its config claimed FedMom.
+# Those are the two settings worth A/B-ing.
+#
+# 0.9 momentum here, unlike configs/central_aggregator.yaml's 0.0. That file's
+# comment explains the ResNet reason: outer momentum can push averaged weights
+# outside the convex hull of the client weights, which corrupts BatchNorm running
+# statistics. Qwen3 has no BatchNorm -- it is RMSNorm throughout, whose parameters
+# are learned rather than accumulated from batch statistics -- so momentum is safe
+# here, and it is the entire contribution of the FedMom paper.
+server-learning-rate: 0.7
+server-momentum: 0.9
+
+# 200 rounds x H=100 inner steps = 20,000 optimiser steps, matching
+# training.steps in configs/titan/qwen3_0.6b_c4_diloco.toml. Set it too low and
+# training stops early; too high is harmless -- the clients disconnect when DARL
+# runs dry and the server logs a round with 0 examples rather than pretending to
+# aggregate.
+num-rounds: 200
+
+# --- Elastic membership -----------------------------------------------------
+# 1, not 2. This is the difference between a run that survives HPC queues and one
+# that does not.
+#
+# min-clients gates whether a round STARTS, and Flower blocks in the client manager
+# until that many are connected -- round-timeout does not bound that wait, it only
+# bounds waiting for results once a round has begun. So min-clients: 2 means that
+# while Snellius sits in the queue for six hours, LUMI connects and idles, and the
+# run makes no progress at all. With 1:
+#
+#   0 live   the server holds the run and waits; with --state-dir nothing is lost,
+#            not even across a restart of the aggregator itself
+#   1 live   that site trains alone. DiLoCo with k=1 -- correct, not degraded -- and
+#            the momentum buffer keeps accumulating across the gap
+#   N live   the ordinary case
+#
+# A site joining at round 400 needs no special handling: configure_fit hands every
+# participant the current global weights before it trains, so a newcomer cannot
+# contribute an update derived from a stale or freshly-initialised model. And a site
+# killed at walltime mid-round has its next delta rejected by the generation check
+# rather than averaged in stale.
+min-clients: 1
+
+# An outer round is H inner steps plus a full-parameter gather and a WAN transfer
+# of ~1.2 GiB per direction for 0.6B in float16. At H=100 that is minutes, not
+# seconds, so 300s is too tight -- a slow site would be dropped mid-round. Raise it
+# further for blob transport at 8B, where the transfer alone is ~16 GiB each way.
+round-timeout: 1800.0
+
+# --- Transport --------------------------------------------------------------
+# Set by scripts/central_node/start_central_services.sh via the TRANSPORT env var,
+# not here, because it also decides whether the blob store daemon starts:
+#
+#   ./scripts/central_node/start_central_services.sh                 # inline, <=~1B
+#   TRANSPORT=blob ... ./scripts/central_node/start_central_services.sh   # any size
+#
+# Every cluster must agree: set flower.transport in the run's TOML to match, or the
+# client refuses the round with the mismatch spelled out.
+
+# --- DARL -------------------------------------------------------------------
+# Recorded here for provenance; the startup script reads the environment
+# variables, so these are documentation of what the run was launched with.
+num-samples: 0            # set NUM_SAMPLES to tokenize_c4.sh's window count
+block-size: 1024
+darl-state-dir: "./runs/darl"

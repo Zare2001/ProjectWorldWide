@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Download raw allenai/c4 shards onto this site's scratch.
+#
+#   scripts/titan/stage_c4.sh --files 32            # ~5B tokens of C4-en train
+#   scripts/titan/stage_c4.sh --files 4 --split validation
+#
+# LOGIN NODE ONLY -- compute nodes on LUMI and Snellius have no internet.
+#
+# Only needed if you want to (re)tokenise inside the facility, or to keep the raw
+# text around. The shorter path for a first real run is to skip this and let
+# tokenize_c4.sh stream from the hub directly:
+#
+#   scripts/titan/tokenize_c4.sh --dataset c4 --max-files 32
+#
+# Staging first is worth it when you expect to re-tokenise (a tokenizer change, a
+# different seq_len), since it avoids re-downloading hundreds of GB, and it makes
+# the tokenisation step reproducible from a fixed local input rather than from
+# whatever the hub serves that day.
+#
+# C4-en is 1024 train files of ~350 MB compressed, ~156B tokens in total. Take a
+# slice: 32 files is already ~5B tokens, which is more than a 0.6B model needs to
+# be compute-bound rather than data-bound.
+set -euo pipefail
+
+FILES=32
+SPLIT="train"
+OUT_DIR=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --files) FILES="$2"; shift 2 ;;
+        --split) SPLIT="$2"; shift 2 ;;
+        --out) OUT_DIR="$2"; shift 2 ;;
+        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+PWW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=/dev/null
+source "${PWW_ROOT}/env.sh"
+
+OUT_DIR="${OUT_DIR:-${PWW_DATA_DIR}/c4/en}"
+mkdir -p "${OUT_DIR}"
+
+echo "site   : ${PWW_SITE}"
+echo "split  : ${SPLIT}, ${FILES} file(s)"
+echo "output : ${OUT_DIR}"
+echo
+
+pww_run python3 - "${OUT_DIR}" "${SPLIT}" "${FILES}" <<'PY'
+import sys
+from pathlib import Path
+
+from huggingface_hub import hf_hub_download
+
+out_dir, split, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+# C4-en's own file naming; validation has 8 shards, train has 1024.
+total = 1024 if split == "train" else 8
+if count > total:
+    print(f"{split} has only {total} files; downloading all of them")
+    count = total
+
+for index in range(count):
+    name = f"en/c4-{split}.{index:05d}-of-{total:05d}.json.gz"
+    path = hf_hub_download(
+        repo_id="allenai/c4", filename=name, repo_type="dataset",
+        local_dir=str(out_dir.parent.parent / "c4-hub"),
+    )
+    # Flatten into one directory, which is the layout datasets.py's c4_local
+    # loader globs for. Symlink rather than copy: hf_hub_download already has the
+    # bytes in its cache and C4 shards are ~350 MB each.
+    link = out_dir / Path(name).name
+    if not link.exists():
+        link.symlink_to(path)
+    print(f"[{index + 1}/{count}] {link.name}")
+PY
+
+echo
+echo "Staged. Tokenise it with:"
+echo "  PWW_C4_DIR=${OUT_DIR} scripts/titan/tokenize_c4.sh --dataset c4_local --seq-len 2048"

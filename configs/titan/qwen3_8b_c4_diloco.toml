@@ -1,0 +1,136 @@
+# Qwen3 8B on C4, DARL-leased, cross-site DiLoCo over out-of-band weight transport.
+#
+# This is the >1B configuration. It differs from qwen3_0.6b_c4_diloco.toml in exactly
+# one architectural way -- `flower.transport = "blob"` -- because at this size the
+# weights cannot travel inside a Flower gRPC message: 8B parameters is 16 GiB in
+# bfloat16 against gRPC's hard 2 GiB per-message cap, which no setting raises.
+#
+# 8B, not 7B: torchtitan's Qwen3 flavor table has 0.6B / 1.7B / 4B / 8B / 14B / 32B and
+# no 7B, so naming one would fail at startup. See
+# third_party/torchtitan/torchtitan/models/qwen3/__init__.py.
+#
+# The central node must be started with the matching transport, which also brings up
+# the blob store daemon:
+#
+#   AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml TRANSPORT=blob \
+#   NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# Central node disk, which is the binding constraint rather than its RAM:
+#
+#   global model    8B x 4 bytes (float32)  =  32 GiB   resident
+#   momentum        8B x 4 bytes (float32)  =  32 GiB   resident
+#   deltas          8B x 2 bytes x 2 sites  =  32 GiB   transient, during a merge
+#                                              -------
+#                                              96 GiB
+#
+# The merge streams one tensor at a time, so the VM's *memory* only needs a few
+# multiples of the largest single tensor (the embedding, ~4 GiB at float32) -- about
+# 17 GiB peak, not 96. Set --storage-dtype bfloat16 to halve the resident figure if
+# disk is tight, at the cost of momentum precision accumulated over hundreds of rounds.
+#
+# Per round, per site, over the WAN: ~16 GiB up (the delta) and ~32 GiB down (the
+# float32 global). At H=100 inner steps that is one exchange per ~30 minutes of
+# compute on a full node, so a 500 Mbit/s link costs roughly 25 minutes against 30 --
+# too much. Either raise darl.inner_steps (H) until the ratio is comfortable, watching
+# drift_ratio in the logs to check the replicas are not diverging, or run this on a
+# faster link. Nothing here hides that trade-off; the numbers are logged every round.
+
+[job]
+dump_folder = "./outputs/qwen3-8b-c4-diloco"
+description = "Qwen3 8B C4 cross-site DiLoCo (DARL + Flower/FedMom, blob transport)"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "8B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+# Lower as capacity rises: 3e-4 at 0.6B, 1.5e-4 at 1.7B, 1e-4 here.
+lr = 1e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 1000
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+# Small per rank, because activations at 8B and seq_len 2048 dominate. Raise
+# global_batch_size instead to get gradient accumulation without more memory.
+local_batch_size = 1
+seq_len = 2048
+# 8 x local, so 8 accumulation steps at one rank -- keeps the optimiser step count
+# down and the tokens per step up, which is what an 8B model wants.
+global_batch_size = 8
+steps = 100000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-tokenizer-128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+# Still pure FSDP2. 8B shards fine across a node; tensor parallelism starts paying for
+# its extra collectives nearer 14B-32B, and only within a node.
+tensor_parallel_degree = 1
+# Must stay 1: the out-of-band transport walks parameters in one shared order to gather
+# each one, and under pipeline parallelism each rank holds different layers, so ranks
+# would enter different collectives and deadlock. delta.py refuses it explicitly.
+pipeline_parallel_degree = 1
+
+[activation_checkpoint]
+# 'full' rather than 'selective' at this size -- recompute is cheaper than not fitting.
+mode = "full"
+
+[checkpoint]
+enable = true
+# DARL commits are gated on a checkpoint actually being written, so this also sets how
+# much leased work is re-done after a crash. 200 at H=100 is every other round.
+interval = 200
+last_save_model_only = false
+
+[comm]
+# A round now includes a 16 GiB upload and a 32 GiB download, so a rank can sit in a
+# collective for a long time without anything being wrong.
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 1000
+steps = 20
+
+[fault_tolerance]
+# torchft off: Flower + FedMom does the outer step. See scripts/titan/README.md.
+enable = false
+
+[darl]
+url = ""
+site = ""
+# H. Larger than the 0.6B run's 100 because the exchange is 20x the bytes: H is the
+# knob that buys back WAN overhead. Watch drift_ratio in the round logs -- if it
+# climbs toward 1, replicas are diverging faster than averaging can reconcile and H
+# is too large.
+inner_steps = 400
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = true
+server_address = ""
+# The whole point of this config. 'inline' would refuse at startup with the
+# arithmetic: 16 GiB does not fit in a 2 GiB gRPC message.
+transport = "blob"

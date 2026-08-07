@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from .config import add_common_args, apply_config_file, resolve_output_dir
 from .darl.client import LeaseClient, LeaseSession
-from .darl.space import BlockSpace
+from .darl.space import BlockSpace, blocks_for_phase
 from .darl.torch_data import DARLDataSource, LeasedSampler
 from . import distributed as D
 from .logging_utils import get_logger, setup_logging
@@ -68,6 +68,19 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
         self.args = args
         self.device = device
         self.inner_steps = getattr(args, "inner_steps", None) or getattr(args, "diloco_inner_steps", 100)
+
+        # Built once, here -- not per phase inside the inner loop. AdamW's moment
+        # estimates are the whole reason to use it, and rebuilding the optimiser
+        # every phase threw them away before they could accumulate, which is why a
+        # 27-round WikiText run sat flat at loss ~3.15. DiLoCo keeps inner optimiser
+        # state across the outer step too (arXiv 2311.08105 section 2), so this
+        # deliberately survives from one round to the next.
+        self.optimizer = torch.optim.AdamW(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.args.lr,
+            weight_decay=self.args.weight_decay,
+        )
+        self._consumed_samples = 0
 
     def get_parameters(self, config: dict) -> list:
         return [p.detach().to(torch.float32).cpu().numpy() for p in self.model.parameters() if p.requires_grad]
@@ -118,17 +131,7 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 num_workers=self.args.num_workers,
             )
 
-            # Inner step optimizer
-            optimizer = torch.optim.AdamW(
-                [p for p in self.model.parameters() if p.requires_grad],
-                lr=self.args.lr,
-                weight_decay=self.args.weight_decay,
-            )
-
-            # Track total consumed samples across phases
-            if not hasattr(self, "_consumed_samples"):
-                self._consumed_samples = 0
-
+            optimizer = self.optimizer
             num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
             for batch in loader:
@@ -208,8 +211,24 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 f"avg loss: {avg_loss:.4f}, perplexity: {math.exp(min(20, avg_loss)):.2f}"
             )
 
-        num_samples_trained = max(1, step_count * self.args.batch_size)
-        return self.get_parameters(config={}), num_samples_trained, {"loss": float(avg_loss)}
+        # NOT max(1, ...). That floor is what turned "DARL ran dry and I trained
+        # nothing" into "I trained 1 sample at loss 0.0", which FedMom then folded
+        # into the average as a real result -- so a run continued for 23 rounds
+        # after the corpus was exhausted, reporting no failures while the global
+        # model sat frozen. A truthful zero makes Flower's sample-weighted average
+        # ignore this cluster instead.
+        num_samples_trained = step_count * self.args.batch_size
+        if step_count == 0 and D.is_leader():
+            logger.warning(
+                "inner phase ran 0 steps -- DARL has no more blocks for this "
+                "cluster. Reporting 0 samples so this round carries no weight; "
+                "the server should stop rather than keep aggregating nothing."
+            )
+        return (
+            self.get_parameters(config={}),
+            num_samples_trained,
+            {"loss": float(avg_loss), "steps": step_count, "exhausted": step_count == 0},
+        )
 
     def _execute_evaluation(self, parameters: list | None) -> tuple[float, int, dict]:
         if parameters:
@@ -240,7 +259,11 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 f"Perplexity: {perplexity:.2f}"
             )
 
-        return float(avg_loss), total_tokens, {"accuracy": float(perplexity)}
+        # Keyed "perplexity", not "accuracy". It was reported under the latter and
+        # the server prints that metric with a % sign, so a log line reading
+        # "Test Accuracy: 21.69%" was in fact perplexity 21.69 -- which made a model
+        # that never improved look like one at 21% accuracy and climbing.
+        return float(avg_loss), total_tokens, {"perplexity": float(perplexity)}
 
     def evaluate(self, parameters: list, config: dict) -> tuple[float, int, dict]:
         if D.world_size() > 1 and D.is_leader():
@@ -270,11 +293,14 @@ class DiLoCoLLMFlowerClient(fl.client.NumPyClient if HAS_FLWR else object):
                 self._execute_evaluation(params)
 
 
-def main() -> None:
-    if not HAS_FLWR:
-        logger.error("flwr is required on the cluster. Run: pip install flwr")
-        sys.exit(1)
+def build_parser() -> argparse.ArgumentParser:
+    """The LLM client's argument surface.
 
+    Split out of `main` so tests can check that every `configs/llm_*.yaml` parses
+    against the parser that will actually consume it. They were previously checked
+    against the CIFAR trainer's parser, which has no --seq-len or
+    --attn-implementation, so the check failed on keys that are perfectly valid.
+    """
     parser = argparse.ArgumentParser(description="Flower + DARL DiLoCo LLM Client")
     add_common_args(parser)
 
@@ -305,7 +331,15 @@ def main() -> None:
     g.add_argument("--save-every", type=int, default=10)
     g.add_argument("--log-every", type=int, default=50)
 
-    args = apply_config_file(parser)
+    return parser
+
+
+def main() -> None:
+    if not HAS_FLWR:
+        logger.error("flwr is required on the cluster. Run: pip install flwr")
+        sys.exit(1)
+
+    args = apply_config_file(build_parser())
 
     # Setup PyTorch distributed environment
     info = D.setup()
@@ -343,13 +377,47 @@ def main() -> None:
     except Exception:
         eval_dataset = None
 
-    space = BlockSpace(num_samples=len(train_dataset), block_size=100, seed=args.seed)
+    # block_size from the config rather than hardcoded at 100, and num_samples from
+    # the config when given -- both were previously ignored here, so --darl-block-size
+    # and --darl-num-samples were dead knobs that had to agree with the coordinator
+    # by luck.
+    block_size = getattr(args, "darl_block_size", None) or 100
+    num_samples = getattr(args, "darl_num_samples", None) or len(train_dataset)
+    if num_samples != len(train_dataset) and info.is_master:
+        log.warning(
+            "--darl-num-samples is %d but this cluster tokenised %d sequences; the "
+            "coordinator's index space wins, and any sequence beyond %d will never "
+            "be leased",
+            num_samples, len(train_dataset), num_samples,
+        )
+    space = BlockSpace(num_samples=num_samples, block_size=block_size, seed=args.seed)
     sampler = LeasedSampler()
+
+    # One lease per inner phase, sized from H and the batch geometry, instead of a
+    # flat 5 blocks. With blocks_per_phase=5 at block_size=100 a phase leased 500
+    # sequences, consumed inner_steps * batch_size of them, and then committed the
+    # whole span -- which is how a WikiText run committed all 1,152 blocks while
+    # actually training on roughly a tenth of them.
+    blocks_per_phase = blocks_for_phase(
+        space,
+        inner_steps=args.inner_steps,
+        batch_size=args.batch_size,
+        ranks=info.world_size,
+        grad_accum=max(1, getattr(args, "gradient_accumulation_steps", 1)),
+    )
+    if info.is_master:
+        log.info(
+            "darl: %s | %d blocks per phase (H=%d x batch %d x %d ranks)",
+            space.describe(), blocks_per_phase, args.inner_steps, args.batch_size,
+            info.world_size,
+        )
 
     if info.is_master:
         darl_token = args.darl_token or os.environ.get("DARL_TOKEN", "")
         client = LeaseClient(darl_url, cluster_id, token=darl_token)
-        session = LeaseSession(client, space, blocks_per_phase=5)
+        session = LeaseSession(
+            client, space, blocks_per_phase=blocks_per_phase, ranks=info.world_size
+        )
     else:
         session = None
 
@@ -358,7 +426,8 @@ def main() -> None:
         session=session,
         rank=info.rank,
         world_size=info.world_size,
-        blocks_per_phase=5,
+        seed=args.seed,
+        blocks_per_phase=blocks_per_phase,
     )
 
     # 2. Build Model

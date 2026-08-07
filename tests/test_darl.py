@@ -578,6 +578,120 @@ def _():
         assert held == granted, f"the retry leaked a second lease: {held} vs {granted}"
 
 
+@check("HTTP: a drain is not waited out when this session's own prefetch holds the blocks")
+def _():
+    """The deadlock this pins down, observed intermittently in the titan dataloader.
+
+    A phase's foreground acquire and the previous phase's prefetch are in flight at
+    the same time; the prefetch wins the last blocks in the pool; the foreground is
+    told `drain` and settles in to wait. Nothing can ever release it -- the only
+    thread that would consume and commit those blocks is the one asleep in
+    `acquire`, and the heartbeat keeps renewing the lease, so the TTL never expires
+    either. The pool looks drained from the outside while the session is sitting on
+    exactly the span it is waiting for.
+
+    Two blocks, one per phase, so there is precisely one winner to hand out.
+    """
+    space = BlockSpace(num_samples=8, block_size=4)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        client = LeaseClient(server.url, "solo", retries=1, timeout=5.0)
+        session = LeaseSession(client, space, blocks_per_phase=1, heartbeat=False)
+
+        first = session.acquire(wait=False)
+        assert first.granted, first
+        # Stage the next span the way next_phase() does, and let it land.
+        session.start_prefetch()
+        assert session._prefetch_done.wait(10.0), "the prefetch never finished"
+        assert session._prefetch is not None and session._prefetch.granted
+
+        # Retire the first span, so the only uncommitted blocks anywhere in the
+        # coordinator are the ones this session's own prefetch is holding.
+        for span in first.spans:
+            session.note_consumed(span.lease_id, span.end)
+        session.commit_all()
+        assert server.coordinator.table.committed == 1
+
+        # timeout=0.0 makes this an assertion about *ordering* rather than about the
+        # wall clock: the pending grant has to be adopted before the deadline is
+        # consulted. Before the fix this returned the drain reply, and with the
+        # production timeout=None it never returned at all.
+        result = session.acquire(wait=True, timeout=0.0)
+        assert result.granted, (
+            f"waited on a drain instead of consuming the span this session already "
+            f"holds: {result.status} ({result.reason})"
+        )
+        session.close(release=True)
+
+
+@check("HTTP: a caller collects the prefetch in flight instead of racing it")
+def _():
+    """The other half of the fix: don't create the race in the first place.
+
+    Two acquires from one cluster queued at the coordinator at once is what put the
+    session in the state above. `take_prefetched(wait=...)` closes it -- a caller
+    that wants the next span joins the request already in flight rather than issuing
+    a competing one. Here the prefetch is held mid-RPC, so waiting is the only thing
+    that can produce a span, and the acquire count proves nothing raced it.
+    """
+    space = BlockSpace(num_samples=40, block_size=4)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        client = LeaseClient(server.url, "gated", retries=1, timeout=5.0)
+        session = LeaseSession(client, space, blocks_per_phase=1, heartbeat=False)
+
+        inflight, release = threading.Event(), threading.Event()
+        acquires = []
+        real_acquire = client.acquire
+
+        def gated(*args, **kwargs):
+            acquires.append(1)
+            inflight.set()
+            release.wait(10.0)
+            return real_acquire(*args, **kwargs)
+
+        client.acquire = gated
+        session.start_prefetch()
+        assert inflight.wait(10.0), "the prefetch never issued its RPC"
+
+        # A non-blocking peek has nothing yet, which is exactly the moment a caller
+        # used to go off and acquire in parallel.
+        assert session.take_prefetched(wait=0.0) is None
+        release.set()
+
+        result = session.take_prefetched(wait=10.0)
+        assert result is not None and result.granted, result
+        assert len(acquires) == 1, f"{len(acquires)} acquires reached the coordinator"
+        assert len(server.coordinator.table.leases) == 1, "a second lease was taken"
+        session.close(release=True)
+
+
+@check("HTTP: releasing drops an uncollected prefetch as well as the held spans")
+def _():
+    """Otherwise a released span can still be handed to a phase.
+
+    `release` returns every lease this cluster holds, including whatever the
+    prefetcher won. If the session kept serving that grant afterwards, the cluster
+    would train blocks another cluster is now free to lease -- a duplicate, and one
+    nothing downstream would catch, because from the trainer's side the span looks
+    perfectly valid.
+    """
+    space = BlockSpace(num_samples=40, block_size=4)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        client = LeaseClient(server.url, "quitter", retries=1, timeout=5.0)
+        session = LeaseSession(client, space, blocks_per_phase=1, heartbeat=False)
+        session.start_prefetch()
+        assert session._prefetch_done.wait(10.0)
+        assert session._prefetch is not None and session._prefetch.granted
+
+        session.release_all()
+        assert session.take_prefetched(wait=0.0) is None, (
+            "a released span was still on offer"
+        )
+        assert not server.coordinator.table.leases
+
+
 @check("HTTP: the token is enforced")
 def _():
     from pww.darl.client import DarlError

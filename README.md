@@ -60,7 +60,53 @@ tests/
   test_local.py           CPU-only, single process, no allocation needed
   test_diloco_gloo.py     CPU-only, multi-process gloo -- DiLoCo collectives
   test_darl.py            CPU-only, incl. a real coordinator on a socket
+  test_titan.py           CPU-only, the torchtitan path (shards, leasing, wire)
 ```
+
+There is a second, newer training path built on **torchtitan** -- Qwen3 flavors,
+FSDP2, C4, and the OpenEuroLLM 128k tokenizer -- which keeps DARL and Flower/FedMom
+but replaces the hand-rolled HuggingFace inner loop. It needs its own environment
+(torch >= 2.9, which conflicts with this repo's deliberate 2.7.1 pin), so it is
+documented separately in **[scripts/titan/README.md](scripts/titan/README.md)**.
+Start there rather than here if that is what you are running.
+
+```
+third_party/torchtitan   submodule, pinned; never pip-installed (PYTHONPATH)
+configs/titan/           TOML run configs for the torchtitan path
+containers/titan-lumi.def  ROCm image for it (LUMI's own is on torch 2.7.1)
+scripts/titan/           tokenizer download, C4 staging/tokenising, launcher
+src/pww/
+  fedproto.py            the config/metric keys the two sides agree on
+  tensorio.py            tensor file with a streaming writer, so a model can be
+                         built or merged without ever holding it whole
+  delta.py               out-of-band transport: streaming HTTP + per-tensor
+                         DTensor gather/scatter
+  central/
+    blobstore.py         HTTP blob store daemon for multi-GB weight deltas
+    globalstate.py       durable global model, momentum, membership; the
+                         per-tensor FedMom merge
+  titan/
+    config.py            the [darl]/[flower]/[titan] JobConfig sections
+    __init__.py          pww_qwen3 train spec; vocab_size from the tokenizer
+    datasets.py          C4 registrations into torchtitan's DATASETS
+    shards.py            pre-tokenised memmap format DARL leases over
+    tokenize_corpus.py   the one-off offline tokenisation pass
+    darl_dataloader.py   DARL-leased torchtitan BaseDataLoader
+    trainer.py           torchtitan Trainer, one inner phase at a time
+    params.py            whole-state gather/scatter and the inline wire codec
+    flower_client.py     the cross-site outer round, over either transport
+    train.py             entrypoint (torchrun -m pww.titan.train)
+tests/
+  test_titan.py          shards, DARL leasing, wire codec
+  test_federation.py     blob store, elastic membership, both transports
+```
+
+The central node runs three daemons: the DARL coordinator (29510), the Flower
+aggregator (29511) and — only for models above ~1B, where weights no longer fit in a
+gRPC message — the blob store (29512). Membership is elastic by default: zero live
+replicas (every site queued), one, or several are all normal states, and the run
+survives a restart of the aggregator itself. See
+[scripts/titan/README.md](scripts/titan/README.md).
 
 Code lives in `$HOME`; data, checkpoints and logs live on scratch, symlinked as
 `data/` and `runs/`. Which scratch differs per site, and so do the limits:
@@ -182,6 +228,26 @@ of `H`:
 Set `--diloco-outer-optimizer sgd --diloco-outer-lr 1.0 --diloco-outer-momentum 0`
 and the outer step collapses to `θ⁽ᵗ⁾ = mean_i θᵢ⁽ᵗ⁾`, i.e. FederatedAveraging.
 That identity is what the test suite checks against.
+
+**The cross-site outer step is the same algorithm.** `diloco.py` runs `OuterOpt`
+inside one allocation as a collective; across sites, `central/strategy.py` applies
+FedMom on the central node instead. Those are not two different optimisers — FedMom's
+
+```
+v_next = w - eta*(w - w_avg);   w_next = v_next + beta*(v_next - v_prev)
+```
+
+is *algebraically* Nesterov momentum on the same Δ⁽ᵗ⁾. Substituting
+`m = v_t − v_(t−1)` gives `m_next = beta*m − eta*Δ` with `Δ` evaluated at
+`w = v + beta*m`, which is Nesterov's accelerated gradient in two-sequence form and
+matches `torch.optim.SGD(momentum=beta, nesterov=True)` exactly, first step included.
+`tests/test_federation.py` pins that equivalence against a heavy-ball control. Both
+paths therefore default to the paper's `lr` 0.7 / `momentum` 0.9.
+
+The cross-site path differs from the paper in two deliberate ways: deltas are
+weighted by tokens contributed rather than uniformly by `1/k` (the sites do different
+amounts of work per round, and this reduces to `1/k` when they do not), and `k`
+varies between rounds because membership is elastic.
 
 ### Rank layout
 
@@ -767,34 +833,50 @@ scaled to the replica: `k=2` gives 2 ranks per replica here against 4 on LUMI, s
 the rank count, so a 4-GPU node allows `k` of 1, 2 or 4 — `k=8` is a LUMI-only
 layout.
 
-## Extending to LLM Training (Implemented Pipeline)
+## Extending to LLM Training
 
-The ProjectWorldWide codebase natively supports **Causal Language Model (LLM) pre-training** on pre-tokenized datasets across Snellius (NVIDIA H100) and LUMI (AMD MI250X) using **Flower + DARL + HuggingFace `Trainer` + FSDP**.
+Two client paths share the same central node. **Prefer torchtitan for new work** —
+it is the only one that scales past ~1B parameters, and the operational detail is in
+**[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)** with the environment requirements in
+[scripts/titan/README.md](scripts/titan/README.md).
 
-### System Architecture for Multi-Site LLM Training
+| | inner loop | model | config | torch |
+|---|---|---|---|---|
+| **torchtitan** | `pww.titan.train` | Qwen3, FSDP2, C4, OpenEuroLLM 128k | `configs/titan/*.toml` | >= 2.9 |
+| **legacy HF** | `pww.train_llm_flower` | GPT-2 / LLaMA via `AutoModel` | `configs/llm_*.yaml` | 2.7.1 |
+
+The rest of this section documents the legacy path, which still runs unchanged.
+
+### System architecture
 
 ```
-                  +-------------------------------------------------+
-                  |            CENTRAL ORCHESTRATOR NODE            |
-                  |            (Ubuntu 24.04 @ 145.38.206.143)     |
-                  |  +-------------------+   +-------------------+  |
-                  |  | DARL Coordinator  |   | Flower Server     |  |
-                  |  | (Token Leases)    |   | (FedMom / FedAvg) |  |
-                  |  +---------+---------+   +---------^---------+  |
-                  +------------|-----------------------|------------+
-                               | Lease Spans           | FedMom Weights
-                               |                       |
-                 +-------------+------------+          |
-                 |                          |          |
-     +-----------v-----------+  +-----------v----------++
-     |    SNELLIUS CLUSTER   |  |     LUMI CLUSTER      |
-     |  NVIDIA H100 (SURF)   |  |  AMD MI250X (EuroHPC) |
-     |                       |  |                       |
-     |  train_llm_flower.py  |  |  train_llm_flower.py  |
-     |  (HuggingFace Trainer |  |  (HuggingFace Trainer |
-     |   FSDP + FlashAttn-2) |  |   FSDP + FlashAttn-2) |
-     +-----------------------+  +-----------------------+
+                +----------------------------------------------------------+
+                |                 CENTRAL ORCHESTRATOR NODE                |
+                |                (Ubuntu 24.04 @ 145.38.206.143)           |
+                |  +---------------+  +----------------+  +-------------+  |
+                |  | DARL          |  | Flower server  |  | Blob store  |  |
+                |  | coordinator   |  | PWWFedMom      |  | (>1B only)  |  |
+                |  | HTTP 29510    |  | gRPC 29511      |  | HTTP 29512  |  |
+                |  +-------+-------+  +--------^-------+  +------^------+  |
+                |          |                   |                 |         |
+                |   durable global model, momentum buffer, membership      |
+                |          |    (--state-dir: survives a restart)          |
+                +----------|-------------------|-----------------|---------+
+                           | lease spans       | deltas          | weights
+              +------------+---------+         |                 |
+              |                      |         |                 |
+  +-----------v----------+  +--------v---------+-----------------+--+
+  |   SNELLIUS CLUSTER   |  |            LUMI CLUSTER              |
+  |  NVIDIA H100 (SURF)  |  |       AMD MI250X (EuroHPC)           |
+  |  4 ranks/node        |  |       8 ranks/node (2 GCDs each)     |
+  +----------------------+  +--------------------------------------+
 ```
+
+Membership is **elastic**: zero live replicas (every site queued), one, or several
+are all normal states, and the run survives a restart of the aggregator itself.
+Weights move either inline in the gRPC message (capped at 2 GiB, so up to ~1B
+parameters) or out of band through the blob store, streamed one tensor at a time so
+peak memory tracks the largest tensor rather than the model.
 
 ---
 
@@ -805,8 +887,19 @@ The ProjectWorldWide codebase natively supports **Causal Language Model (LLM) pr
 3. **Zero Sample Duplication**: Before each inner phase, Snellius and LUMI lease fresh token block spans via lightweight 50-byte HTTP `/acquire` calls. Snellius and LUMI train on completely disjoint token blocks.
 4. **Decoupled Rounds & Epochs**: A single 1-epoch corpus supports hundreds or thousands of Flower outer aggregation rounds ($H$ inner steps per round) without repeating a single token.
 
-#### Note on Tokenizers (`src/pww/data/tokenizer.py`):
-For standard pre-trained LLMs (LLaMA-3, Qwen-2.5, GPT-2), tokenizers are loaded automatically from HuggingFace via `AutoTokenizer.from_pretrained()`. A custom `data/tokenizer.py` script is an optional utility helper if you wish to train a brand-new BPE / SentencePiece tokenizer from scratch on raw text files.
+#### Note on tokenizers
+This path loads tokenizers from HuggingFace via `AutoTokenizer.from_pretrained()` and
+tokenises on the fly in [src/pww/data/text.py](src/pww/data/text.py). There is no
+tokenizer-training utility in the repo; earlier revisions of this file described a
+`src/pww/data/tokenizer.py` that was never written.
+
+The torchtitan path works differently and deliberately so: tokenisation is a
+**one-off offline pass** ([scripts/titan/tokenize_c4.sh](scripts/titan/tokenize_c4.sh))
+that writes fixed-width memmap shards plus a manifest, and DARL leases over window
+indices into those shards. That is what makes a lease mean the same thing at both
+sites — the manifest digest covers the tokenizer hash and `seq_len`, so a
+disagreement is refused at registration rather than silently producing two different
+partitions of "the corpus".
 
 ---
 
@@ -856,12 +949,26 @@ Inside each HPC cluster, the inner training loop is managed by HuggingFace `Trai
 Stream outer round metrics on the Central VM:
 ```bash
 tail -f runs/central/flower.log
+./scripts/central_node/status_central_services.sh   # merge round + per-cluster membership
 ```
 
 Log outputs report:
-* **Aggregated Training Loss**: Weighted average loss across clusters.
-* **Token Throughput**: Tokens processed per second (`tokens/sec`).
-* **Validation Perplexity**: Evaluated on test tokens ($\text{PPL} = \exp(\text{loss})$).
+* **`merge round`** — the count of *successful merges*, not Flower's round number. A
+  round in which every site was killed at walltime consumes a round number and
+  changes nothing.
+* **Aggregated training loss** weighted by tokens, with perplexity alongside it.
+  Perplexity is reported under its own name; an earlier version reported it in a
+  field labelled `accuracy`.
+* **Tokens per round**, which is 0 for a round that trained nothing and is not
+  merged. Worth watching: an earlier WikiText run reported `loss 0.0` on 1 sample
+  for 23 consecutive rounds, because a `max(1, ...)` floor turned "the corpus is
+  exhausted" into "one sample" and the global model sat frozen while the log showed
+  no failures.
+* **`drift`** — `||local − global|| / ||global||` per round. The one number that says
+  whether `H` was chosen sensibly.
+
+See [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md) §5 for annotated log excerpts and §6
+for the failure table.
 
 ## Reading results
 
