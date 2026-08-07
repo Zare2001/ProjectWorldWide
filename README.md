@@ -164,10 +164,13 @@ commands** — including first-time setup, which this omits.
     scripts/titan/stage_c4.sh               fetch C4 shards
     scripts/titan/tokenize_c4.sh            -> fixed-width memmap + manifest
                                             -> prints the WINDOW COUNT
+    scp .../manifest.json <central>:/tmp/   carry that count in a file rather
+                                            than by hand -- a few hundred bytes
   THEN, on the central VM
-    start_central_services.sh               needs that window count as
-                                            NUM_SAMPLES; both sites must agree
-                                            or registration is refused by digest
+    start_central_services.sh               MANIFEST=/tmp/manifest.json, or the
+                                            count directly as NUM_SAMPLES. Both
+                                            sites must agree or registration is
+                                            refused by the block-space digest
   THEN, at each site, independently
     sbatch scripts/{lumi,snellius}/job_titan_diloco.sh
                                             queue whenever; the server waits

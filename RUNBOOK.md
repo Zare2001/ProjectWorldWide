@@ -125,6 +125,18 @@ is a startup failure, not a silent problem:
 | **windows** | `NUM_SAMPLES` on the central VM |
 | **manifest digest** | must match at both sites |
 
+**Better than writing the window count down: copy `manifest.json` to the central VM.**
+
+```bash
+scp "$PWW_DATA_DIR/c4-tokenizer-128k-2048/manifest.json" <central>:/tmp/
+```
+
+That one file — a few hundred bytes — is all the central node needs from the corpus, and
+`MANIFEST=` in Part 2 reads the count out of it. The central VM never opens the shards, so
+there is nothing else to copy. It also removes the only step in the whole sequence whose
+failure mode is a mistyped seven-digit number, which the digest guard catches, but not
+until a site has already spent its queue wait trying to register.
+
 Both sites must end up with the **same window count**. Either run the tokenisation
 identically at each (it is deterministic given the same inputs) or run it once and
 `rsync` the output directory across — the second is cheaper and removes the risk.
@@ -159,6 +171,15 @@ wikitext-103 placeholder — it does not pick this count up by itself. Restart i
 
 Runs on `145.38.206.143`. Must be up **before** either site's job starts training.
 
+**The one thing this node needs from Part 1 is the window count.** It never reads the
+corpus — no shards, no tokenizer, no GPU — so the only input that has to travel from a
+site is that single number. Supply it either way:
+
+| | |
+|---|---|
+| `MANIFEST=/path/to/manifest.json` | reads `num_windows` out of the file you copied in Part 1. Preferred — nothing to mistype. |
+| `NUM_SAMPLES=<windows>` | the number itself, as printed by `tokenize_c4.sh`. Wins if both are given. |
+
 ```bash
 cd ~/ProjectWorldWide
 
@@ -166,14 +187,25 @@ cd ~/ProjectWorldWide
 # FEDERATION_GUIDE.md #1 has the measured per-flavor table.
 
 # <= ~1B parameters
-NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
 AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
   ./scripts/central_node/start_central_services.sh
 
 # above ~1B -- also brings up the blob store on 29512
-TRANSPORT=blob NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+TRANSPORT=blob MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
 AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
   ./scripts/central_node/start_central_services.sh
+
+# or with the count typed in directly, if you have no manifest to hand
+NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+```
+
+It echoes what it used, so this is checkable rather than assumed:
+
+```
+num_samples 2750000 read from /tmp/manifest.json
 ```
 
 Then confirm, and take the token the sites need:

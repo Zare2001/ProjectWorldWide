@@ -66,6 +66,45 @@ not a token or document count, and `SEED` must match `darl.space_seed` at every
 site. A disagreement is refused at registration by `BlockSpace.digest` rather than
 silently producing two different meanings for position *p*.
 
+### The central node needs one number from the corpus, and nothing else
+
+It has no GPU, never opens a shard, and never loads a tokenizer. What it does need is the
+window count, because that is the size of the index space DARL partitions — and it must be
+the *same* space every site computes, or exactly-once leasing means nothing.
+
+That makes the count a genuine cross-machine dependency, and the only one this node has on
+the data. `BlockSpace.digest` covers `(num_samples, block_size, seed)`, so a mismatch is
+caught — but at registration, which is after a site has queued, been scheduled and started.
+The check is doing its job; the cost is a wasted queue wait.
+
+So carry the number in a file rather than by hand. `MANIFEST=` reads `num_windows` out of
+the manifest the tokenisation already wrote:
+
+```bash
+# once, from a site login node -- a few hundred bytes
+scp "$PWW_DATA_DIR/c4-tokenizer-128k-2048/manifest.json" <central>:/tmp/
+
+MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+```
+
+`NUM_SAMPLES` still wins if both are set, and the script echoes which it used. This is also
+why the manifest is worth keeping rather than treating as a build artefact: it is the
+authoritative record of what the block space *should* be, and the file whose digest both
+sites are compared against.
+
+Two notes on getting this wrong, since neither is obvious:
+
+- **A shorter corpus is not caught by the digest** if `NUM_SAMPLES` was set to match it.
+  The digest proves the sites agree with each other and with the coordinator; it cannot
+  prove the number describes the corpus you meant. Reading it from the manifest is what
+  closes that gap.
+- **Re-tokenising changes the count.** `--max-files 32` and `--max-files 64` are different
+  block spaces, so the coordinator must be restarted with `DARL_FRESH=1` and the new
+  count. A resume would refuse, which is the good outcome; the bad one is passing the new
+  count *and* the flag while a site still holds the old shards.
+
 ### Which transport, and why the choice exists
 
 Inline transport all-gathers the full parameter set onto every rank and puts it in
