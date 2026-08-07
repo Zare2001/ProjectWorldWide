@@ -56,7 +56,7 @@ from typing import Any
 
 from ..logging_utils import get_logger, setup_logging
 from .space import BlockSpace
-from .table import HEARTBEAT_DIVISOR, MIN_TTL, LeaseTable
+from .table import HEARTBEAT_DIVISOR, MIN_TTL, ClusterBusy, LeaseTable
 
 DEFAULT_PORT = 8760
 # Mutations that are cheap to lose are batched; a commit is fsynced because
@@ -205,8 +205,14 @@ class Coordinator:
         table = self.table
         try:
             if op == "register":
+                # check_conflict=False: this register was already authorised when it was
+                # served. Re-testing liveness against a historic timestamp would either
+                # refuse a legitimate replay or pass meaninglessly -- but the incarnation
+                # still has to be recorded, so a restart does not blank it out.
                 table.register(payload["cluster"], digest=payload.get("digest", ""),
-                               ranks=payload.get("ranks", 0), now=now)
+                               ranks=payload.get("ranks", 0),
+                               incarnation=payload.get("incarnation", ""),
+                               check_conflict=False, now=now)
             elif op == "acquire":
                 table.register(payload["cluster"], now=now)
                 for lease in payload["leases"]:
@@ -214,6 +220,9 @@ class Coordinator:
             elif op == "commit":
                 table.commit(payload["cluster"], payload["lease"], payload["through"], now=now)
             elif op == "release":
+                # No incarnation on replay: the journalled release was already
+                # authorised when it was served, and the record's current incarnation
+                # after a restart is whatever registered last, which would refuse it.
                 table.release(payload["cluster"], payload.get("lease"), now=now)
             elif op == "heartbeat":
                 table.heartbeat(payload["cluster"], payload.get("progress"),
@@ -236,10 +245,12 @@ class Coordinator:
                 payload["cluster"],
                 digest=payload.get("digest", ""),
                 ranks=int(payload.get("ranks", 0)),
+                incarnation=str(payload.get("incarnation", "")),
                 now=now,
             )
             self._log_op("register", {"cluster": record.cluster_id,
                                       "digest": payload.get("digest", ""),
+                                      "incarnation": record.incarnation,
                                       "ranks": record.ranks}, now)
             return {
                 "cluster": record.cluster_id,
@@ -249,6 +260,8 @@ class Coordinator:
                 "heartbeat_divisor": HEARTBEAT_DIVISOR,
                 "committed": self.table.committed,
                 "known_clusters": sorted(self.table.clusters),
+                "incarnation": record.incarnation,
+                "incarnations": record.incarnations,
             }
 
     def acquire(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -318,9 +331,13 @@ class Coordinator:
     def release(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             now = time.time()
-            blocks = self.table.release(payload["cluster"], payload.get("lease"), now=now)
+            blocks = self.table.release(
+                payload["cluster"], payload.get("lease"),
+                incarnation=str(payload.get("incarnation", "")), now=now,
+            )
             self._log_op("release", {"cluster": payload["cluster"],
-                                     "lease": payload.get("lease")}, now)
+                                     "lease": payload.get("lease"),
+                                     "incarnation": payload.get("incarnation", "")}, now)
             return {"released": blocks, "epoch": self.table.epoch}
 
     def status(self) -> dict[str, Any]:
@@ -440,6 +457,11 @@ class _Handler(BaseHTTPRequestHandler):
             # A lease that no longer exists. 409 rather than 404 because the
             # client's own state is what is stale, and it has to act on that.
             self._send(409, {"error": str(exc), "code": "lease_gone"})
+        except ClusterBusy as exc:
+            # 503, not 409: this is temporary by construction -- it clears when the
+            # incumbent's leases expire -- so the right client behaviour is to keep
+            # retrying, and 5xx is what the client's retry loop already acts on.
+            self._send(503, {"error": str(exc), "code": "cluster_busy"})
         except PermissionError as exc:
             self._send(403, {"error": str(exc), "code": "not_owner"})
         except ValueError as exc:

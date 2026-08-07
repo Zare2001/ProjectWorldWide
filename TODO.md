@@ -32,6 +32,7 @@ matches the plan it came from.
 | average BatchNorm buffers, handle `num_batches_tracked` | only `named_parameters()` is exchanged. Correct for Qwen3, which is RMSNorm with learned weights and no accumulated statistics; its buffers are RoPE tables recomputed at init. This is also exactly why the ResNet path pins outer momentum to 0.0 — a BatchNorm model *would* need its buffers, and momentum can push averaged weights outside the convex hull of the client weights. A model with learned buffer state needs this revisited. |
 | SSH push/pull between sites, Snellius orchestrating | Flower gRPC on 29511, plus an HTTP blob store on 29512 for models above ~1B. Neither site talks to the other; both talk to the central VM. |
 | "if one site's job dies, does the round stall or proceed?" | proceeds. `min-clients: 1`, and 0/1/N live replicas are all normal states. A requeued site's first stale delta is rejected by `base_round` rather than averaged in. |
+| — (not foreseen) | **two jobs at one site.** Partial-node allocations make co-location routine, and the cluster id was the site name alone. Resolved with a per-session incarnation token judged by liveness — a stale incumbent means a requeue and is taken over, a live one means a second concurrent job and is refused. Plus `--replica` to avoid the refusal, release scoped to the incarnation, and a duplicated-id guard in `aggregate_fit` for runs that never register with DARL. |
 
 Verified by measurement, CPU-only (`tests/test_darl.py`, `test_titan.py`,
 `test_federation.py`):
@@ -46,6 +47,9 @@ Verified by measurement, CPU-only (`tests/test_darl.py`, `test_titan.py`,
       DiLoCo's outer gradient to 1.9e-06, and is distinguishable from heavy ball
 - [x] 0 / 1 / N live replicas, restart durability, stale-delta rejection,
       mismatched-model refusal
+- [x] two concurrent jobs at one site: refused at registration, requeue after a clean
+      exit and after a hard crash, release scoped to the incarnation, and a duplicated
+      cluster id in one aggregation round
 - [x] per-tensor DTensor gather/scatter on 2 gloo ranks with genuinely sharded
       parameters
 
@@ -110,28 +114,51 @@ is the smallest thing that exercises it.
       batch across two sites is roughly twice one site's. Whether to scale for that
       is a research question, not an infrastructure one.
 
-### 6. Concurrent jobs at one site need a protocol decision
+### 6. Costs we accepted, and one invariant that must not be tidied away
 
-Two jobs submitted to one facility can share a node, and the DARL cluster id defaults
-to the site name alone. `--replica a` / `--replica b` on `scripts/titan/run_train.sh`
-works today and is documented, but it is opt-in: forget it and the failure is silent
-(the first job to exit releases the second's live leases; both upload deltas to the
-same blob name and one overwrites the other). Both behaviours are pinned in
-`tests/test_darl.py`.
+Not open work — decisions already made, recorded because the reasoning is not visible
+from the code and someone will otherwise reverse them by accident.
 
-Closing it properly means the coordinator must distinguish "the requeued me" from "a
-second concurrent me", and those look identical today — which is not an oversight:
-excluding the job id from the cluster id is what lets a requeued job keep the measured
-throughput that sizes its grants.
+#### A hard crash now costs a bounded requeue delay
 
-- [ ] decide between: (a) leave it opt-in and rely on `--replica`; (b) add a random
-      per-session incarnation token, sent with register/heartbeat/release, so a release
-      is scoped to the incarnation that made it and a new incarnation supersedes an old
-      one; (c) refuse a second concurrent registration outright, which is simplest but
-      would break the requeue-while-stale-leases-exist case, i.e. the normal walltime
-      path
-- [ ] whichever is chosen, the delta blob name needs the same distinction, or two jobs
-      still overwrite each other on the central node
+Refusing a second live process on a cluster id (see the superseded-plans table) uses
+liveness as its discriminator, and liveness is only knowable up to a TTL. A job that
+exits cleanly releases on SIGTERM and its successor takes the id back immediately. A job
+that dies **hard** — OOM kill, node failure, a hung rank — leaves leases on the books,
+and the coordinator cannot tell that from "slow" until they expire. So the requeued job
+is refused for up to one TTL, then takes over.
+
+That is a real regression in requeue latency, taken deliberately in exchange for
+eliminating silent duplicate training. It is bounded, it is logged with the reason, and
+`--replica` avoids it entirely. Both paths are tested (`tests/test_darl.py`: requeue
+after a clean exit, requeue after a hard crash).
+
+- [ ] if the delay ever actually hurts, the lever is a shorter `min_ttl` for the
+      *cluster* liveness window than for lease expiry — they are the same number today
+      only because one predicate served both purposes
+- [ ] a `--force-takeover` escape hatch is the other option, but it hands the operator a
+      way to cause exactly the corruption this prevents, so it should not be added
+      speculatively
+
+#### Journal replay must record the incarnation without checking it
+
+`Coordinator._replay` calls `register(..., check_conflict=False)`. Both halves of that
+are load-bearing and they pull in opposite directions:
+
+- **skip the check** — a replayed register was already authorised when it was served,
+  and re-testing liveness against a historic timestamp is meaningless. Worse, it raises
+  `ClusterBusy`, which is not in the replay handler's `except` clause, so recovery would
+  crash.
+- **still record the value** — a live client registers exactly once, at session start,
+  and never again. Drop the incarnation on replay and a coordinator restart leaves the
+  incumbent's field blank, which disables the concurrent-job guard for the remainder of
+  the run. The failure it prevents is silent, so nothing would reveal that it had
+  stopped working.
+
+Pinned by "a coordinator restart keeps the incumbent's incarnation, from snapshot or
+journal", which covers both recovery paths — the value can come from the snapshot or the
+write-ahead journal depending on which side of the last snapshot the register fell — and
+was verified to fail when the incarnation is dropped from the replay call.
 
 ### 7. Smaller things
 

@@ -350,29 +350,53 @@ correctness issue rather than a performance one.
 
 The cluster id defaults to the site name alone (`lumi`), deliberately: a job killed at
 walltime and requeued must be recognised as the same cluster so it keeps the measured
-throughput that sizes its grants. The cost is that two *concurrent* jobs at one site
-are indistinguishable to the coordinator, and two things then go wrong silently:
+throughput that sizes its grants. `SLURM_JOB_ID` changes on requeue, so it cannot be
+part of the id — which means nothing in the environment is *both* stable across a
+requeue *and* unique across concurrent jobs.
 
-- `/release` with no lease id is scoped to the cluster id, so the first job to exit
-  hands back the second job's **live** leases. The second keeps training blocks that
-  are back in the free pool — duplicate work, and nothing downstream catches it.
-- the delta blob is named `(run, round, cluster)`, so both jobs upload to the same
-  object each round and one silently overwrites the other. A whole round of one job's
-  work disappears.
-
-So pass `--replica`:
+**So pass `--replica` when you run two jobs at one site:**
 
 ```bash
 scripts/titan/run_train.sh --replica a --config ...   # cluster id "lumi-a"
 scripts/titan/run_train.sh --replica b --config ...   # cluster id "lumi-b"
 ```
 
-Both are pinned in `tests/test_darl.py` — one check asserts the collision happens
-without distinct ids, the other that distinct ids isolate the two jobs. Closing the
-hazard properly needs a per-incarnation token in the protocol so the coordinator can
-tell "the requeued me" from "a second concurrent me"; that trade is recorded in
-TODO.md rather than made unilaterally, because the requeue behaviour it would touch is
-load-bearing.
+That is the path to be on. Forgetting it used to corrupt the run silently; it is now
+refused instead, by three independent guards.
+
+**1. Registration refuses a second live process.** Each session generates a random
+*incarnation* id and sends it with `/register`. A register under a different
+incarnation is judged by whether the incumbent is still alive — heartbeating, or
+holding leases:
+
+| incumbent | verdict |
+|---|---|
+| stale | a **requeue**. Take over, keep the record, so committed count, EWMA rate and cursor survive exactly as before |
+| live | a **second concurrent job**. Refuse with `503 cluster_busy`, naming `--replica` |
+
+503 rather than 409 because it clears on a timer, so the client's existing retry loop
+keeps trying. The honest cost: after a *hard* crash (OOM kill, node failure — no
+SIGTERM, no release) the requeued job waits out one TTL before it can take over,
+because dead and merely slow are indistinguishable until the leases expire. A bounded
+wait replacing silent duplicate training, and `--replica` avoids it entirely.
+
+**2. `/release` with no lease id is scoped to the incarnation**, not just the id. It is
+the one operation whose blast radius is every lease a name owns, so a process that
+does not currently hold the id cannot hand back leases it never had.
+
+**3. `aggregate_fit` drops a round's contributions if two clients claim one id.** This
+closes a path the coordinator cannot see: `pww_qwen3_local` uses torchtitan's own
+dataloader, so a config with `flower.enable = true` and no DARL never registers. There
+the failure is not a lost round but a *wrong* one — delta blobs are named
+`(run, round, cluster)`, so both clients wrote the same object and one overwrote the
+other; two contributions then point at one file and the merge counts the survivor
+twice with the combined weight of both. The other sites' round still proceeds; only
+the duplicated id is dropped, because with one file and two token counts there is no
+correct weight to give it.
+
+All of it is pinned in `tests/test_darl.py` and `tests/test_federation.py`: second
+concurrent refused, requeue after a clean exit, requeue after a hard crash, release
+scoping, and the duplicated-id round.
 
 ### Failures
 
@@ -385,7 +409,8 @@ load-bearing.
 | `blob store: 507` | the volume behind `--blob-root` is below its reserve | point `--state-dir`/`BLOB_ROOT` at a larger volume. `GlobalState.log_disk_budget` prints the requirement at startup. |
 | lease expiry after a walltime kill | Slurm killed a site mid-epoch | self-healing: uncommitted blocks return to the pool on TTL expiry, and the surviving site finishes the epoch. Releasing on SIGTERM makes it milliseconds instead of a full TTL. |
 | `Connection refused` on 29511 | daemons not running | `./scripts/central_node/start_central_services.sh` |
-| two jobs at one site, one loses a round of work or trains duplicate blocks | both registered under the same DARL cluster id | pass `--replica a` / `--replica b`. See above. |
+| `503 cluster_busy` at startup | another live process holds this cluster id — a second concurrent job at the same site, or a requeue whose predecessor died hard and whose leases have not expired yet | pass `--replica a` / `--replica b` to give each job its own id. If it is a requeue, it clears itself within one TTL. See above. |
+| `N clients reported as cluster X` in the aggregator log | two Flower clients using one cluster id, on a run with no DARL coordinator to refuse it | same fix. That round's contributions under that id were dropped rather than merged wrongly. |
 
 ---
 
@@ -408,9 +433,9 @@ python3 tests/test_federation.py
 
 | suite | checks | covers |
 |---|---|---|
-| `test_darl.py` | 39 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race |
-| `test_titan.py` | 17 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec |
-| `test_federation.py` | 21 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; the outer step against `SGD(nesterov=True)` |
+| `test_darl.py` | 45 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
+| `test_titan.py` | 19 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec, config feasibility |
+| `test_federation.py` | 23 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; the outer step against `SGD(nesterov=True)` |
 | `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
 | `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
 

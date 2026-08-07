@@ -61,7 +61,7 @@ of the fork is logged and ignored.
 from __future__ import annotations
 
 from collections.abc import Callable
-from logging import INFO, WARNING
+from logging import ERROR, INFO, WARNING
 from pathlib import Path
 from typing import Any
 
@@ -347,6 +347,43 @@ if HAS_FLWR:
 
         # --- blob transport ------------------------------------------------
 
+        def _reject_duplicate_clusters(self, contributions, server_round):
+            """Refuse a round where two clients claim the same cluster id.
+
+            The DARL coordinator normally stops this at registration -- two live
+            processes cannot hold one cluster id. But a run can reach here without ever
+            registering: `pww_qwen3_local` uses torchtitan's own dataloader, so a config
+            with `flower.enable = true` and no DARL has no coordinator to refuse it.
+
+            Left unchecked the damage is not a lost round, it is a *wrong* one. Delta
+            blobs are named (run, round, cluster), so both clients wrote to the same
+            object and one overwrote the other. Two Contributions then point at the
+            same file, and the merge sums `share_i * delta` over both -- so the
+            surviving delta is counted twice, carrying the combined weight of both
+            jobs, while the other's work is gone. Nothing about the result looks wrong.
+
+            Dropping the whole duplicated set is deliberate: with one file and two token
+            counts there is no way to tell which job's weights survived, so there is no
+            correct weight to give it. Skipping the round costs H steps from those
+            clusters; merging it corrupts the global model.
+            """
+            seen: dict[str, int] = {}
+            for item in contributions:
+                seen[item.cluster] = seen.get(item.cluster, 0) + 1
+            duplicated = {name for name, count in seen.items() if count > 1}
+            if not duplicated:
+                return contributions
+
+            for name in sorted(duplicated):
+                log(ERROR,
+                    "Round %s: %d clients reported as cluster %r. Their delta blobs "
+                    "share a name, so one silently overwrote the other and the "
+                    "survivor would be counted twice. Dropping every contribution "
+                    "under that id. Give each concurrent job its own cluster id: "
+                    "--replica a / --replica b on scripts/titan/run_train.sh.",
+                    server_round, seen[name], name)
+            return [item for item in contributions if item.cluster not in duplicated]
+
         def _aggregate_blob(self, server_round, results, metrics):
             assert self.state is not None and self.blob_root is not None
 
@@ -383,6 +420,8 @@ if HAS_FLWR:
                         blob=blob,
                     )
                 )
+
+            contributions = self._reject_duplicate_clusters(contributions, server_round)
 
             if not contributions:
                 log(WARNING,

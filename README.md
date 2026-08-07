@@ -20,6 +20,175 @@ and pinning variable from the environment rather than assuming ROCm or CUDA.
 | interconnect | Slingshot (`hsn`) + aws-ofi-rccl | InfiniBand |
 | MIOpen cache workaround | required | not applicable |
 
+## How it works
+
+### The problem
+
+Two supercomputers, ~1,500 km apart, that between them have far more compute than
+either alone. Ordinary data parallelism cannot use both: it all-reduces gradients
+**every step**, so it needs a fat, low-latency path between every pair of ranks. Over a
+WAN that path is the run.
+
+Three separate things break, and each needs its own answer:
+
+| what breaks | why | the answer here |
+|---|---|---|
+| gradient exchange every step | ~100 ms RTT and shared bandwidth, against a step of tens of ms | **DiLoCo** — exchange every `H` steps instead of every step |
+| both sites train the same data | each site's dataloader shards *its own* ranks, so running the same code twice is two redundant runs, not one distributed one | **DARL** — a coordinator leases disjoint token ranges at run time |
+| sites are not up at the same time | HPC queues. One site waits hours while the other idles | **elastic membership** — 0, 1 or N live sites are all normal states |
+
+### The shape of it
+
+One central VM with no GPUs coordinates; the two facilities never talk to each other.
+
+```
+                    +--------------------------------------------------+
+                    |        CENTRAL VM  (145.38.206.143)              |
+                    |        no GPUs -- it only coordinates            |
+                    |                                                  |
+                    |  DARL coordinator            :29510              |
+                    |    the only map of which token blocks are        |
+                    |    unassigned / leased / committed               |
+                    |                                                  |
+                    |  Flower + PWWFedMom          :29511              |
+                    |    theta_global, momentum buffer, membership     |
+                    |    -- all durable on disk, so a restart or an    |
+                    |    empty queue loses nothing                     |
+                    |                                                  |
+                    |  blob store                  :29512              |
+                    |    only for models above ~1B                     |
+                    +---------^--------------------------^-------------+
+                              |                          |
+             leases, then     |                          |    leases, then
+             weight deltas    |                          |    weight deltas
+                              |                          |
+        +---------------------+-----+      +-------------+----------------------+
+        |  LUMI          (EuroHPC)  |      |  SNELLIUS              (SURF)      |
+        |  8 x MI250X GCD, ROCm     |      |  4 x H100, CUDA                    |
+        |  torchtitan + FSDP2       |      |  torchtitan + FSDP2                |
+        |                           |      |                                    |
+        |  H inner steps on the     |      |  H inner steps on the              |
+        |  blocks IT leased         |      |  blocks IT leased                  |
+        +---------------------------+      +------------------------------------+
+
+                 no traffic between the two facilities, ever
+```
+
+Inside a facility, nothing is unusual: FSDP2 shards the model across that site's GPUs
+and all-reduces every step over the local interconnect, which is what it is good at.
+Only the *outer* loop crosses the WAN.
+
+### The two loops
+
+```
+  inner loop  (per site, no WAN traffic)         outer loop  (H times less often)
+  ---------------------------------------        ------------------------------------
+  for h in 1..H:                                 delta_i = theta_i - theta_global
+      x ~ the blocks this site leased                    (one file, streamed)
+      loss = f(x, theta_i)                        --> central VM
+      theta_i = AdamW(theta_i, grad)
+                                                 theta_global = OuterOpt(
+  H = 100 by default, so the WAN is                  theta_global,
+  touched once per ~100 optimiser steps                sum_i p_i * delta_i)
+
+                                                 <-- every site loads the new
+                                                     theta_global and starts again
+```
+
+`OuterOpt` is Nesterov momentum at the paper's `lr` 0.7 / `momentum` 0.9. The FedMom
+update the server applies is *algebraically* Nesterov, not merely momentum-flavoured —
+pinned against `torch.optim.SGD(nesterov=True)` in `tests/test_federation.py`. Set
+`momentum 0.0, lr 1.0` and it collapses to exact FedAvg, which is the control arm.
+
+### One outer round, end to end
+
+```
+  SITE                                CENTRAL VM
+  ----                                ----------
+  1. POST /acquire  ----------------->  pick disjoint blocks, mark them LEASED
+                    <-----------------  span [4096, 5120)          [DARL]
+     Only rank 0 asks; it broadcasts the span to the other ranks, which each
+     derive their own slice locally. A 512-rank job makes one RPC, not 512.
+
+  2. load theta_global  <------------  whatever round the server is on now
+     Unconditional, so a site joining at round 400 cannot contribute an
+     update derived from stale weights.
+
+  3. H inner steps .................  (no coordinator traffic at all)
+     Heartbeats continue in the background; the reply is an *instruction* --
+     it carries the authoritative lease end, which may have shrunk because a
+     faster site stole the untouched tail.
+
+  4. write checkpoint, THEN commit  ->  mark blocks COMMITTED
+     That order is the exactly-once guarantee: {weights, committed blocks}
+     fail together, so a crash loses the same work from both sides.
+
+  5. delta = theta_local - theta_global
+     PUT delta  ---------------------->  check base_round is current, then merge:
+                                           v = w - eta*(w - sum_i p_i*theta_i)
+                                           w = v + beta*(v - v_prev)
+                                         publish theta_global, round += 1
+```
+
+Step 5's `base_round` check is what makes requeueing safe: a site killed at walltime
+and restarted hours later computed its delta against a global model that has moved on,
+and that delta is **rejected** rather than averaged in. Its next round is current.
+
+### Who is "a site", exactly
+
+A cluster id, and it is worth being careful about because two things with different
+lifetimes were once the same field:
+
+- **the logical stream** — `lumi`. Must be *stable across a requeue*, because the
+  coordinator sizes a cluster's grants from its measured throughput and a new id on
+  every resubmission throws that history away. `SLURM_JOB_ID` therefore cannot be part
+  of it.
+- **the process** — a random *incarnation* id, generated per session. Must be *unique
+  among concurrent jobs*.
+
+Nothing in the environment is both, which is why the two are separate. Running two jobs
+at one facility — routine, since both sites allow partial-node allocations — needs
+`--replica a` / `--replica b` to give each its own cluster id. Forget it and the
+coordinator refuses the second one rather than letting two processes quietly release
+each other's leases and overwrite each other's deltas. `FEDERATION_GUIDE.md` has the
+three guards and what each catches.
+
+### The operational workflow
+
+```
+  ONCE, offline (login node, no allocation)
+    scripts/titan/download_tokenizer.sh     OpenEuroLLM 128k
+    scripts/titan/stage_c4.sh               fetch C4 shards
+    scripts/titan/tokenize_c4.sh            -> fixed-width memmap + manifest
+                                            -> prints the WINDOW COUNT
+  THEN, on the central VM
+    start_central_services.sh               needs that window count as
+                                            NUM_SAMPLES; both sites must agree
+                                            or registration is refused by digest
+  THEN, at each site, independently
+    sbatch scripts/{lumi,snellius}/job_titan_diloco.sh
+                                            queue whenever; the server waits
+  WHILE RUNNING
+    status_central_services.sh              merge round + per-cluster membership
+    tail -f runs/central/flower.log         rounds, loss, drift, tokens
+  ENDS WHEN
+    DARL runs out of blocks -> the dataloader stops rather than looping on
+    empty work, which is what an earlier run did for 23 silent rounds
+```
+
+### Where each piece lives
+
+| concern | code |
+|---|---|
+| which tokens a site may train on | [src/pww/darl/](src/pww/darl/) — `table.py` is the state machine, `server.py` the coordinator, `client.py` the site side |
+| the inner training loop | [src/pww/titan/trainer.py](src/pww/titan/trainer.py) — wraps torchtitan's `Trainer` to run `H` steps at a time |
+| the outer step | [src/pww/central/globalstate.py](src/pww/central/globalstate.py) — the streaming FedMom merge; [strategy.py](src/pww/central/strategy.py) — the round protocol |
+| getting weights across | [src/pww/titan/params.py](src/pww/titan/params.py) inline, [src/pww/delta.py](src/pww/delta.py) out-of-band |
+| single-site DiLoCo (no WAN) | [src/pww/diloco.py](src/pww/diloco.py) — same algorithm as a collective inside one allocation |
+
+Operational detail is in **[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**; the torchtitan
+environment requirements are in **[scripts/titan/README.md](scripts/titan/README.md)**.
+
 ## Layout
 
 ```

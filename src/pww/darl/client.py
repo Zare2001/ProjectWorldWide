@@ -58,6 +58,17 @@ class DarlError(RuntimeError):
     """Any coordinator interaction that failed and will not be retried."""
 
 
+class ClusterBusy(DarlError):
+    """Another live process is already registered under this cluster id.
+
+    Two concurrent jobs sharing an id corrupt each other's leases and overwrite each
+    other's weight deltas, so the coordinator refuses rather than letting it happen
+    quietly. Temporary by construction -- it clears when the incumbent's leases expire --
+    so the client retries before giving up. Give each job its own id to avoid the wait:
+    `--replica a` / `--replica b` on scripts/titan/run_train.sh.
+    """
+
+
 class LeaseGone(DarlError):
     """The lease expired and its blocks went back to the pool.
 
@@ -184,6 +195,15 @@ class LeaseClient:
         self.rtt_s = 0.0
         self.calls = 0
         self.retried = 0
+        # Identifies this *process*, where cluster_id identifies the logical stream.
+        # The two have different lifetimes and conflating them is what let two
+        # concurrent jobs at one site silently release each other's leases: a requeued
+        # job must keep the cluster id (its measured throughput sizes its grants) but
+        # must not be mistaken for its own predecessor. Random rather than derived,
+        # because nothing in the environment is both stable across a requeue and unique
+        # across concurrent jobs -- SLURM_JOB_ID changes on requeue, and the site name
+        # does not change between jobs.
+        self.incarnation = uuid.uuid4().hex
         # Compute nodes usually have http_proxy set so that they can reach the
         # internet through a slow gateway. The coordinator is normally *inside*
         # the facility, and routing to it through that proxy either fails or adds
@@ -208,6 +228,7 @@ class LeaseClient:
         log = get_logger()
 
         last_error: Exception | None = None
+        busy = ""
         for attempt in range(self.retries):
             request = urllib.request.Request(f"{self.url}{route}", data=data,
                                              headers=headers,
@@ -232,6 +253,13 @@ class LeaseClient:
                     message, code = detail, ""
                 if exc.code == 409 or code == "lease_gone":
                     raise LeaseGone(message) from None
+                if code == "cluster_busy":
+                    # A 5xx, so it falls through to the retry loop below -- which is
+                    # what we want, since the incumbent's leases expire on a timer.
+                    # Remembered so that exhausting the retries reports *this* rather
+                    # than a generic "coordinator unreachable", which would send the
+                    # next person looking at the network.
+                    busy = message
                 if exc.code == 401:
                     raise DarlError(
                         f"coordinator rejected the token. Set DARL_TOKEN (or "
@@ -250,6 +278,10 @@ class LeaseClient:
                         route, last_error, attempt + 1, self.retries, delay)
             time.sleep(delay)
 
+        if busy:
+            raise ClusterBusy(
+                f"{busy} (still refused after {self.retries} attempts)"
+            )
         raise DarlError(
             f"coordinator unreachable at {self.url} after {self.retries} attempts: "
             f"{last_error}. The training job cannot get new data ranges; the span it "
@@ -266,6 +298,7 @@ class LeaseClient:
             "ranks": ranks,
             "num_samples": space.num_samples,
             "block_size": space.block_size,
+            "incarnation": self.incarnation,
         })
         if reply.get("num_blocks") not in (None, space.num_blocks):
             raise DarlError(
@@ -320,7 +353,11 @@ class LeaseClient:
                                       "through": int(through)})
 
     def release(self, lease_id: str | None = None) -> dict[str, Any]:
-        return self._call("/release", {"cluster": self.cluster_id, "lease": lease_id})
+        # The incarnation matters on a release-everything: it is the one operation
+        # whose blast radius is every lease a cluster id owns, so the coordinator
+        # checks that the asker is the process that currently holds the id.
+        return self._call("/release", {"cluster": self.cluster_id, "lease": lease_id,
+                                       "incarnation": self.incarnation})
 
     def advance_epoch(self) -> dict[str, Any]:
         """Tell the coordinator to advance to the next epoch, recycling all blocks."""

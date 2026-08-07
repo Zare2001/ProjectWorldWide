@@ -630,6 +630,102 @@ if HAS_FLWR:
             assert config[proto.TRANSPORT] == proto.TRANSPORT_BLOB
             assert proto.GLOBAL_BLOB not in config
 
+    @check("two clients reporting the same cluster id in one round are dropped, not merged")
+    def _():
+        """Closes a path the DARL coordinator cannot see.
+
+        Registration now refuses a second live process on one cluster id, but a run can
+        reach the aggregator without ever registering: `pww_qwen3_local` uses
+        torchtitan's own dataloader, so a config with `flower.enable = true` and no DARL
+        has no coordinator to refuse it.
+
+        Left unchecked the result is not a lost round, it is a *wrong* one. Delta blobs
+        are named (run, round, cluster), so both clients wrote the same object and one
+        overwrote the other; two Contributions then point at one file and the merge sums
+        `share_i * delta` over both, counting the survivor twice with the combined weight
+        of both jobs. Nothing about the output looks wrong, which is why this has to be
+        refused rather than warned about.
+        """
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blobs = root / "blobs"
+            blobs.mkdir()
+            state = GlobalState(root / "state")
+            write_state_dict(root / "init.pww", _model())
+            state.initialise_from_file(root / "init.pww")
+            strategy = FedMom(
+                transport=proto.TRANSPORT_BLOB, state=state, blob_root=blobs,
+                blob_url="http://vm:29512", run_id="t", keep_rounds=0,
+            )
+
+            # Two jobs at one site, both calling themselves "lumi", so both wrote this
+            # one blob and only the last writer's content is in it.
+            shared = proto.delta_blob("t", 0, "lumi")
+            _delta(blobs / shared, 0.2, 0)
+            # A third, correctly-named site in the same round.
+            _delta(blobs / proto.delta_blob("t", 0, "snellius"), 0.3, 0)
+
+            before = state.round
+            params, metrics = strategy.aggregate_fit(
+                1,
+                [
+                    (None, _fit_res({proto.CLUSTER: "lumi",
+                                     proto.DELTA_BLOB: shared,
+                                     proto.BASE_ROUND: 0}, 400)),
+                    (None, _fit_res({proto.CLUSTER: "lumi",
+                                     proto.DELTA_BLOB: shared,
+                                     proto.BASE_ROUND: 0}, 500)),
+                    (None, _fit_res({proto.CLUSTER: "snellius",
+                                     proto.DELTA_BLOB: proto.delta_blob("t", 0, "snellius"),
+                                     proto.BASE_ROUND: 0}, 600)),
+                ],
+                [],
+            )
+
+            # The round still happens -- snellius did nothing wrong and its tokens
+            # should not be thrown away because another site was misconfigured.
+            assert state.round == before + 1, state.round
+            # But only snellius is in it. Both "lumi" entries are gone: with one file
+            # and two token counts there is no way to know whose weights survived, so
+            # there is no correct weight to give it.
+            assert set(state.clusters) == {"snellius"}, sorted(state.clusters)
+            assert state.clusters["snellius"].tokens_total == 600
+
+    @check("a duplicated cluster id does not stop the other sites' round")
+    def _():
+        """And if the duplicated pair is *all* there is, the model must not move."""
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blobs = root / "blobs"
+            blobs.mkdir()
+            state = GlobalState(root / "state")
+            write_state_dict(root / "init.pww", _model())
+            state.initialise_from_file(root / "init.pww")
+            strategy = FedMom(
+                transport=proto.TRANSPORT_BLOB, state=state, blob_root=blobs,
+                blob_url="http://vm:29512", run_id="t", keep_rounds=0,
+            )
+            shared = proto.delta_blob("t", 0, "lumi")
+            _delta(blobs / shared, 0.2, 0)
+
+            with state.open_global() as handle:
+                original = {k: handle.get(k, torch.float32).clone() for k in handle.keys}
+
+            strategy.aggregate_fit(
+                1,
+                [(None, _fit_res({proto.CLUSTER: "lumi", proto.DELTA_BLOB: shared,
+                                  proto.BASE_ROUND: 0}, n)) for n in (400, 500)],
+                [],
+            )
+            assert state.round == 0, "the model moved on a round with nothing valid in it"
+            with state.open_global() as handle:
+                for key, value in original.items():
+                    assert torch.equal(handle.get(key, torch.float32), value), key
+
     @check("blob round: seed, merge, publish, then hand the new global to both sites")
     def _():
         from pww.central.strategy import FedMom

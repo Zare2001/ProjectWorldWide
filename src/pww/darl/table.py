@@ -168,6 +168,8 @@ class ClusterRecord:
     rtt_s: float = 0.0
     rate: float = 0.0             # committed blocks/s, EWMA
     cursor: int = 0               # next position to prefer, for cache locality
+    incarnation: str = ""         # which *process* is currently this cluster
+    incarnations: int = 0         # how many have held it, i.e. requeue count
     _last_commit_at: float = 0.0
 
     @property
@@ -205,6 +207,16 @@ class DoubleFreeError(RuntimeError):
     Fatal on purpose: it means two leases covered the same position, which is the
     one bug this whole module exists to prevent. Better to stop the run than to
     train on silently duplicated data.
+    """
+
+
+class ClusterBusy(RuntimeError):
+    """A second live process tried to register under an id one already holds.
+
+    Distinct from a digest mismatch, which is permanent and means the operator has
+    two different corpora: this one clears by itself when the incumbent's leases
+    expire, so the client is told to wait rather than to give up. See
+    `LeaseTable.register`.
     """
 
 
@@ -444,12 +456,25 @@ class LeaseTable:
 
     # --- cluster registration ---------------------------------------------
 
+    def is_live(self, record: ClusterRecord, now: float) -> bool:
+        """Whether a cluster is plausibly still running: heartbeating, or holding work.
+
+        The same predicate `_active_clusters` uses to decide who counts when the pool
+        is split proportionally, factored out because `register` needs it too -- it is
+        the only thing that distinguishes a requeued job from a second concurrent one.
+        """
+        holding = any(lease.cluster == record.cluster_id for lease in self.leases.values())
+        window = max(self.min_ttl, record.rtt_s * TTL_BETA)
+        return holding or (now - record.last_seen) < window
+
     def register(
         self,
         cluster_id: str,
         *,
         digest: str = "",
         ranks: int = 0,
+        incarnation: str = "",
+        check_conflict: bool = True,
         now: float | None = None,
     ) -> ClusterRecord:
         """Announce a cluster. Idempotent -- a requeued job re-registers.
@@ -457,6 +482,33 @@ class LeaseTable:
         Refuses a digest mismatch. That check is the difference between "these two
         clusters disagree about the permutation and will duplicate half the corpus"
         being a startup error and being an invisible data-quality bug.
+
+        Also refuses a *second concurrent process* claiming an id that a live one
+        already holds. Both facilities allow partial-node allocations, so two jobs
+        submitted to one site can run at once, and the cluster id defaults to the site
+        name alone -- deliberately, because excluding the Slurm job id is what lets a
+        requeued job keep the measured throughput that sizes its grants. The cost was
+        that two concurrent jobs were indistinguishable here, and the damage was
+        silent: `release` is scoped by cluster id, so the first to exit handed back the
+        other's live leases and it went on training blocks that were back in the pool.
+
+        `incarnation` is a per-process random id, which makes the two cases
+        distinguishable by liveness rather than by identity:
+
+            predecessor stale  ->  a requeue. Take over, keep the record, so rate,
+                                   cursor and commit history survive as before.
+            predecessor live   ->  a second concurrent job. Refuse, and say so.
+
+        Clients that send no incarnation get the old behaviour, so this cannot break a
+        mixed-version deployment mid-run.
+
+        `check_conflict=False` records the incarnation without the liveness test, which
+        is what journal replay needs: replay re-applies a register that was already
+        authorised when it was served, against wall-clock timestamps that make `is_live`
+        meaningless. It still has to record the value, or a coordinator restart would
+        leave the incumbent's incarnation blank and silently disable this check for the
+        rest of the run -- a live client registers once, at session start, and never
+        again.
         """
         now = self._now(now)
         if digest and self.digest and digest != self.digest:
@@ -471,6 +523,29 @@ class LeaseTable:
             record = ClusterRecord(cluster_id=cluster_id, joined_at=now, last_seen=now)
             self.clusters[cluster_id] = record
             self._record("registered", cluster=cluster_id)
+        elif incarnation and record.incarnation and incarnation != record.incarnation:
+            if check_conflict and self.is_live(record, now):
+                held = sum(l.outstanding for l in self.leases.values()
+                           if l.cluster == cluster_id)
+                raise ClusterBusy(
+                    f"cluster id {cluster_id!r} is already held by a running process "
+                    f"(last seen {now - record.last_seen:.0f}s ago, {held} blocks "
+                    f"outstanding). Two concurrent jobs sharing one cluster id corrupt "
+                    f"each other's leases and overwrite each other's weight deltas, so "
+                    f"this is refused rather than allowed to happen quietly. Give each "
+                    f"job its own id: pass --replica a / --replica b to "
+                    f"scripts/titan/run_train.sh, or set --darl.cluster_id directly. "
+                    f"If the previous job really is dead, this clears by itself once "
+                    f"its leases expire."
+                )
+            # Stale predecessor: a requeue, which is the normal walltime path. Its
+            # leases are reaped on their own deadlines; nothing to do but take over.
+            self._record("superseded", cluster=cluster_id,
+                         silent_for=round(now - record.last_seen, 1))
+
+        if incarnation and incarnation != record.incarnation:
+            record.incarnation = incarnation
+            record.incarnations += 1
         record.last_seen = now
         if ranks:
             record.ranks = int(ranks)
@@ -672,6 +747,7 @@ class LeaseTable:
         cluster_id: str,
         lease_id: str | None = None,
         *,
+        incarnation: str = "",
         now: float | None = None,
     ) -> int:
         """Give back the uncommitted tail of one lease, or of all of them.
@@ -681,12 +757,25 @@ class LeaseTable:
         the way out returns its blocks in milliseconds instead of after a whole
         TTL. On a 15-minute TTL that is the difference between the surviving
         clusters idling for 15 minutes and not idling at all.
+
+        A release-everything is scoped to the *incarnation* that asks, not just to the
+        cluster id. `register` normally stops two live processes sharing an id in the
+        first place, but a client from before that check -- or one that registered while
+        the incumbent looked stale and then raced it -- must not be able to hand back
+        leases it never held. Belt and braces on the one operation whose blast radius
+        is every lease a name owns.
         """
         now = self._now(now)
-        targets = (
-            [lease_id] if lease_id
-            else [lid for lid, l in self.leases.items() if l.cluster == cluster_id]
-        )
+        if lease_id:
+            targets = [lease_id]
+        else:
+            targets = [lid for lid, l in self.leases.items() if l.cluster == cluster_id]
+            record = self.clusters.get(cluster_id)
+            if (incarnation and record is not None and record.incarnation
+                    and incarnation != record.incarnation):
+                self._record("release_refused", cluster=cluster_id,
+                             leases=len(targets))
+                return 0
         returned = 0
         for lid in targets:
             lease = self.leases.get(lid)
@@ -876,12 +965,9 @@ class LeaseTable:
 
     def _active_clusters(self) -> list[ClusterRecord]:
         """Clusters plausibly still alive: heartbeating, or holding a lease."""
-        holding = {lease.cluster for lease in self.leases.values()}
         now = self._clock()
-        return [
-            c for c in self.clusters.values()
-            if c.cluster_id in holding or (now - c.last_seen) < max(self.min_ttl, c.rtt_s * TTL_BETA)
-        ] or list(self.clusters.values())
+        return [c for c in self.clusters.values()
+                if self.is_live(c, now)] or list(self.clusters.values())
 
     # --- observability ----------------------------------------------------
 

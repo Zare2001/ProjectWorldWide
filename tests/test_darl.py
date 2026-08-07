@@ -29,12 +29,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from pww.darl.client import ClusterBusy as ClientClusterBusy  # noqa: E402
 from pww.darl.client import LeaseClient, LeaseSession  # noqa: E402
 from pww.darl.server import Coordinator, make_server  # noqa: E402
 from pww.darl.space import BlockSpace, blocks_for_phase  # noqa: E402
 from pww.darl.table import (  # noqa: E402
     TTL_ALPHA,
     TTL_BETA,
+    ClusterBusy,
     DoubleFreeError,
     IntervalSet,
     LeaseTable,
@@ -56,6 +58,23 @@ def check(name: str):
         return fn
 
     return decorator
+
+
+def expect_raises(exc_type, fn, *, contains: str = ""):
+    """Assert `fn` raises `exc_type`, and that the message says something useful.
+
+    The `contains` check is the point as often as the type is: a refusal whose message
+    does not name the fix leaves the next person guessing.
+    """
+    try:
+        fn()
+    except exc_type as exc:
+        if contains and contains not in str(exc):
+            raise AssertionError(
+                f"raised {exc_type.__name__} but message lacked {contains!r}: {exc}"
+            ) from None
+        return
+    raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
 
 
 class Clock:
@@ -482,6 +501,49 @@ def _():
         recovered.table.verify()
 
 
+@check("a coordinator restart keeps the incumbent's incarnation, from snapshot or journal")
+def _():
+    """Otherwise the concurrent-job guard silently switches itself off.
+
+    `register` only refuses a second live process when it knows the incumbent's
+    incarnation, and a live client registers exactly once -- at session start -- and
+    never again. So if a restart lost that field, the guard would be disabled for the
+    rest of the run, and the failure it prevents is silent to begin with.
+
+    Both orderings matter, because the value can be recovered from either half of
+    Psi: in the snapshot if the register happened before the last one, in the
+    write-ahead journal if after. Journal replay deliberately skips the liveness test
+    (`check_conflict=False`, since re-testing it against a historic timestamp is
+    meaningless) but must still record the value, which is exactly what this pins.
+    """
+    for snapshot_before_register in (False, True):
+        where = "journal" if snapshot_before_register else "snapshot"
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Coordinator(LeaseTable(60, min_ttl=600.0, first_grant_fraction=1.0),
+                                tmp, snapshot_interval=0.0)
+            if snapshot_before_register:
+                first.save_snapshot(force=True)
+            first.register({"cluster": "lumi", "ranks": 4, "incarnation": "job-1"})
+            first.acquire({"cluster": "lumi", "blocks": 20, "ttl": 600.0,
+                           "request_id": "r1"})
+            if not snapshot_before_register:
+                first.save_snapshot(force=True)
+
+            recovered = Coordinator.load(tmp, expect_blocks=60, grace_s=600.0)
+            assert recovered is not None, where
+            record = recovered.table.clusters.get("lumi")
+            assert record is not None, f"cluster record lost via {where}"
+            assert record.incarnation == "job-1", (
+                f"incarnation lost via {where}: {record.incarnation!r}. The guard "
+                f"against a second concurrent job is now disabled for this run."
+            )
+            expect_raises(
+                ClusterBusy,
+                lambda: recovered.register({"cluster": "lumi", "incarnation": "job-2"}),
+                contains="--replica",
+            )
+
+
 @check("replaying the journal twice does not double-count")
 def _():
     with tempfile.TemporaryDirectory() as tmp:
@@ -692,93 +754,175 @@ def _():
         assert not server.coordinator.table.leases
 
 
-@check("HTTP: two concurrent jobs sharing a cluster id corrupt each other's leases")
+@check("a second concurrent process is refused the cluster id a live one holds")
 def _():
-    """Documents a hazard rather than a fixed bug, so it asserts what DOES happen.
+    """Both HPCs allow partial-node allocations, so two jobs submitted to one site can
+    run at once -- and the cluster id defaults to the site name alone.
 
-    Both HPCs allow partial-node allocations, so submitting two jobs to one facility
-    can land them on the same node -- and the DARL cluster id defaults to the site name
-    alone, on purpose, so a requeued job keeps the throughput history that sizes its
-    grants. The consequence is that two *concurrent* jobs at one site are indis-
-    tinguishable to the coordinator, and /release with no lease id is scoped to the
-    cluster id: the first job to exit hands back the second job's live leases, which
-    then get handed to someone else while the second job is still training them.
+    That default is deliberate: excluding SLURM_JOB_ID is what lets a requeued job keep
+    the measured throughput that sizes its grants. The cost used to be that two
+    *concurrent* jobs were indistinguishable here, and the damage was silent -- release
+    is scoped by cluster id, so the first to exit handed back the other's live leases
+    and it went on training blocks that were back in the free pool.
 
-    Nothing downstream catches that, which is why scripts/titan/run_train.sh has
-    --replica and why it is documented as a correctness flag. If the protocol ever
-    grows a per-incarnation token (see TODO.md) this check should start failing, and
-    the fix is to assert isolation instead.
+    The incarnation is what separates the two cases, by liveness rather than identity.
     """
-    space = BlockSpace(num_samples=400, block_size=10)
-    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
-                 first_grant_fraction=1.0) as server:
-        table = server.coordinator.table
+    lease_table, clock = table(400, min_ttl=600.0)
+    lease_table.register("lumi", incarnation="job-1")
+    lease_table.acquire("lumi", 4, ttl=600.0)
 
-        # Two jobs, same site, no --replica: the same cluster id.
-        job_a = LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
-                             space, blocks_per_phase=2, heartbeat=False)
-        job_b = LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
-                             space, blocks_per_phase=2, heartbeat=False)
+    try:
+        lease_table.register("lumi", incarnation="job-2")
+    except ClusterBusy as exc:
+        # The message has to name the fix, or the next person has a mystery.
+        assert "--replica" in str(exc), exc
+    else:
+        raise AssertionError("a second live process must not take the id")
 
-        granted_a = job_a.acquire(wait=False)
-        granted_b = job_b.acquire(wait=False)
-        assert granted_a.granted and granted_b.granted
-        # Disjoint spans, so the coordinator is at least not double-granting.
-        blocks_a = {p for s in granted_a.spans for p in range(s.start, s.end)}
-        blocks_b = {p for s in granted_b.spans for p in range(s.start, s.end)}
-        assert not (blocks_a & blocks_b), "the coordinator granted the same block twice"
+    # And the incumbent is untouched: still its incarnation, still holding its leases.
+    assert lease_table.clusters["lumi"].incarnation == "job-1"
+    assert all(l.cluster == "lumi" for l in lease_table.leases.values())
+    assert sum(l.blocks for l in lease_table.leases.values()) == 4
 
-        # Job A hits walltime and releases on the way out, as it should.
-        job_a.release_all()
 
-        # Job B is still running and still believes it holds its span -- but the
-        # coordinator has already given those blocks back to the free pool.
-        assert job_b.spans, "job B still thinks it holds a lease"
-        for lease_id in job_b.spans:
-            assert lease_id not in table.leases, (
-                "expected job A's release to have taken job B's lease with it; if this "
-                "now holds, the protocol gained per-job isolation and this check "
-                "should be inverted"
-            )
-        # Which is the actual damage: every one of job B's blocks is back in the free
-        # pool, claimable by anyone, while job B goes on training them. Asserted against
-        # the block states rather than by acquiring again -- the allocator prefers a
-        # cluster's cursor, so where a third cluster happens to be handed blocks from
-        # says nothing about which ones are claimable.
-        from pww.darl.table import BlockState
+@check("a requeue after a clean exit takes the id back, keeping its throughput history")
+def _():
+    """The normal walltime path, and the reason this cannot simply refuse a second
+    registration outright (option (c) in TODO.md).
 
-        assert all(table._state[p] == BlockState.UNASSIGNED for p in blocks_b), (
-            "job B's blocks should be back in the pool after job A's release"
-        )
+    A job killed at walltime releases on SIGTERM and comes back with a new incarnation.
+    It must be recognised as the same cluster -- the ClusterRecord carries the committed
+    count, the EWMA rate and the cursor, and `_grant_size` halves the first grant of a
+    cluster with no measured throughput. Losing that would make every requeue start
+    from scratch.
+    """
+    lease_table, clock = table(400, min_ttl=10.0)
+    lease_table.register("lumi", incarnation="job-1")
+    grant = lease_table.acquire("lumi", 4, ttl=10.0)
+    for lease in grant.leases:
+        lease_table.commit("lumi", lease.lease_id, lease.end)
+    before = lease_table.clusters["lumi"]
+    committed, cursor = before.blocks_committed, before.cursor
+    assert committed == 4
+
+    # Clean exit: releases what it holds, so nothing is outstanding.
+    lease_table.release("lumi", incarnation="job-1")
+    clock.advance(60.0)                      # past the liveness window
+
+    lease_table.register("lumi", incarnation="job-2")
+    after = lease_table.clusters["lumi"]
+    assert after.incarnation == "job-2"
+    assert after.incarnations == 2, after.incarnations
+    assert after.blocks_committed == committed, "requeue lost the committed count"
+    assert after.cursor == cursor, "requeue lost the locality cursor"
+    assert not after.is_new, "requeue must not be treated as a cluster with no history"
+
+
+@check("a requeue after a hard crash waits out the dead job's leases, then takes over")
+def _():
+    """The case that makes this a wait rather than a rejection.
+
+    A job that dies without SIGTERM -- OOM kill, node failure -- leaves leases behind,
+    and the coordinator cannot tell dead from merely slow until they expire. So the
+    requeued job is refused meanwhile, which is a bounded wait of one TTL, and then
+    succeeds. That is the price of the check, and it is worth stating plainly: it
+    replaces silent duplicate training with a delay the operator can avoid entirely by
+    passing --replica.
+    """
+    lease_table, clock = table(400, min_ttl=10.0)
+    lease_table.register("lumi", incarnation="job-1")
+    lease_table.acquire("lumi", 4, ttl=10.0)
+
+    # Hard crash: no release, no heartbeat. The leases are still on the books.
+    clock.advance(5.0)
+    expect_raises(ClusterBusy,
+                  lambda: lease_table.register("lumi", incarnation="job-2"),
+                  contains="outstanding")
+
+    # Past the deadline the leases are reapable, and reap() runs at the top of every
+    # mutating RPC -- so by the time an acquire happens the id is free again.
+    clock.advance(120.0)
+    lease_table.reap()
+    lease_table.register("lumi", incarnation="job-2")
+    assert lease_table.clusters["lumi"].incarnation == "job-2"
+    assert not lease_table.leases, "the dead job's leases should have been reaped"
+
+
+@check("release-everything is scoped to the process that holds the id, not the name")
+def _():
+    """Belt and braces on the one operation whose blast radius is a whole cluster id.
+
+    `register` normally stops two live processes sharing an id, but a client from before
+    that check -- or one that registered while the incumbent looked stale and then raced
+    it -- must not be able to hand back leases it never held.
+    """
+    lease_table, clock = table(400, min_ttl=600.0)
+    lease_table.register("lumi", incarnation="job-1")
+    grant = lease_table.acquire("lumi", 4, ttl=600.0)
+    held = {lease.lease_id for lease in grant.leases}
+
+    # A stranger claiming the same name gets nowhere.
+    assert lease_table.release("lumi", incarnation="job-2") == 0
+    assert {lid for lid in lease_table.leases} == held, "a stranger released real leases"
+
+    # The incumbent still can.
+    assert lease_table.release("lumi", incarnation="job-1") == 4
+    assert not lease_table.leases
 
 
 @check("HTTP: distinct replica ids keep two jobs at one site isolated")
 def _():
-    """The fix available today: --replica in scripts/titan/run_train.sh.
+    """What --replica buys, over HTTP with real sessions: no refusal at all, and each
+    job's release confined to its own leases.
 
-    With distinct cluster ids the release is scoped to the job that made it, which is
-    what makes two concurrent jobs at one facility safe.
+    This is the path an operator should be on -- the incarnation check is the safety
+    net for forgetting it, not a substitute for it, because a refusal still costs a
+    queue slot.
     """
     space = BlockSpace(num_samples=400, block_size=10)
     with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
                  first_grant_fraction=1.0) as server:
-        table = server.coordinator.table
+        lease_table = server.coordinator.table
         job_a = LeaseSession(LeaseClient(server.url, "lumi-a", retries=1, timeout=5.0),
                              space, blocks_per_phase=2, heartbeat=False)
         job_b = LeaseSession(LeaseClient(server.url, "lumi-b", retries=1, timeout=5.0),
                              space, blocks_per_phase=2, heartbeat=False)
         assert job_a.acquire(wait=False).granted
-        granted_b = job_b.acquire(wait=False)
-        assert granted_b.granted
+        assert job_b.acquire(wait=False).granted
 
         job_a.release_all()
 
         for lease_id in job_b.spans:
-            assert lease_id in table.leases, (
+            assert lease_id in lease_table.leases, (
                 f"job A's release took lease {lease_id} from job B despite distinct "
                 f"cluster ids"
             )
-        assert all(l.cluster == "lumi-b" for l in table.leases.values())
+        assert all(l.cluster == "lumi-b" for l in lease_table.leases.values())
+
+
+@check("HTTP: a second concurrent session is refused, and says how to fix it")
+def _():
+    """The same refusal end to end, so the 503 -> ClusterBusy mapping is covered.
+
+    503 rather than 409 on purpose: this clears on a timer, so the client's existing
+    retry loop should keep trying rather than give up. `retries=1` here only to keep
+    the check fast.
+    """
+    space = BlockSpace(num_samples=400, block_size=10)
+    with _Server(space.num_blocks, digest=space.digest(), min_ttl=600.0,
+                 first_grant_fraction=1.0) as server:
+        first = LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
+                             space, blocks_per_phase=2, heartbeat=False)
+        assert first.acquire(wait=False).granted
+
+        def second() -> None:
+            LeaseSession(LeaseClient(server.url, "lumi", retries=1, timeout=5.0),
+                         space, blocks_per_phase=2, heartbeat=False)
+
+        expect_raises(ClientClusterBusy, second, contains="--replica")
+        # The incumbent kept everything.
+        assert all(l.cluster == "lumi" for l in server.coordinator.table.leases.values())
+        assert first.spans
 
 
 @check("HTTP: the token is enforced")
