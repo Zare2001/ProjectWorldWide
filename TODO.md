@@ -160,7 +160,68 @@ journal", which covers both recovery paths — the value can come from the snaps
 write-ahead journal depending on which side of the last snapshot the register fell — and
 was verified to fail when the incarnation is dropped from the replay call.
 
-### 7. Smaller things
+### 7. Two sites can train on different corpora and nothing notices
+
+The coordinator compares `BlockSpace.digest` at registration, which covers
+`num_samples : block_size : seed : shuffle : epoch` plus the permutation. That proves the
+clusters agree about what position *p* means **positionally**. It says nothing about what
+the bytes at *p* are.
+
+`Manifest.digest` is the one that covers corpus identity — `format : seq_len : window :
+dtype : vocab_size : tokenizer_sha256 : num_windows` — and the coordinator never sees it.
+The two digests overlap in exactly one field: `num_windows`, which arrives as
+`num_samples`, stripped of everything that gives it meaning.
+
+So this passes every check in the system:
+
+> LUMI and Snellius have the same window count and **different tokenizers** — one
+> regenerated under a different `transformers` version, so `tokenizer.json` hashes
+> differently. Block-space digests match, so registration succeeds. Each site also passes
+> its own `shards.verify_compatible`, because that compares a manifest against the files
+> sitting next to it, and locally both are self-consistent. The sites lease disjoint
+> positions over *different corpora*, train on different token ids, and the outer step
+> averages the results.
+
+It does not crash, and no log line is wrong. It shows up, if at all, as a loss curve that
+is merely worse than it should be.
+
+**The only defence today is manual**: comparing manifest digests across sites before
+submitting (RUNBOOK.md Part 1) and `sha256sum tokenizer.json` against the manifest's
+`tokenizer.sha256` after any transfer. Both are in the docs, neither is enforced, and the
+window in which it matters is exactly when someone is moving 22 GiB between facilities
+under time pressure.
+
+The fix is to send the corpus digest at registration and have the coordinator pin it.
+Prototyped and then reverted deliberately, because it touches the registration path of a
+run that is about to start; the notes below are what the implementation has to get right.
+
+- [ ] `LeaseTable.register(..., corpus_digest="")`: **first writer wins.** The coordinator
+      cannot be given an expected value — it holds no shards, no tokenizer and no manifest
+      by design, and [that is a property worth keeping](FEDERATION_GUIDE.md), so the first
+      cluster to report one defines the run and later clusters are checked against it
+- [ ] an empty digest must stay legal and unchecked. The legacy HuggingFace path
+      (`train_llm_flower.py`) and `darl/simulate.py` have no manifest at all, and a
+      mixed-version deployment must not break mid-run. Those clusters are simply not
+      covered, and the status output should make that visible rather than implying they are
+- [ ] persist it in `snapshot()`/`restore()`. This is the same trap as the incarnation in
+      § 6: a live client registers **once**, at session start, so a coordinator restart that
+      forgets the pinned value disables the guard for the remainder of the run — and the
+      failure it prevents is silent, so nothing would reveal that it had stopped working
+- [ ] thread it through `LeaseClient.register` → `LeaseSession` → `darl_dataloader`, which
+      is the only caller that has a `Manifest` in scope
+- [ ] `ValueError`, so it surfaces as `400 bad_request` exactly like the block-space
+      mismatch, and the message must name both clusters and say to compare manifests and
+      rsync the tokenizer rather than regenerate it
+- [ ] tests: a second cluster with a differing corpus digest is refused; the same digest is
+      accepted; an empty digest is accepted and does not pin; the pin survives a snapshot
+      round-trip **and** journal replay. Verify each by reverting the guard and watching the
+      test fail, not merely by watching it pass
+
+Worth stating plainly, since it argues for doing this rather than relying on the runbook:
+every other cross-site disagreement in this system is caught by a machine at startup. This
+one is caught by a human remembering to run two commands.
+
+### 8. Smaller things
 
 - [ ] `--keep-rounds` prunes old blobs; confirm the pruning actually keeps disk
       bounded over a 200-round run rather than only in the test
