@@ -175,6 +175,49 @@ def gather_full_state(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     return state
 
 
+def _report_dtensor_boundary(part: nn.Module, state: dict[str, torch.Tensor]) -> None:
+    """Say which side of the DTensor boundary each parameter sits on, before the copy.
+
+    Diagnostic only -- this converts nothing. `set_model_state_dict` raises
+
+        aten.copy_.default: got mixed torch.Tensor and DTensor
+
+    without naming which operand is which, and the message is symmetric, so the
+    obvious reading (model sharded, incoming plain) may be backwards. On the Qwen3
+    0.6B flavor it fails on exactly `norm.weight` and `output.weight` while every
+    block parameter and `tok_embeddings.weight` load fine.
+
+    The lead is that torchtitan rebinds the tied head *after* parallelising --
+    parallelize.py, "Enable weight tying after applying parallelisms", live here
+    because the 0.6B flavor sets enable_weight_tying -- so `output.weight` is not a
+    parameter `apply_fsdp` grouped. That does not explain `norm.weight`, which is not
+    tied and fails identically, so tying is at most half of it.
+
+    Which direction the mismatch runs decides the fix, and guessing it risks loading
+    weights into the wrong shards silently instead of raising. So record it.
+    """
+    owned: dict[str, torch.Tensor] = {
+        **dict(part.named_parameters()),
+        **dict(part.named_buffers()),
+    }
+    for key, incoming in state.items():
+        mine = owned.get(key)
+        if mine is None:
+            continue
+        if isinstance(mine, DTensor) == isinstance(incoming, DTensor):
+            continue
+        logger.warning(
+            "scatter boundary mismatch %s: model=%s%s incoming=%s%s",
+            key,
+            type(mine).__name__,
+            f" placements={mine.placements} mesh={tuple(mine.device_mesh.shape)}"
+            if isinstance(mine, DTensor) else f" shape={tuple(mine.shape)}",
+            type(incoming).__name__,
+            f" placements={incoming.placements}"
+            if isinstance(incoming, DTensor) else f" shape={tuple(incoming.shape)}",
+        )
+
+
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
     """Load a full state dict back into the sharded model.
 
@@ -186,6 +229,7 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
         full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True, strict=False
     )
     for part in model_parts:
+        _report_dtensor_boundary(part, state)
         set_model_state_dict(part, model_state_dict=state, options=options)
 
 
