@@ -16,3 +16,11 @@ pww_cpu_bind() {
 }
 
 PWW_LAUNCH=()
+
+# --- Deployment ---------------------------------------------------------------
+# The central node runs no model, so it needs no torch 2.9 environment. The
+# aggregator's own venv is created by start_central_services.sh on first launch.
+pww_titan_env() {
+    printf 'none\t%s\t./scripts/central_node/start_central_services.sh\n' \
+        "${PWW_OUTPUT_DIR:-${PWW_ROOT}/runs}/central/.venv"
+}

@@ -87,3 +87,14 @@ pww_cpu_bind() {
         echo "cores"
     fi
 }
+
+# --- Deployment ---------------------------------------------------------------
+# How the torch >= 2.9 environment torchtitan needs is provided here, for
+# scripts/deploy.sh. Three tab-separated fields: kind, path, build command.
+#
+# A container rather than a venv, because LUMI's own image is on torch 2.7.1 and
+# there is no module tree offering 2.9. See scripts/titan/README.md.
+pww_titan_env() {
+    printf 'container\t%s\tsbatch scripts/lumi/build_titan_container.sh\n' \
+        "${PWW_SCRATCH}/containers/pww-titan.sif"
+}

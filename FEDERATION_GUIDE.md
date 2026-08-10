@@ -380,6 +380,27 @@ round 138 merged from 2 cluster(s) in 41.3s (peak ~2.1 GiB, lr=0.7, momentum=0.9
   its own name, not as `accuracy` — the old path reported a perplexity of 30 in a field
   labelled accuracy.
 
+### What the held-out number does and does not measure
+
+`[validation]` points at torchtitan's bundled `c4_test` fixture — 2,000 C4 documents, ~543
+windows at `seq_len 2048` — not at a held-out slice of the run's own corpus. Two
+consequences worth keeping straight:
+
+- **It is comparable across sites, and that is its main job.** Every cluster evaluates the
+  *same* global weights, so a disagreement is a bug rather than variance. `run_train.sh`
+  fixes the window *total* (`PWW_VAL_WINDOWS`, default 512) rather than `validation.steps`,
+  because windows scored = `steps x local_batch_size x nproc` — a fixed step count makes an
+  8-rank site score twice as many windows as a 4-rank one, and against a 543-window fixture
+  that is 1.2 vs 2.4 passes and two numbers that cannot be compared.
+- **It is not a publishable C4 perplexity.** 512 windows is ~1.05M tokens, so a few percent
+  of round-to-round wobble is sampling noise, and the fixture's disjointness from any
+  particular `--max-files` slice of C4 is plausible but unverified. Judge progress from the
+  training loss; use the held-out figure for the cross-site comparison.
+
+A **training** perplexity is also reported now, next to the training loss. That one is exact
+rather than approximate: `exp()` of a token-weighted mean loss is the perplexity of the union
+of those tokens, the same identity the held-out figure uses.
+
 ### Why the metric arithmetic is not obvious
 
 Three things here would produce plausible-looking numbers if they were wrong, so they
@@ -494,7 +515,71 @@ scoping, and the duplicated-id round.
 
 ---
 
-## 7. What is verified, and on what
+## 7. Deploying, and adding a site
+
+### Updating an existing site
+
+```bash
+./scripts/deploy.sh              # pull, submodules, dirs, symlinks, verify
+./scripts/deploy.sh --check      # report only, change nothing
+```
+
+One script for every machine, including the central VM. It is site-agnostic by
+construction: everything machine-specific comes from `sites/<site>.sh`, which
+`env.sh` selects by detection. Re-running it is the normal way to pick up a
+commit.
+
+It deliberately does **not** build the heavy environment. A LUMI container build
+is a 30–60 minute batch job, so `deploy.sh` reports what is missing and the one
+command that creates it, rather than starting it behind your back.
+
+It also refuses to turn `runs/` or `data/` into a symlink when one already exists
+as a real directory. `ln -sfn` would put the link *inside* it — producing
+`runs/runs` — and every path in the runbook would then quietly point at nothing.
+
+### Adding a third site
+
+There is no per-site deployment script to write, and no code to change. A site is
+one file, `sites/<name>.sh`, which must define:
+
+| | |
+|---|---|
+| `PWW_ACCOUNT` | accounting project for `sbatch` |
+| `PWW_SCRATCH` | writable, large, visible from compute nodes |
+| `PWW_GPUS_PER_NODE` | ranks per full node — **GCDs, not cards**, on AMD |
+| `PWW_CPUS_PER_TASK` | cores per rank |
+| `PWW_ACCELERATOR` | `rocm` or `cuda` |
+| `PWW_GPU_VISIBLE_VAR` | `ROCR_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES` |
+| `PWW_LAUNCH` | bash array: command prefix that enters the environment (container `exec`, or empty for modules) |
+| `pww_cpu_bind()` | echoes the `--cpu-bind` value for an allocation |
+| `pww_titan_env()` | echoes `kind<TAB>path<TAB>build command` for the torch ≥ 2.9 environment, so `deploy.sh` can check it without knowing the machine |
+
+Then add the detection branch in `env.sh`'s `pww_detect_site`, and copy a job
+script from `scripts/lumi/` or `scripts/snellius/` — whichever resembles the new
+machine — adjusting only the `#SBATCH` header and the environment quirks.
+
+Three things that are **not** per-site, and where the time actually goes:
+
+- **The torch ≥ 2.9 environment.** This is the whole of the work. Snellius has a
+  usable module tree, so it is a second venv; LUMI's own image is on 2.7.1 with no
+  2.9 module, so it is a container. A new machine is one or the other, and
+  `scripts/titan/README.md` has the reasoning for both.
+- **The corpus.** Compute nodes have no internet, so the tokenised shards and the
+  exact `tokenizer.json` must be on that site's scratch before the first job.
+  Copy them rather than regenerating: `tokenizer.sha256` feeds the manifest
+  digest, so a file regenerated under a different `transformers` version is
+  refused at registration. See [RUNBOOK.md](RUNBOOK.md) Part 1.
+- **Reachability.** The compute nodes must reach the central VM on 29510 and
+  29511. Test it from a login node before spending a queue slot.
+
+Nothing on the central node changes. `min-clients: 1` means a third site is
+sampled as soon as it connects, `configure_fit` hands it the current global model
+before it trains, and DARL partitions the index space over however many clusters
+register. The one hard requirement is that it computes the **same block-space
+digest** — same window count, `block_size` and `space_seed` — or registration
+refuses it, which is the guard working.
+
+## 8. What is verified, and on what
 
 CPU-only, no allocation needed. At a site, through the usual environment:
 

@@ -100,3 +100,11 @@ PWW_LAUNCH=()
 pww_cpu_bind() {
     echo "cores"
 }
+
+# --- Deployment ---------------------------------------------------------------
+# See the note in sites/lumi.sh. A second venv here rather than a container,
+# because Snellius has a usable Python module tree and no container runtime need.
+pww_titan_env() {
+    printf 'venv\t%s\t./scripts/titan/setup_venv_snellius.sh\n' \
+        "${PWW_TITAN_VENV:-${HOME}/venvs/pww-titan-snellius}"
+}

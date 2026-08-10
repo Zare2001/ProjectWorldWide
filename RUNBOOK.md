@@ -23,12 +23,19 @@ Skip to Part 1 if `pww_summary` already prints sane paths and the torch 2.9 envi
 exists.
 
 ```bash
-# 1. Clone and set up scratch/symlinks. Login node.
+# 1. Clone, then let deploy.sh do the rest. Login node.
 git clone <repo> ~/ProjectWorldWide && cd ~/ProjectWorldWide
-git submodule update --init --recursive        # third_party/torchtitan
-./scripts/bootstrap.sh                          # scratch dirs, logs/, data/ + runs/ symlinks
-source env.sh && pww_summary                    # confirm site detection and paths
+./scripts/deploy.sh                             # submodules, dirs, symlinks, verify
 ```
+
+`deploy.sh` is also how you **update** a site later — it pulls, re-syncs the submodule and
+re-checks everything, and it is the same script on all three machines including the central
+VM. `--check` reports without changing anything. It tells you whether the torch ≥ 2.9
+environment exists and the one command that builds it, but never starts that build itself,
+because on LUMI it is a 30–60 minute batch job.
+
+For a **new** HPC there is no new script to write — a site is one file, `sites/<name>.sh`.
+See [FEDERATION_GUIDE.md § 7](FEDERATION_GUIDE.md) for the contract it must satisfy.
 
 Two things to check before moving on:
 
@@ -314,6 +321,33 @@ the same samples
 That is the guard working. It also means the coordinator does not come up at all until
 you either pass `DARL_FRESH=1` or point `--state-dir` somewhere else.
 
+### Global-model checkpoints
+
+The aggregator snapshots the merged model to `runs/central/global/checkpoints/`, in two
+tiers, and resumes from them automatically:
+
+| | when | kept | for |
+|---|---|---|---|
+| **ephemeral** | every merge | `--keep-ephemeral 2` | crash recovery |
+| **persistent** | every `--persist-every 5` merges | `--keep-persistent 4` | rolling **back** |
+
+```
+round-000005-persistent.npz   round-000010-persistent.npz
+round-000011-ephemeral.npz    round-000012-ephemeral.npz
+```
+
+~4.8 GiB each at 0.6B (weights + momentum, both float32), so ~29 GiB steady state.
+`--keep-persistent 0` is unbounded: 200 rounds at every-5 is ~192 GiB, so check the
+filesystem first — it warns with the projected total.
+
+**Resume picks the newest checkpoint that is finite, not simply the newest.** If a run died
+from a bad merge, the newest checkpoints are the dead ones; it walks back past them and says
+how many it skipped. `--fresh-model` opts out entirely, and is needed when the architecture
+changes, since a checkpoint's tensor shapes must match the model the sites build.
+
+The round in the filename is the **merge** round, so `round-000008-*.npz` is exactly the
+model a site joining at round 9 receives.
+
 See [FEDERATION_GUIDE.md § 2](FEDERATION_GUIDE.md).
 
 ---
@@ -398,9 +432,18 @@ Healthy looks like this — `merge round` advancing with nonzero tokens from eve
 site:
 
 ```
-merge round 138: 100 steps, 1,048,576 tokens, loss 2.9143 (ppl 18.44), drift 0.0071
-round 138 merged from 2 cluster(s) in 41.3s (peak ~2.1 GiB, lr=0.7, momentum=0.9)
+  >> Training loss 2.9233 (ppl 18.60)  (2 cluster(s) [lumi, snellius], 19,660,800 tokens,
+     drift 0.0068 (max 0.0071))
+  >> Throughput 94,300 tok/s combined | lumi 41,500 tok/s, 31.4% MFU, 58.2 TFLOP/s/rank,
+     48.3 GiB (76%); snellius 52,800 tok/s, 43.9% MFU, 434.6 TFLOP/s/rank, 61.2 GiB (77%)
+  >> Round took 316s (slowest site's inner phase)
+  >> Perplexity 18.79  (held-out loss 2.9333; per-cluster ppl [18.17, 19.11], 1,048,576 eval tokens)
+round 138 merged from 2 cluster(s) in 41.3s
 ```
+
+`MFU` and memory are per cluster and **not** averaged — an MFU against an MI250X GCD and
+against an H100 are ratios to different peak FLOPs, so a mean of the two would describe
+neither. `tok/s` *is* summed, because the sites train concurrently.
 
 Four things to actually read, rather than everything:
 

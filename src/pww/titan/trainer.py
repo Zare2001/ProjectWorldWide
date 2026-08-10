@@ -250,7 +250,69 @@ class FederatedTrainer:
             "blocks_committed": committed,
             "seconds": elapsed,
             "tokens_per_s": tokens / elapsed,
+            **self._hardware_metrics(tokens, elapsed),
         }
+
+    def _hardware_metrics(self, tokens: int, elapsed: float) -> dict[str, float]:
+        """MFU, peak memory and learning rate, read off torchtitan's own state.
+
+        These are the parts of a Megatron-style metrics set that mean something here.
+        Deliberately not reported, because this configuration does not have them:
+
+        * pipeline-bubble time -- no pipeline parallelism, so there is no bubble
+        * P2P / NVLink bandwidth and all-reduce duration -- the intra-site collective is
+          FSDP2's, and the only link this project adds is the WAN hop, whose cost shows up
+          as the server's merge duration rather than as a fabric metric
+        * scaling efficiency -- meaningful against a single-GPU baseline on identical
+          hardware; across two facilities with different accelerators it would compare
+          MI250X GCDs to H100s and report a number about the hardware, not the code
+
+        MFU is per *rank* on purpose. It answers "is this GPU being used well", which is a
+        local question; averaging it across two facilities with different peak FLOPs would
+        produce a figure describing neither.
+        """
+        out: dict[str, float] = {}
+        proc = getattr(self.trainer, "metrics_processor", None)
+        if proc is None:
+            return out
+
+        flops_per_token = getattr(proc, "num_flops_per_token", -1)
+        peak_flops = getattr(proc, "gpu_peak_flops", 0)
+        ranks = self._dp_degree()
+        if flops_per_token > 0 and peak_flops > 0 and ranks > 0 and elapsed > 0:
+            # tokens is cluster-level, so divide back down: MFU is a per-device ratio.
+            tps_per_rank = (tokens / ranks) / elapsed
+            out["mfu_pct"] = 100.0 * flops_per_token * tps_per_rank / peak_flops
+            out["tflops_per_rank"] = flops_per_token * tps_per_rank / 1e12
+
+        monitor = getattr(proc, "device_memory_monitor", None)
+        if monitor is not None:
+            try:
+                stats = monitor.get_peak_stats()
+                # torchtitan returns a namedtuple; reserved is the number that predicts
+                # an OOM, active is what the model actually holds.
+                out["peak_memory_gib"] = float(getattr(stats, "max_reserved_gib", 0.0))
+                out["peak_memory_pct"] = float(getattr(stats, "max_reserved_pct", 0.0))
+            except Exception:                                         # noqa: BLE001
+                pass
+
+        schedulers = getattr(self.trainer, "lr_schedulers", None)
+        try:
+            groups = schedulers.schedulers[0].optimizer.param_groups   # type: ignore[union-attr]
+            out["lr"] = float(groups[0]["lr"])
+        except Exception:                                             # noqa: BLE001
+            pass
+        return out
+
+    def _dp_degree(self) -> int:
+        """Data-parallel ranks in this cluster, or 1 if not sharded."""
+        parallel_dims = getattr(self.trainer, "parallel_dims", None)
+        if parallel_dims is None or not getattr(parallel_dims, "dp_cp_enabled", False):
+            return 1
+        try:
+            return int(parallel_dims.world_mesh["dp_cp"].size())
+        except Exception:                                             # noqa: BLE001
+            return 1
 
     @property
     def _commit_every_phase(self) -> bool:

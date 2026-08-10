@@ -329,6 +329,13 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             proto.BASE_ROUND: base_round,
             "tokens_per_s": float(result["tokens_per_s"]),
             "blocks_committed": int(result["blocks_committed"]),
+            "seconds": float(result["seconds"]),
+            # Hardware metrics, when the trainer could read them. Forwarded per cluster
+            # rather than aggregated: MFU against an MI250X GCD and against an H100 are
+            # not the same quantity, so a mean of the two would describe neither.
+            **{key: float(result[key]) for key in
+               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr")
+               if key in result},
             **{key: float(value) for key, value in drift.items()},
         }
         if seeded:
@@ -398,6 +405,13 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             proto.BASE_ROUND: int(config.get(proto.ROUND, 0)),
             "tokens_per_s": float(result["tokens_per_s"]),
             "blocks_committed": int(result["blocks_committed"]),
+            "seconds": float(result["seconds"]),
+            # Hardware metrics, when the trainer could read them. Forwarded per cluster
+            # rather than aggregated: MFU against an MI250X GCD and against an H100 are
+            # not the same quantity, so a mean of the two would describe neither.
+            **{key: float(result[key]) for key in
+               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr")
+               if key in result},
             **{key: float(value) for key, value in drift.items()},
         }
         if result["exhausted"]:

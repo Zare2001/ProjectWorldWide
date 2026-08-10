@@ -190,10 +190,55 @@ def build_metric_aggregators():
             out["drift_ratio_max"] = max(drifts)
             detail = f", drift {out['drift_ratio']:.4f} (max {max(drifts):.4f})"
         names = ", ".join(str(m.get(proto.CLUSTER, "?")) for _, m in metrics)
+        # Training perplexity alongside the loss. exp() of a token-weighted mean loss is
+        # the perplexity of the union of those tokens, the same identity the held-out
+        # figure uses -- so it is exact here rather than an approximation, and it is the
+        # number that is comparable with published pre-training curves.
+        out["perplexity"] = math.exp(min(20.0, avg_loss)) if math.isfinite(avg_loss) else float("nan")
         logger.info(
-            "  >> Training loss %.4f  (%d cluster(s) [%s], %s tokens%s)",
-            avg_loss, len(metrics), names, f"{total:,}", detail,
+            "  >> Training loss %.4f (ppl %.2f)  (%d cluster(s) [%s], %s tokens%s)",
+            avg_loss, out["perplexity"], len(metrics), names, f"{total:,}", detail,
         )
+
+        # Throughput and hardware, per cluster.
+        #
+        # Aggregated tokens/s is the sum, because the sites train concurrently -- the run's
+        # rate is what both produce together. MFU and memory are NOT aggregated: MFU is a
+        # ratio against a device's peak FLOPs, and an MI250X GCD and an H100 have different
+        # peaks, so a mean of the two describes neither. Reported per cluster instead, which
+        # is also the form that tells you *which* site is underused.
+        rate = sum(float(m["tokens_per_s"]) for _, m in metrics if "tokens_per_s" in m)
+        if rate > 0:
+            out["tokens_per_s"] = rate
+            slowest = max((float(m.get("seconds", 0.0)) for _, m in metrics), default=0.0)
+            per_site = "; ".join(
+                f"{m.get(proto.CLUSTER, '?')} {float(m.get('tokens_per_s', 0)):,.0f} tok/s"
+                + (f", {float(m['mfu_pct']):.1f}% MFU" if "mfu_pct" in m else "")
+                + (f", {float(m['tflops_per_rank']):.1f} TFLOP/s/rank"
+                   if "tflops_per_rank" in m else "")
+                + (f", {float(m['peak_memory_gib']):.1f} GiB"
+                   f" ({float(m.get('peak_memory_pct', 0)):.0f}%)"
+                   if "peak_memory_gib" in m else "")
+                for _, m in metrics
+            )
+            logger.info("  >> Throughput %s tok/s combined | %s", f"{rate:,.0f}", per_site)
+            if slowest > 0:
+                # The straggler sets the round's wall time: every site waits for the last
+                # one before the merge. Worth seeing next to the rates, because a site can
+                # be fast per-token and still be the one everyone waits on if it was given
+                # more blocks.
+                out["round_seconds"] = slowest
+                logger.info("  >> Round took %.0fs (slowest site's inner phase)", slowest)
+
+        lrs = [float(m["lr"]) for _, m in metrics if "lr" in m]
+        if lrs:
+            out["lr"] = lrs[0]
+            # A spread here means the sites are at different points in the schedule, which
+            # they should not be: it is over *global* steps and survives outer rounds.
+            if max(lrs) - min(lrs) > 1e-12:
+                logger.warning("  >> learning rate differs across clusters: %s -- the "
+                               "schedule is over global steps and should agree",
+                               ", ".join(f"{v:.3e}" for v in lrs))
         return out
 
     def aggregate_eval_metrics(metrics: list[tuple[int, dict]]) -> dict:
