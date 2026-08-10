@@ -283,11 +283,11 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
             full_shape = tuple(param.shape)
             if key in state:
                 # Rank 0: use the incoming full tensor.
-                value = state[key].to(param.dtype).contiguous()
+                value = state[key].to(param.dtype).contiguous().cuda()
             else:
                 # Workers: allocate a receive buffer matching the full shape.
-                value = torch.empty(full_shape, dtype=param.dtype)
-            # Broadcast the full tensor from rank 0 to all ranks.
+                value = torch.empty(full_shape, dtype=param.dtype, device="cuda")
+            # Broadcast the full tensor from rank 0 to all ranks (NCCL, on GPU).
             dist.broadcast(value, src=0)
             # Now every rank has the same full tensor — shard it.
             if hasattr(param, "device_mesh"):
