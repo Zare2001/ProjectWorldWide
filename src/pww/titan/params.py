@@ -218,6 +218,47 @@ def _report_dtensor_boundary(part: nn.Module, state: dict[str, torch.Tensor]) ->
         )
 
 
+def _without_tied_aliases(
+    part: nn.Module, state: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """`state` minus any key that is not a parameter this module actually owns.
+
+    On the Qwen3 0.6B flavor `set_model_state_dict` raises
+    ``aten.copy_.default: got mixed torch.Tensor and DTensor`` on exactly
+    ``norm.weight`` and ``output.weight``, while every block parameter and
+    ``tok_embeddings.weight`` load -- even though the DTensor/plain split is
+    identical for all of them, so the type boundary is not what distinguishes them.
+
+    What distinguishes them is the root parameter group. torchtitan ties the head
+    *after* parallelising ("Enable weight tying after applying parallelisms", live
+    because the 0.6B flavor sets ``enable_weight_tying``), rebinding
+    ``output.weight`` to alias ``tok_embeddings.weight`` once ``apply_fsdp`` has
+    already built its groups. The root group is
+    ``{tok_embeddings.weight, norm.weight, output.weight}``: the real parameter
+    loads, and the two remaining members of the mutated group do not.
+
+    ``output.weight`` is absent from ``named_parameters()`` entirely, because that
+    deduplicates shared parameters -- which is the alias showing through. Loading
+    ``tok_embeddings.weight`` already writes those weights, so feeding the alias in
+    as well is redundant as well as fatal.
+
+    Anything dropped is logged rather than skipped quietly: silently not loading a
+    parameter would leave a replica training from stale weights and show up only as
+    a slow divergence, which is far worse than the exception this replaces.
+    """
+    owned = set(dict(part.named_parameters())) | set(dict(part.named_buffers()))
+    dropped = [key for key in state if key not in owned]
+    if not dropped:
+        return state
+    logger.info(
+        "scatter: dropping %d key(s) this module does not own as distinct "
+        "parameters: %s. Expected for a tied head -- named_parameters() "
+        "deduplicates shared tensors, and the tying source carries the weights.",
+        len(dropped), ", ".join(sorted(dropped)),
+    )
+    return {key: value for key, value in state.items() if key in owned}
+
+
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
     """Load a full state dict back into the sharded model.
 
@@ -230,7 +271,7 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
     )
     for part in model_parts:
         _report_dtensor_boundary(part, state)
-        set_model_state_dict(part, model_state_dict=state, options=options)
+        set_model_state_dict(part, model_state_dict=_without_tied_aliases(part, state), options=options)
 
 
 def state_delta(
