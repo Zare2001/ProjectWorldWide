@@ -37,7 +37,6 @@ import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
-    set_model_state_dict,
 )
 from torch.distributed.tensor import DTensor
 
@@ -262,16 +261,33 @@ def _without_tied_aliases(
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
     """Load a full state dict back into the sharded model.
 
-    `broadcast_from_rank0` means only rank 0 needs to hold the incoming copy;
-    every other rank receives its shard over the process group. `strict=False`
-    because with PP each part legitimately holds only its own subset of the keys.
+    Uses ``distribute_tensor`` to shard each incoming plain tensor to match the
+    model parameter's ``device_mesh`` and ``placements``, then copies the local
+    shard in-place.  This bypasses ``set_model_state_dict``, which on torch 2.9
+    raises ``aten.copy_.default: got mixed torch.Tensor and DTensor`` when the
+    incoming state is plain tensors and the model is FSDP2-sharded -- even with
+    ``full_state_dict=True``.
+
+    The approach mirrors ``_write_shard_into`` in ``delta.py``, which the blob
+    transport path (``stream_apply_global``) already uses successfully.
     """
-    options = StateDictOptions(
-        full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True, strict=False
-    )
+    from torch.distributed.tensor import distribute_tensor
+
     for part in model_parts:
-        _report_dtensor_boundary(part, state)
-        set_model_state_dict(part, model_state_dict=_without_tied_aliases(part, state), options=options)
+        owned = dict(part.named_parameters())
+        owned.update(dict(part.named_buffers()))
+        for key in sorted(owned):
+            if key not in state:
+                continue
+            param = owned[key]
+            value = state[key]
+            if hasattr(param, "device_mesh"):
+                sharded = distribute_tensor(
+                    value.to(param.dtype), param.device_mesh, param.placements
+                )
+                param.detach().to_local().copy_(sharded.to_local())
+            else:
+                param.detach().copy_(value.to(param.dtype))
 
 
 def state_delta(
