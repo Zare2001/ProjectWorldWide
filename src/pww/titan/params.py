@@ -261,33 +261,42 @@ def _without_tied_aliases(
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
     """Load a full state dict back into the sharded model.
 
-    Uses ``distribute_tensor`` to shard each incoming plain tensor to match the
-    model parameter's ``device_mesh`` and ``placements``, then copies the local
-    shard in-place.  This bypasses ``set_model_state_dict``, which on torch 2.9
-    raises ``aten.copy_.default: got mixed torch.Tensor and DTensor`` when the
-    incoming state is plain tensors and the model is FSDP2-sharded -- even with
-    ``full_state_dict=True``.
+    Rank 0 holds the full state dict (from Flower); worker ranks call this with
+    an empty dict.  Each tensor is broadcast from rank 0, then every rank calls
+    ``distribute_tensor`` to shard it and copies its local slice into the
+    parameter.
 
-    The approach mirrors ``_write_shard_into`` in ``delta.py``, which the blob
-    transport path (``stream_apply_global``) already uses successfully.
+    This replaces ``set_model_state_dict`` with ``broadcast_from_rank0``, which
+    on torch 2.9 raises ``aten.copy_.default: got mixed torch.Tensor and
+    DTensor`` when the incoming state is plain tensors and the model is
+    FSDP2-sharded.
     """
+    import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor
 
     for part in model_parts:
         owned = dict(part.named_parameters())
         owned.update(dict(part.named_buffers()))
         for key in sorted(owned):
-            if key not in state:
-                continue
             param = owned[key]
-            value = state[key]
+            # DTensor.shape is the global (unsharded) shape.
+            full_shape = tuple(param.shape)
+            if key in state:
+                # Rank 0: use the incoming full tensor.
+                value = state[key].to(param.dtype).contiguous()
+            else:
+                # Workers: allocate a receive buffer matching the full shape.
+                value = torch.empty(full_shape, dtype=param.dtype)
+            # Broadcast the full tensor from rank 0 to all ranks.
+            dist.broadcast(value, src=0)
+            # Now every rank has the same full tensor — shard it.
             if hasattr(param, "device_mesh"):
                 sharded = distribute_tensor(
-                    value.to(param.dtype), param.device_mesh, param.placements
+                    value, param.device_mesh, param.placements
                 )
                 param.detach().to_local().copy_(sharded.to_local())
             else:
-                param.detach().copy_(value.to(param.dtype))
+                param.detach().copy_(value)
 
 
 def state_delta(
