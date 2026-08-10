@@ -3,9 +3,11 @@
 Under FSDP2 every parameter is a `DTensor` holding one shard, so "the model's
 parameters" is not something any single rank has. `torch.distributed.checkpoint`'s
 `get_model_state_dict` / `set_model_state_dict` are the supported way to gather and
-scatter a full state dict across whatever parallelism is configured, and going
-through them (rather than reaching for `.full_tensor()` per parameter) is what
-keeps this working when tensor or pipeline parallelism is switched on.
+scatter a full state dict across whatever parallelism is configured, and driving the
+gather through them (rather than enumerating parameters and calling `.full_tensor()`
+on each) is what keeps this working when tensor or pipeline parallelism is switched
+on. They stay the mechanism; `_as_plain_tensor` only unwraps what they return, because
+on torch 2.9 `full_state_dict=True` can still hand back a `DTensor`.
 
 Ordering is the subtle part. Flower carries an ordered *list* of arrays with no
 names attached, and the server averages position-wise -- so if two clusters
@@ -37,6 +39,7 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
 )
+from torch.distributed.tensor import DTensor
 
 from ..logging_utils import get_logger
 
@@ -115,6 +118,31 @@ class ParameterCodec:
         return state
 
 
+def _as_plain_tensor(value: torch.Tensor) -> torch.Tensor:
+    """A plain tensor, whatever `get_model_state_dict` chose to hand back.
+
+    `full_state_dict=True` is documented to return ordinary tensors, and on torch
+    2.7 it did. On 2.9 some entries come back still wrapped as `DTensor`, and
+    everything downstream assumes plain tensors: the codec calls `.numpy()`, the
+    delta subtracts against a reference decoded from the wire, and
+    `outer_agreement` reduces to Python floats. A single mixed pair fails the whole
+    outer round with
+
+        aten.sub.Tensor: got mixed torch.Tensor and DTensor
+
+    which is unreachable from any CPU test, so it surfaces only after a queue wait.
+
+    `full_tensor()` covers both shapes this can take. If the entry is already
+    Replicate-placed -- `full_state_dict=True` did gather, it just did not unwrap --
+    the redistribute is a no-op and no collective is issued. If it is still sharded,
+    the collective runs. Either way it is called on every rank in sorted key order
+    by the caller, so ranks cannot disagree about the order of any collective.
+    """
+    if isinstance(value, DTensor):
+        return value.full_tensor()
+    return value
+
+
 def gather_full_state(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     """Full, unsharded, CPU-resident model state on every rank.
 
@@ -123,8 +151,22 @@ def gather_full_state(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     """
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
     state: dict[str, torch.Tensor] = {}
+    wrapped = 0
     for part in model_parts:
-        state.update(get_model_state_dict(part, options=options))
+        part_state = get_model_state_dict(part, options=options)
+        # Sorted, not insertion order: `_as_plain_tensor` can issue a collective, and
+        # every rank has to reach them in the same sequence. Same ordering contract
+        # the codec relies on.
+        for key in sorted(part_state):
+            value = part_state[key]
+            wrapped += isinstance(value, DTensor)
+            state[key] = _as_plain_tensor(value)
+    if wrapped:
+        logger.debug(
+            "unwrapped %d/%d state entries that get_model_state_dict returned as "
+            "DTensor despite full_state_dict=True",
+            wrapped, len(state),
+        )
     return state
 
 

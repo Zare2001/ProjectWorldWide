@@ -48,6 +48,12 @@ fi
 PWW_TITAN_VENV="${PWW_TITAN_VENV:-${HOME}/venvs/pww-titan-snellius}"
 if [[ -r "${PWW_TITAN_VENV}/bin/activate" ]]; then
     source "${PWW_TITAN_VENV}/bin/activate"
+    # run_train.sh sources env.sh again in its own shell, and sites/snellius.sh
+    # activates PWW_VENV unconditionally -- which would put the 2.7.1 venv back on
+    # PATH and launch the ranks with a torch that has no FSDP2 and no tyro. Point
+    # PWW_VENV at the titan venv so that re-source is a no-op instead of a silent
+    # downgrade.
+    export PWW_VENV="${PWW_TITAN_VENV}"
     echo "activated torchtitan venv: ${PWW_TITAN_VENV}"
 else
     echo "ERROR: no torchtitan venv at ${PWW_TITAN_VENV}" >&2
