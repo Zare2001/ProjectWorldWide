@@ -948,6 +948,46 @@ if HAS_FLWR:
         assert strategy.v_vector[0].dtype == np.float32
         assert metrics["merge_round"] == 1
 
+    @check("a failed round leaves at the wire dtype, so one crash cannot wedge the server")
+    def _():
+        # The regression this pins cost a whole run. A round that produced no results
+        # returned the *authoritative float32* copy, which is twice the wire size; at
+        # 0.6B that is 2.4 GiB against gRPC's hard 2 GiB per-message cap, so the next
+        # configure_fit could not be sent, which failed the round, which took the same
+        # exit again. Eighteen rounds of "0 results, 1 failure" from one crashed round.
+        from flwr.common import parameters_to_ndarrays
+        from pww.central.strategy import FedMom
+
+        weights = np.full((512,), 0.5, dtype=np.float16)
+        incoming = ndarrays_to_parameters([weights.copy()])
+        wire_bytes = sum(len(t) for t in incoming.tensors)
+
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([weights.copy()]),
+            server_learning_rate=0.7, server_momentum=0.9,
+        )
+        strategy.configure_fit(1, incoming, _FakeManager(1))
+
+        # A crashed client: no results, one exception.
+        out, _ = strategy.aggregate_fit(1, [], [RuntimeError("DTensor crash")])
+        assert out is not None
+        assert sum(len(t) for t in out.tensors) == wire_bytes, (
+            f"a failed round must not grow the payload: {sum(len(t) for t in out.tensors)} "
+            f"vs {wire_bytes} incoming"
+        )
+        assert parameters_to_ndarrays(out)[0].dtype == np.float16
+
+        # initialize_parameters is the other exit that skipped the downcast, and it is
+        # the one a restarted server takes.
+        resumed = strategy.initialize_parameters(_FakeManager(1))
+        assert sum(len(t) for t in resumed.tensors) == wire_bytes
+        assert parameters_to_ndarrays(resumed)[0].dtype == np.float16
+
+        # ...while the copy the outer step is computed on stays float32, because
+        # round-tripping the momentum buffer through float16 quantises it every round.
+        assert strategy._global_fp32[0].dtype == np.float32
+
     @check("blob transport refuses to start without the pieces it needs")
     def _():
         from pww.central.strategy import FedMom

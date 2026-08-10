@@ -184,6 +184,17 @@ if HAS_FLWR:
             self.v_vector: NDArrays | None = None
             self._global_fp32: NDArrays | None = None
             self._inline_round = 0
+            # The dtype the clients put on the wire, remembered.
+            #
+            # It used to be a local inside `_aggregate_inline`, discovered from the
+            # incoming layers and discarded, so the paths that leave this strategy
+            # *without* a merge -- `_current_parameters` after a failed round, and
+            # `initialize_parameters` -- had no way to know it and handed Flower the
+            # float32 authoritative copy instead. At 0.6B that is 2.4 GiB against
+            # gRPC's hard 2 GiB message cap, so the next configure_fit could not be
+            # sent, which produced another failed round, which took the same exit
+            # again: one crashed round wedged the server permanently.
+            self._wire_dtype: Any = None
 
         def __repr__(self) -> str:
             return (
@@ -228,7 +239,7 @@ if HAS_FLWR:
                 return Parameters(tensors=[], tensor_type=proto.BLOB_PARAMETERS_TYPE)
 
             if self._global_fp32 is not None:
-                return ndarrays_to_parameters(self._global_fp32)
+                return self._on_wire(self._global_fp32)
             return self.initial_parameters
 
         # --- fit ----------------------------------------------------------
@@ -259,10 +270,13 @@ if HAS_FLWR:
             if self.transport != proto.TRANSPORT_BLOB and self._global_fp32 is None:
                 # Round 1 only: adopt whatever the initial parameters are, then own
                 # them from here.
-                self._global_fp32 = [
-                    layer.astype(np.float32)
-                    for layer in parameters_to_ndarrays(parameters)
-                ]
+                adopted = parameters_to_ndarrays(parameters)
+                # Record the wire dtype *before* upcasting, or it is gone. This is the
+                # only place it is observable on a cold start, because the first merge
+                # may never happen -- which is exactly the case that wedged the server.
+                if self._wire_dtype is None and adopted:
+                    self._wire_dtype = adopted[0].dtype
+                self._global_fp32 = [layer.astype(np.float32) for layer in adopted]
 
             config = self._round_config(server_round)
 
@@ -318,6 +332,8 @@ if HAS_FLWR:
             results: list[tuple[ClientProxy, FitRes]],
             failures: list[tuple[ClientProxy, FitRes] | BaseException],
         ) -> tuple[Parameters | None, dict[str, Scalar]]:
+            if failures:
+                self._log_failures(server_round, failures)
             if not results:
                 log(WARNING,
                     "Round %s: no results (%d failure(s)); global model unchanged at "
@@ -331,12 +347,66 @@ if HAS_FLWR:
                 return self._aggregate_blob(server_round, results, metrics)
             return self._aggregate_inline(server_round, results, metrics)
 
+        def _log_failures(self, server_round: int, failures) -> None:
+            """Say *why* a round produced no results.
+
+            Flower reports failures as a count, and this strategy used to pass that
+            count straight through -- so "received 0 results and 1 failures" repeated
+            every round with nothing to act on. A failure is either a raised exception
+            or a client reply the transport rejected, and in both cases the reason is
+            sitting in the object being discarded. Losing it turns a five-second
+            diagnosis into reading stack traces on a compute node at the other end of
+            a WAN.
+            """
+            for failure in failures:
+                if isinstance(failure, BaseException):
+                    log(ERROR, "Round %s failure: %s: %s", server_round,
+                        type(failure).__name__, failure)
+                    continue
+                # (ClientProxy, FitRes): the client answered, but with a status the
+                # strategy could not use. `status` carries the client's own reason.
+                try:
+                    proxy, res = failure
+                    status = getattr(res, "status", None)
+                    log(ERROR, "Round %s failure from client %s: code=%s message=%r",
+                        server_round, getattr(proxy, "cid", "?"),
+                        getattr(status, "code", "?"), getattr(status, "message", ""))
+                except Exception:                                     # noqa: BLE001
+                    log(ERROR, "Round %s failure (unparseable): %r", server_round, failure)
+
+        def _on_wire(self, arrays: NDArrays) -> Parameters:
+            """Serialise for the wire, at the dtype the clients actually use.
+
+            Every exit from this strategy goes through here, so a round that produced
+            no merge hands back a payload the *same size* as one that did. The
+            authoritative copy stays float32 -- see the comment on `v_vector` for why
+            the momentum state must not be round-tripped through float16 -- but nothing
+            that size ever goes into a gRPC message.
+            """
+            if self._wire_dtype is not None and self._wire_dtype != np.float32:
+                arrays = [layer.astype(self._wire_dtype) for layer in arrays]
+            params = ndarrays_to_parameters(arrays)
+            # gRPC's cap is hard: 2**31 - 1 bytes, and no setting raises it. Exceeding
+            # it fails the *send*, which Flower reports as an ordinary round failure
+            # with no indication of the cause -- 18 rounds of "0 results, 1 failure"
+            # with the reason nowhere in the log. If it is ever about to happen again,
+            # say so here rather than leaving it to be inferred.
+            total = sum(len(t) for t in params.tensors)
+            if total >= 2_147_483_647:
+                log(ERROR,
+                    "outgoing parameters are %.2f GiB at dtype %s, at or above gRPC's "
+                    "2 GiB per-message cap -- this send will fail and the round will be "
+                    "reported as a plain failure. Lower flower.wire_dtype, or move this "
+                    "run to transport=blob.",
+                    total / 2 ** 30, self._wire_dtype)
+            return params
+
         def _current_parameters(self) -> Parameters | None:
             if self.transport == proto.TRANSPORT_BLOB:
                 return Parameters(tensors=[], tensor_type=proto.BLOB_PARAMETERS_TYPE)
             if self._global_fp32 is None:
                 return self.initial_parameters
-            return ndarrays_to_parameters(self._global_fp32)
+            return self._on_wire(self._global_fp32)
 
         def _aggregate_metrics(self, results) -> dict[str, Scalar]:
             if self.fit_metrics_aggregation_fn:
@@ -578,11 +648,10 @@ if HAS_FLWR:
             self._global_fp32 = w_next
             self._inline_round += 1
 
-            if wire_dtype is not None and wire_dtype != np.float32:
-                on_wire = [layer.astype(wire_dtype) for layer in w_next]
-            else:
-                on_wire = w_next
-            aggregated = ndarrays_to_parameters(on_wire)
+            # Keep it, so a later round that fails to merge leaves at the same dtype.
+            if wire_dtype is not None:
+                self._wire_dtype = wire_dtype
+            aggregated = self._on_wire(w_next)
             self.initial_parameters = aggregated
 
             metrics = dict(metrics)
