@@ -170,7 +170,7 @@ registration anyway, and finding out now costs seconds instead of a queue wait.
 
 If a coordinator is **already running on a different corpus** — which it is, on the
 wikitext-103 placeholder — it does not pick this count up by itself. Restart it with
-`DARL_FRESH=1` before any real training: [Part 2, switching corpus](#part-2--start-the-central-vm).
+`PWW_FRESH_RUN=1` before any real training: [Part 2, starting a genuinely fresh run](#part-2--start-the-central-vm).
 
 ---
 
@@ -273,40 +273,85 @@ restored coordinator from .../snapshot.json (+0 journal entries): epoch 0, 0/113
 ```
 
 If that line is absent, the lease table was **discarded** and already-trained windows are
-free to be handed out again. Only ask for that when the corpus itself changed:
+free to be handed out again.
 
-```bash
-DARL_FRESH=1 NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
-AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
-  ./scripts/central_node/start_central_services.sh
-```
+### Starting a genuinely fresh run
 
-**Switching corpus — the one time `DARL_FRESH=1` is required.** Going from the
-placeholder space to real C4 is exactly this case, so do it once after Part 1 has run at
-a site and **before any real training**:
+**`PWW_FRESH_RUN=1`, not `DARL_FRESH=1`.** There are two durable stores and they have to
+agree:
+
+| | holds |
+|---|---|
+| `runs/darl` | the lease table — which windows have been trained |
+| `runs/central/global` | the global model, its momentum buffer, the checkpoints |
+
+Resetting only the lease table re-issues windows the surviving model already trained on.
+Resetting only the model merges a brand-new epoch into momentum accumulated against a
+different corpus. **Both are silent.** So one switch does both, and `DARL_FRESH=1` on its
+own now warns rather than being quietly honoured.
 
 ```bash
 ./scripts/central_node/stop_central_services.sh
-DARL_FRESH=1 NUM_SAMPLES=<windows from tokenize_c4.sh> BLOCK_SIZE=1024 SEED=42 \
+PWW_FRESH_RUN=1 MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
 AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
   ./scripts/central_node/start_central_services.sh
 ```
 
-Better, if you can copy one small file: point at the manifest and let the count be read
-rather than retyped. The central node never reads the corpus, so `manifest.json` alone is
-enough, and it removes the one transcription the digest guard would otherwise catch only
-after a site had already spent its queue wait.
+`MANIFEST=` reads the window count out of the file instead of you retyping it — the central
+node never opens the corpus, so copying that one small file across is enough. `NUM_SAMPLES=`
+still works and wins if both are given.
+
+Confirm it discarded rather than resumed:
+
+```
+PWW_FRESH_RUN=1: discarding the lease table AND the global model.
+--fresh: moved snapshot.json aside to snapshot.json.superseded
+darl coordinator on http://0.0.0.0:29510 | 2692 blocks | epoch 0/1 | token yes
+```
+
+Old state is **renamed, not deleted** — `snapshot.json.superseded`, `journal.jsonl.superseded`,
+`round-*.npz.superseded` — so a mistaken reset is recoverable for one generation.
+
+**Switching corpus is the case that requires this.** Going from a placeholder space to real
+C4 is exactly it: the old lease table is not stale, it is *meaningless*, because its
+committed positions index a different corpus.
+
+**The sites need the same variable.** torchtitan keeps its own checkpoint under each site's
+dump folder and resumes from it, so pass `PWW_FRESH_RUN=1` at submit time as well:
 
 ```bash
-scp <site>:.../c4-tokenizer-128k-2048/manifest.json /tmp/
-DARL_FRESH=1 MANIFEST=/tmp/manifest.json BLOCK_SIZE=1024 SEED=42 \
-AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
-  ./scripts/central_node/start_central_services.sh
+PWW_FRESH_RUN=1 DARL_TOKEN="..." sbatch --export=ALL,PWW_FRESH_RUN,DARL_TOKEN \
+  scripts/snellius/job_titan_diloco.sh
 ```
 
-The old lease table is not stale, it is *meaningless*: its committed positions index a
-different corpus. Leave the flag off for every other restart, or a resume turns into a
-silent re-issue of already-trained windows.
+Only the model in that checkpoint is harmless — `configure_fit` overwrites it. The other
+three are not:
+
+| restored | effect on a fresh run |
+|---|---|
+| `OPTIMIZER` | stale AdamW moments paired with completely different weights |
+| `LR_SCHEDULER` + `TRAIN_STATE` | resumes at the old global step, so a freshly seeded model **skips `warmup_steps`** and takes near-peak LR on its first step |
+| `DATALOADER` | the DARL client's `epoch`/`phase_index`/`samples_seen`, while the coordinator is on a fresh epoch with every block unassigned |
+
+`checkpoint.interval` equals `darl.inner_steps`, so a checkpoint is written every round — a
+job that failed after one round has already left one behind.
+
+### It never decides this for you
+
+Nothing infers that a run is dead, and nothing should — resume is the default and is always
+safe. So a **VM reboot** or **every site sitting in the queue** needs no flags and no
+intervention:
+
+| question | mechanism | who decides |
+|---|---|---|
+| is this lease still held? | TTL + heartbeats | automatic, seconds–minutes |
+| is this process still alive? | `is_live()`, for the cluster-id conflict only | automatic, one TTL |
+| **is this run dead?** | `PWW_FRESH_RUN=1` | **you, never inferred** |
+
+A bare restart after a reboot resumes: DARL restores its snapshot, the geometry comes from
+`space.env`, and the model resumes from the newest finite checkpoint. `min-clients: 1` makes
+"nobody connected" a wait, not a failure, and leases held by a job that vanished expire on
+their own TTL.
 
 Changing `NUM_SAMPLES`/`BLOCK_SIZE`/`SEED` without the flag is **refused, not adapted to**
 — the restore compares the block-space digest and raises rather than falling back to a
@@ -319,7 +364,7 @@ the same samples
 ```
 
 That is the guard working. It also means the coordinator does not come up at all until
-you either pass `DARL_FRESH=1` or point `--state-dir` somewhere else.
+you either pass `PWW_FRESH_RUN=1` or point `--state-dir` somewhere else.
 
 ### Global-model checkpoints
 

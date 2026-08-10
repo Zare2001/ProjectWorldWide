@@ -125,6 +125,48 @@ s.close()' 2>/dev/null || true)
 fi
 echo "rendezvous  : ${RDZV_ENDPOINT}"
 
+# --- PWW_FRESH_RUN: the site half of a fresh start ---------------------------
+#
+# Same variable name as on the central node, because forgetting this side leaves a run
+# that is half fresh, and the half that is stale is silent.
+#
+# torchtitan's checkpoint restores four things, and only the first is harmless here:
+#
+#   MODEL         overwritten anyway by configure_fit before the first step
+#   OPTIMIZER     stale AdamW moments, now paired with completely different weights
+#   LR_SCHEDULER  resumes at the old global step, so a freshly seeded model skips
+#   + TRAIN_STATE warmup_steps entirely and takes near-peak LR on its first step
+#   DATALOADER    the DARL client's epoch/phase_index/samples_seen, while the
+#                 coordinator is on a fresh epoch with every block unassigned
+#
+# With checkpoint.interval == darl.inner_steps a checkpoint is written every round, so
+# even a job that failed after one round leaves one behind.
+#
+# Renamed, not deleted, keeping one generation -- the same policy the coordinator uses.
+if [[ "${PWW_FRESH_RUN:-0}" == "1" ]]; then
+    fresh_dump="${DUMP:-}"
+    if [[ -z "${fresh_dump}" ]]; then
+        fresh_dump="$(grep -m1 -E '^[[:space:]]*dump_folder[[:space:]]*=' "${CONFIG}" \
+                      | cut -d'"' -f2)"
+    fi
+    if [[ -n "${fresh_dump}" ]]; then
+        # dump_folder is relative in the shipped configs, so resolve it the way the job
+        # would rather than trusting the current directory.
+        [[ "${fresh_dump}" != /* ]] && fresh_dump="${PWW_ROOT}/${fresh_dump#./}"
+        fresh_ckpt="${fresh_dump}/checkpoint"
+        if [[ -d "${fresh_ckpt}" ]]; then
+            rm -rf "${fresh_ckpt}.superseded"
+            mv "${fresh_ckpt}" "${fresh_ckpt}.superseded"
+            echo "PWW_FRESH_RUN=1: moved ${fresh_ckpt} aside to .superseded"
+        else
+            echo "PWW_FRESH_RUN=1: no checkpoint at ${fresh_ckpt}, nothing to clear"
+        fi
+    else
+        echo "WARNING: PWW_FRESH_RUN=1 but no dump_folder found in ${CONFIG}; this site" \
+             "may resume a stale optimizer state and LR schedule position" >&2
+    fi
+fi
+
 overrides=()
 [[ -n "${TOKENIZER}" ]] && overrides+=(--model.hf_assets_path "${TOKENIZER}")
 [[ -n "${SHARDS}" ]] && overrides+=(--training.dataset_path "${SHARDS}")

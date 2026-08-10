@@ -101,7 +101,7 @@ Two notes on getting this wrong, since neither is obvious:
   prove the number describes the corpus you meant. Reading it from the manifest is what
   closes that gap.
 - **Re-tokenising changes the count.** `--max-files 32` and `--max-files 64` are different
-  block spaces, so the coordinator must be restarted with `DARL_FRESH=1` and the new
+  block spaces, so the coordinator must be restarted with `PWW_FRESH_RUN=1` and the new
   count. A resume would refuse, which is the good outcome; the bad one is passing the new
   count *and* the flag while a site still holds the old shards.
 
@@ -204,9 +204,22 @@ the lease table. Restarting the central services resumes both, but they resume
 independently, and a lease table that came back empty is not detectable from the model
 side — the merge round continues from where it stopped either way, and the run trains
 windows it has already trained. The coordinator prints `restored coordinator from
-.../snapshot.json` when it resumed; that line is the check. `DARL_FRESH=1` is what
-deliberately discards it, for a genuinely new corpus, and it is not the default precisely
-because the failure is silent.
+.../snapshot.json` when it resumed; that line is the check.
+
+`PWW_FRESH_RUN=1` is what deliberately discards state, and it discards **both** stores
+together. `DARL_FRESH=1` alone resets only the lease table and leaves the model and its
+momentum buffer, which were trained against the previous block space -- so it warns. Neither
+is the default, precisely because the failure they cause is silent.
+
+Discarded state is renamed to `*.superseded` rather than deleted. That is not tidiness: both
+flags used only to *skip loading* the old state while leaving it on disk, so a fresh
+coordinator that died before its first snapshot came back resumed from the run it was meant
+to replace.
+
+Nothing infers that a run is dead, and nothing should. Resume is the default and is always
+safe, which is what makes a VM reboot or every site sitting in the queue a non-event -- see
+[RUNBOOK.md](RUNBOOK.md) "It never decides this for you" for the three timescales and which
+of them are automatic.
 
 On a cold start with no state on disk, the server asks exactly **one** site to
 upload its initial weights and adopts them as the global model — the central node
@@ -507,6 +520,11 @@ scoping, and the duplicated-id round.
 | client refuses the round citing transport | `flower.transport` in the TOML disagrees with the server's `--transport` | make them match; restart whichever is wrong. |
 | `every delta for round N was stale` | all participating sites were requeued and computed against an older global model | expected after a walltime kill. The next round is current. |
 | a site hangs at the end of an epoch | was: a prefetched DARL lease nobody consumed, so the pool looked drained while the session held the missing blocks | fixed — `LeaseSession.acquire` now consumes a pending prefetch instead of waiting on it. Covered by `tests/test_darl.py`. |
+| `dropping cluster X -- tensor N contains nan/inf` | that site's weights are non-finite, usually local divergence or float16 overflow on the wire | the round proceeds without it and the global model is untouched. Read that site's own training loss: this is a symptom, not the cause. |
+| `Training loss nan` with `merge complete` | was: one non-finite contribution poisoned the global model, and every later round was arithmetic on nan | fixed — non-finite contributions are dropped before the merge. If it recurs, one site is diverging and the log now names it. |
+| `Round N failure: ...` | a client raised, or the transport rejected its reply | the reason is now logged. Previously only the count was, which is why an 18-round failure loop had no diagnosable cause. |
+| `held-out loss spread N nats across clusters` | either a site is not applying the weights it was sent, or the sites are not scoring the same data | check `validation.steps`/`PWW_VAL_WINDOWS` and the eval token counts first; equal counts mean the model is the suspect. |
+| `outgoing parameters are N GiB ... gRPC's 2 GiB cap` | the wire dtype makes the message too large | lower `flower.wire_dtype`, or move to `transport=blob`. Previously this failed the send with no stated cause and wedged the run. |
 | `blob store: 507` | the volume behind `--blob-root` is below its reserve | point `--state-dir`/`BLOB_ROOT` at a larger volume. `GlobalState.log_disk_budget` prints the requirement at startup. |
 | lease expiry after a walltime kill | Slurm killed a site mid-epoch | self-healing: uncommitted blocks return to the pool on TTL expiry, and the surviving site finishes the epoch. Releasing on SIGTERM makes it milliseconds instead of a full TTL. |
 | `Connection refused` on 29511 | daemons not running | `./scripts/central_node/start_central_services.sh` |

@@ -1160,6 +1160,19 @@ Log outputs report:
 * **`drift`** — `||local − global|| / ||global||` per round, as mean and **max**. The one
   number that says whether `H` was chosen sensibly, and it is the max that matters:
   two sites at 0.01 and 0.30 average to a reassuring 0.155.
+* **Throughput and hardware, per cluster** — tokens/s, MFU, TFLOP/s per rank and peak
+  memory, plus the round's wall time (the slowest site's inner phase, since everyone waits
+  for the straggler before the merge). tokens/s is *summed* across sites because they train
+  concurrently; MFU and memory are deliberately **not** averaged, because MFU is a ratio to
+  a device's peak FLOPs and an MI250X GCD and an H100 have different peaks — a mean of the
+  two would describe neither.
+* **A dropped cluster** — a site whose weights contain nan/inf is named and excluded rather
+  than averaged. One poisoned contribution used to propagate into the global model and end
+  the run while the log still said `merge complete` every round.
+* **The held-out figure is comparable across sites, not publishable.** It is measured on a
+  small bundled C4 fixture, with the window *total* fixed so rank count cannot change what
+  each site scores. Judge progress from the training loss; use the held-out number to
+  compare sites.
 
 Three pieces of the metric arithmetic are non-obvious enough to be worth knowing, and
 each is pinned by a test because all three produce plausible numbers when wrong:

@@ -164,6 +164,32 @@ DARL_EPOCHS="${DARL_EPOCHS:-1}"
 # checks the block-space digest and refuses a snapshot that describes a different
 # partitioning, which is a loud failure rather than a quiet one.
 DARL_FRESH="${DARL_FRESH:-0}"
+
+# One switch for a genuinely fresh run, because resetting half of it is worse than
+# resetting none.
+#
+#   PWW_FRESH_RUN=1 NUM_SAMPLES=<windows> ... ./start_central_services.sh
+#
+# There are two independent pieces of durable state and they must agree:
+#
+#   runs/darl            the lease table -- which windows have been trained
+#   runs/central/global  the global model, its momentum buffer, and checkpoints
+#
+# Resetting only the lease table re-issues windows the surviving model already trained on.
+# Resetting only the model merges a brand-new epoch of data into momentum accumulated
+# against a different corpus. Both are silent. So PWW_FRESH_RUN sets both, and mixing the
+# two flags by hand warns rather than being quietly honoured.
+FRESH_MODEL_EXTRA=()
+if [[ "${PWW_FRESH_RUN:-0}" == "1" ]]; then
+    DARL_FRESH=1
+    FRESH_MODEL_EXTRA+=(--fresh-model)
+    echo "PWW_FRESH_RUN=1: discarding the lease table AND the global model."
+elif [[ "${DARL_FRESH}" == "1" ]]; then
+    echo "WARNING: DARL_FRESH=1 resets the lease table but keeps the global model and its" \
+         "momentum buffer, which were trained against the previous block space. Use" \
+         "PWW_FRESH_RUN=1 for a clean run, or pass this deliberately." >&2
+fi
+
 DARL_EXTRA=()
 if [[ "${DARL_FRESH}" == "1" ]]; then
     DARL_EXTRA+=(--fresh)
@@ -229,7 +255,8 @@ else
 fi
 
 # 2. Start the blob store (blob transport only)
-SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}")
+SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
+              ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"})
 if [[ "${TRANSPORT}" == "blob" ]]; then
     mkdir -p "${BLOB_ROOT}" "${GLOBAL_STATE_DIR}"
     if [[ -f "${BLOB_PID_FILE}" ]] && kill -0 "$(cat "${BLOB_PID_FILE}")" 2>/dev/null; then

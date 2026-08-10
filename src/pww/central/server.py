@@ -471,6 +471,21 @@ def main() -> None:
 
     # Resume from disk before Flower's INIT, so `initialize_parameters` answers from the
     # checkpoint and no client is asked to re-seed a run that already has a model.
+    if checkpoint_dir is not None and args.fresh_model:
+        # Same reasoning as DARL's --fresh: not loading them is not enough, because they
+        # stay on disk and the *next* restart without this flag would adopt them. Moved
+        # aside rather than deleted so a mistaken --fresh-model is recoverable.
+        moved = 0
+        for stale in sorted(checkpoint_dir.glob("round-*.npz")):
+            try:
+                stale.replace(stale.with_suffix(".npz.superseded"))
+                moved += 1
+            except OSError as exc:
+                logger.warning("could not move %s aside: %s", stale.name, exc)
+        if moved:
+            logger.info("--fresh-model: moved %d checkpoint(s) aside; this run starts from "
+                        "whichever cluster seeds it", moved)
+
     if checkpoint_dir is not None and not args.fresh_model:
         resumed = strategy.resume_from_checkpoint()
         if resumed is not None:

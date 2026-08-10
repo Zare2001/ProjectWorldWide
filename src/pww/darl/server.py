@@ -657,6 +657,26 @@ def main(argv: list[str] | None = None) -> None:
             snapshot_interval=args.snapshot_interval,
             verify_on_snapshot=not args.no_verify,
         )
+    if coordinator is None and args.state_dir and args.fresh:
+        # --fresh has to move the old state out of the way, not merely ignore it.
+        #
+        # Skipping the load is not enough. The journal is opened in append mode and the
+        # snapshot is only overwritten at the first periodic save, so between startup and
+        # that save the directory still describes the *previous* run -- and a coordinator
+        # that dies in that window is resumed from it, silently reinstating the old
+        # epoch's committed blocks and cluster records. A fresh run that crashes early
+        # would come back as the run it was meant to replace.
+        #
+        # Renamed rather than deleted: --fresh is destructive by intent, but a typo should
+        # be recoverable, and one previous generation is enough to undo a mistake.
+        state = Path(args.state_dir)
+        for name in ("snapshot.json", "journal.jsonl"):
+            current = state / name
+            if current.exists() and current.stat().st_size > 0:
+                superseded = state / f"{name}.superseded"
+                current.replace(superseded)
+                log.info("--fresh: moved %s aside to %s", name, superseded.name)
+
     if coordinator is None:
         table = LeaseTable(
             space.num_blocks,
