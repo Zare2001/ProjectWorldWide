@@ -29,6 +29,7 @@ for, silently dropping them from the epoch.
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from typing import Any
 
@@ -59,6 +60,8 @@ class FederatedTrainer:
         # Patched in so loss survives train_step, which logs and returns None.
         self._loss_sum = 0.0
         self._loss_count = 0
+        self._last_loss: float | None = None
+        self._reported_nonfinite = False
         original_fbs = trainer.forward_backward_step
 
         def counting_forward_backward(input_dict, labels):
@@ -67,8 +70,12 @@ class FederatedTrainer:
             # metrics path already syncs at log_freq; this is the price of having a
             # per-round loss to report to the aggregator, and it is amortised over
             # a full forward+backward.
-            self._loss_sum += float(loss.detach())
+            value = float(loss.detach())
+            self._loss_sum += value
             self._loss_count += 1
+            # Kept so `_log_step` can report the loss of the step just finished, and
+            # spot the first non-finite one, without a second device sync.
+            self._last_loss = value
             return loss
 
         trainer.forward_backward_step = counting_forward_backward
@@ -186,6 +193,10 @@ class FederatedTrainer:
         trainer = self.trainer
         self._loss_sum = 0.0
         self._loss_count = 0
+        self._last_loss = None
+        # Per phase, not per run: a site that recovers should report the next phase's
+        # first bad step too rather than staying silent because an earlier one fired.
+        self._reported_nonfinite = False
 
         tokens_before = trainer.ntokens_seen
         steps_done = 0
@@ -212,6 +223,7 @@ class FederatedTrainer:
                 logger.info("dataloader exhausted at step %d", trainer.step)
                 break
             steps_done += 1
+            self._log_step(trainer.step)
 
         # Checkpoint first, then commit the leases it covers: {weights, committed
         # blocks} then fail together, so a crash loses the same work from both
@@ -252,6 +264,99 @@ class FederatedTrainer:
             "tokens_per_s": tokens / elapsed,
             **self._hardware_metrics(tokens, elapsed),
         }
+
+    def align_to_global_step(self, global_step: int) -> int:
+        """Put this cluster's step counter and LR schedule where the *run* is.
+
+        Each site keeps its own `trainer.step`, and the LR scheduler advances off that.
+        So a site that joins at outer round N starts its schedule at 0 while the global
+        model is already N*H steps along -- and the two sites then optimise the same
+        weights at different learning rates. Observed on the first two-site round: one
+        cluster at 3.000e-04 (past a 200-step warmup) and the other at 1.515e-04, which
+        is exactly 3e-4 * 101/200, i.e. a fresh joiner halfway through its own warmup.
+
+        That contradicts what the config promises -- the schedule is meant to be over
+        *global* steps and to survive outer rounds -- and it matters beyond tidiness:
+        FedMom weights contributions by tokens alone, so it has no way to account for one
+        replica having taken its steps at half the learning rate of another.
+
+        Only ever forwards. A site *ahead* of the global round is not something to fix by
+        rewinding it mid-run; that would mean the coordinator and the model disagree,
+        which is a different fault with a different remedy.
+
+        Collective-free and cheap: LambdaLR recomputes from `last_epoch`, so catching up
+        is one lambda evaluation per step, and it is called once per phase.
+        """
+        target = int(global_step)
+        if target <= self.trainer.step:
+            return self.trainer.step
+
+        behind = target - self.trainer.step
+        self.trainer.step = target
+        schedulers = getattr(self.trainer, "lr_schedulers", None)
+        stepped = 0
+        if schedulers is not None:
+            for _ in range(behind):
+                try:
+                    schedulers.step()
+                    stepped += 1
+                except Exception as exc:                              # noqa: BLE001
+                    logger.warning("could not advance the LR schedule: %s", exc)
+                    break
+        lr = self._current_lr()
+        logger.info(
+            "joined at global step %d (was %d): advanced the step counter and %d LR "
+            "schedule step(s)%s so this cluster optimises on the same schedule as the "
+            "rest of the run",
+            target, target - behind, stepped,
+            f", lr now {lr:.3e}" if lr is not None else "",
+        )
+        return self.trainer.step
+
+    def _log_step(self, step: int) -> None:
+        """Per-step loss, which torchtitan would log and this path skipped entirely.
+
+        torchtitan's own logging lives inside `Trainer.train()`, and this class drives
+        `train_step` directly to interleave DiLoCo phases -- so `metrics_processor.log`
+        was never reached and a run produced **zero** per-step loss lines. `log_freq`
+        looked honoured and was not.
+
+        That absence is expensive at exactly the wrong moment. When a site starts
+        returning non-finite weights, the question is whether the loss went bad
+        gradually over the phase or on the first step, and those have different causes:
+        gradual points at the learning rate or the outer step, immediate points at the
+        weights the site was handed. Without a per-step trace neither can be told apart,
+        and the evidence is gone once the round ends.
+
+        So: log at `log_freq`, and log the **first** non-finite step unconditionally,
+        with the step number. One line is enough to answer the question the round
+        summary cannot.
+        """
+        loss = self._last_loss
+        if loss is None:
+            return
+        finite = math.isfinite(loss)
+        if not finite and not self._reported_nonfinite:
+            self._reported_nonfinite = True
+            logger.error(
+                "step %d: loss became NON-FINITE (%s) -- first occurrence this phase. "
+                "The %d step(s) before it were finite, so this is where to look. "
+                "Everything after it in this phase is meaningless, and the weights this "
+                "cluster reports will be rejected by the central node.",
+                step, loss, self._loss_count - 1,
+            )
+        freq = max(1, int(getattr(self.job_config.metrics, "log_freq", 10) or 10))
+        if finite and step % freq == 0:
+            lr = self._current_lr()
+            logger.info("step %d  loss %.4f%s", step, loss,
+                        f"  lr {lr:.3e}" if lr is not None else "")
+
+    def _current_lr(self) -> float | None:
+        try:
+            schedulers = self.trainer.lr_schedulers
+            return float(schedulers.schedulers[0].optimizer.param_groups[0]["lr"])
+        except Exception:                                             # noqa: BLE001
+            return None
 
     def _hardware_metrics(self, tokens: int, elapsed: float) -> dict[str, float]:
         """MFU, peak memory and learning rate, read off torchtitan's own state.

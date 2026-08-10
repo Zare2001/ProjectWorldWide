@@ -27,7 +27,9 @@ them. Every count of live replicas is a normal state:
            the architecture, and it simply waits in `client_manager` until someone
            connects. Nothing is lost, including across a restart of the server itself.
   1 live   one site trains alone. That is DiLoCo with k=1 -- correct, not degraded --
-           and the momentum buffer keeps accumulating across the gap.
+           and the momentum buffer keeps accumulating across the gap. The outer step
+           takes eta=1 on such a round, because with nothing to average eta<1 would
+           only discard that site's progress; see `_aggregate_inline`.
   N live   the ordinary case.
 
 A cluster joining at round 400 needs no special handling: `configure_fit` hands every
@@ -146,6 +148,8 @@ if HAS_FLWR:
             keep_ephemeral: int = 2,
             persist_every: int = 5,
             keep_persistent: int = 4,
+            # eta = 1 for a round with a single contributor. See `_aggregate_inline`.
+            solo_full_step: bool = True,
         ) -> None:
             super().__init__(
                 fraction_fit=fraction_fit,
@@ -189,6 +193,7 @@ if HAS_FLWR:
             self.v_vector: NDArrays | None = None
             self._global_fp32: NDArrays | None = None
             self._inline_round = 0
+            self.solo_full_step = bool(solo_full_step)
             self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
             self.keep_ephemeral = max(0, int(keep_ephemeral))
             self.persist_every = max(0, int(persist_every))
@@ -842,11 +847,47 @@ if HAS_FLWR:
                 for layer in parameters_to_ndarrays(self.initial_parameters)
             ]
 
+            # eta = 1 when there is only one contributor, because with one contributor
+            # there is nothing to average.
+            #
+            # w_avg is then that cluster's own weights, so the update reduces to
+            #
+            #     w_next = (1 - eta) * w + eta * w_local
+            #
+            # and eta < 1 is pure damping: it discards (1 - eta) of the round's local
+            # progress in exchange for variance reduction across replicas that does not
+            # exist here. At the paper's eta = 0.7 that is 30% of every solo round thrown
+            # away. It is also not a hyperparameter question -- DiLoCo's eta is tuned for
+            # the averaging case, and this is the degenerate one.
+            #
+            # It matters because solo rounds are the normal opening of a run: min-clients
+            # is 1 precisely so the first site out of the queue starts training instead of
+            # idling, and FEDERATION_GUIDE already promises that is "DiLoCo with k=1 --
+            # correct, not degraded". Damping made that claim false.
+            #
+            # Momentum is deliberately left alone. Round 1 is momentum-free by
+            # construction (v_prev = w), so this alone makes the opening round exactly
+            # "adopt the local model", and changing beta as well would alter the behaviour
+            # of a long run that merely loses a site for a while.
+            #
+            # solo_full_step = False restores the old behaviour. The reason to want it is
+            # that eta < 1 bounds how far one cluster can drag the global model, which is
+            # a real property if you do not trust a site -- but the non-finite check above
+            # and the drift metric are the intended guards for that.
+            solo = len(usable) == 1 and self.solo_full_step
+            eta = 1.0 if solo else self.server_learning_rate
+            if solo:
+                log(INFO,
+                    "Round %s: single contributor (%s), so applying the outer step at "
+                    "eta=1.0 instead of %.2f -- with nothing to average, damping would "
+                    "discard %.0f%% of this round for no benefit",
+                    server_round,
+                    usable[0][1].metrics.get(proto.CLUSTER, "?"),
+                    self.server_learning_rate,
+                    100.0 * (1.0 - self.server_learning_rate))
+
             pseudo_gradient = [w - w_avg for w, w_avg in zip(w_t, fedavg_result)]
-            v_next = [
-                w - self.server_learning_rate * pg
-                for w, pg in zip(w_t, pseudo_gradient)
-            ]
+            v_next = [w - eta * pg for w, pg in zip(w_t, pseudo_gradient)]
             v_prev: NDArrays = w_t if self.v_vector is None else self.v_vector
             w_next = [
                 vn + self.server_momentum * (vn - vp)

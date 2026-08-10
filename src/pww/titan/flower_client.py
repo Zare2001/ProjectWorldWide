@@ -250,6 +250,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
                 "to look.", loss,
             )
             return float(loss), max(1, int(tokens)), {
+                proto.CLUSTER: self.cluster_id,
                 "eval_loss": float(loss),
                 "perplexity": float("nan"),
             }
@@ -265,7 +266,11 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         # `eval_loss` is what the central node aggregates; perplexity is derived there
         # from the pooled loss. Sent per-cluster too, for visibility -- but it must not be
         # what gets averaged. See central/server.py::aggregate_eval_metrics.
+        # The cluster id travels with the eval metrics too, not just the fit ones. Without
+        # it the server's cross-cluster spread warning can name neither side -- it printed
+        # "?=9.32 vs ?=8.05", which is the one thing that warning exists to tell you.
         return float(loss), int(tokens), {
+            proto.CLUSTER: self.cluster_id,
             "eval_loss": float(loss),
             "perplexity": float(math.exp(min(20.0, loss))),
         }
@@ -296,7 +301,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             # exactly what the central node adopts.
             init_name = str(config.get(proto.INIT_BLOB, proto.init_blob(run_id)))
             reference = staging / init_name
-            self._broadcast(CMD_FIT, reference=str(reference), write_full=True)
+            self._broadcast(CMD_FIT, reference=str(reference), write_full=True,
+                            global_step=self._global_step_for(config))
             stream_write_full(
                 self.trainer.model_parts, reference,
                 meta={"cluster": self.cluster_id, "round": base_round},
@@ -306,7 +312,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             logger.info("seeded the global model from this cluster's initial weights")
         else:
             reference = self._fetch_global(config)
-            self._broadcast(CMD_FIT, reference=str(reference))
+            self._broadcast(CMD_FIT, reference=str(reference), global_step=self._global_step_for(config))
             stream_apply_global(self.trainer.model_parts, reference)
             seeded = False
 
@@ -367,7 +373,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
 
     def _fit_inline(self, parameters: list, config: dict) -> tuple:
         self._check_transport_ceiling()
-        self._broadcast(CMD_FIT, has_parameters=bool(parameters))
+        self._broadcast(CMD_FIT, has_parameters=bool(parameters),
+                        global_step=self._global_step_for(config))
         if parameters:
             self.set_parameters(parameters)
 
@@ -437,6 +444,21 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
 
     # --- rank coordination -------------------------------------------------
 
+    def _global_step_for(self, config: dict) -> int:
+        """Where the run is, in optimiser steps, and align this rank to it.
+
+        merge_round * H, because a merge happens after exactly H inner steps on every
+        participating cluster. It is the merge round rather than Flower's round number
+        for the usual reason: a round that failed to merge advanced Flower's counter and
+        changed no weights, so it consumed no optimiser steps either.
+
+        Rank 0 aligns here; the other ranks get the same number through the CMD_FIT
+        broadcast and align in `run_worker_loop`.
+        """
+        global_step = int(config.get(proto.ROUND, 0)) * self.federated.inner_steps
+        self.federated.align_to_global_step(global_step)
+        return global_step
+
     def _broadcast(
         self,
         command: str,
@@ -445,6 +467,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         gather_only: bool = False,
         reference: str = "",
         write_full: bool = False,
+        global_step: int = -1,
     ) -> None:
         """Tell the other ranks which collectives to enter, and over which file.
 
@@ -455,7 +478,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         """
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.broadcast_object_list(
-                [(command, has_parameters, gather_only, reference, write_full)], src=0
+                [(command, has_parameters, gather_only, reference, write_full, global_step)], src=0
             )
 
     def stop_workers(self) -> None:
@@ -486,7 +509,13 @@ def run_worker_loop(federated: FederatedTrainer) -> None:
     while True:
         box: list[Any] = [None]
         dist.broadcast_object_list(box, src=0)
-        command, has_parameters, gather_only, reference, write_full = box[0]
+        command, has_parameters, gather_only, reference, write_full, global_step = box[0]
+
+        # Every rank owns an LR scheduler, so every rank has to be moved -- aligning only
+        # rank 0 would leave the shards optimising at different learning rates within a
+        # single cluster, which is worse than the cross-site skew this fixes.
+        if global_step >= 0:
+            federated.align_to_global_step(global_step)
 
         if command == CMD_STOP:
             return

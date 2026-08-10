@@ -129,6 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
              "advances can still finish it",
     )
 
+    g = parser.add_argument_group("outer step")
+    g.add_argument(
+        "--no-solo-full-step", dest="solo_full_step", action="store_false",
+        help="Keep applying server-learning-rate on rounds with a single contributor. "
+             "The default applies eta=1 there, because with nothing to average eta<1 only "
+             "discards local progress; disable it if you would rather bound how far one "
+             "cluster can move the global model",
+    )
+    parser.set_defaults(solo_full_step=True)
+
     g = parser.add_argument_group("global-model checkpoints")
     g.add_argument(
         "--checkpoint-dir", type=str, default=None,
@@ -467,6 +477,7 @@ def main() -> None:
         keep_ephemeral=args.keep_ephemeral,
         persist_every=args.persist_every,
         keep_persistent=args.keep_persistent,
+        solo_full_step=args.solo_full_step,
     )
 
     # Resume from disk before Flower's INIT, so `initialize_parameters` answers from the

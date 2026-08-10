@@ -948,6 +948,54 @@ if HAS_FLWR:
         assert strategy.v_vector[0].dtype == np.float32
         assert metrics["merge_round"] == 1
 
+    @check("a solo round takes the full step, because there is nothing to average")
+    def _():
+        # eta < 1 damps toward the previous global to reduce variance across replicas.
+        # With one contributor there are no replicas to average, so w_avg is that
+        # cluster's own weights and the damping only discards its progress -- 30% of
+        # every solo round at the paper's eta = 0.7. Solo rounds are the normal opening
+        # of a run, since min-clients is 1 so the first site out of the queue starts
+        # training rather than idling.
+        from flwr.common import parameters_to_ndarrays
+        from pww.central.strategy import FedMom
+
+        start, local = 0.0, 1.0
+        def run(solo_full_step):
+            s = FedMom(
+                transport=proto.TRANSPORT_INLINE,
+                initial_parameters=ndarrays_to_parameters(
+                    [np.full((4,), start, dtype=np.float16)]),
+                server_learning_rate=0.7, server_momentum=0.0,
+                solo_full_step=solo_full_step,
+            )
+            s.configure_fit(1, ndarrays_to_parameters(
+                [np.full((4,), start, dtype=np.float16)]), _FakeManager(1))
+            s.aggregate_fit(1, [(None, _fit_res({proto.CLUSTER: "lumi"}, 1_000_000,
+                arrays=[np.full((4,), local, dtype=np.float16)]))], [])
+            return float(s._global_fp32[0][0])
+
+        # Round 1 is momentum-free by construction (v_prev = w), so a solo full step
+        # lands exactly on the contributor's weights.
+        assert abs(run(True) - local) < 1e-6, run(True)
+        # ...and with it disabled, 30% of the move is discarded: 0 + 0.7*(1-0) = 0.7.
+        assert abs(run(False) - 0.7) < 1e-3, run(False)
+
+        # Two contributors must still be damped -- this is not "always take a full step".
+        s = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([np.zeros((4,), dtype=np.float16)]),
+            server_learning_rate=0.7, server_momentum=0.0, solo_full_step=True,
+        )
+        s.configure_fit(1, ndarrays_to_parameters([np.zeros((4,), dtype=np.float16)]),
+                        _FakeManager(2))
+        s.aggregate_fit(1, [
+            (None, _fit_res({proto.CLUSTER: "a"}, 1_000_000,
+                            arrays=[np.ones((4,), dtype=np.float16)])),
+            (None, _fit_res({proto.CLUSTER: "b"}, 1_000_000,
+                            arrays=[np.ones((4,), dtype=np.float16)])),
+        ], [])
+        assert abs(float(s._global_fp32[0][0]) - 0.7) < 1e-3, s._global_fp32[0][0]
+
     @check("a failed round leaves at the wire dtype, so one crash cannot wedge the server")
     def _():
         # The regression this pins cost a whole run. A round that produced no results

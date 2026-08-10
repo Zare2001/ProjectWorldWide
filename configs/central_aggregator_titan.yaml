@@ -43,6 +43,11 @@ flower-port: 29511
 # statistics. Qwen3 has no BatchNorm -- it is RMSNorm throughout, whose parameters
 # are learned rather than accumulated from batch statistics -- so momentum is safe
 # here, and it is the entire contribution of the FedMom paper.
+# A round with ONE contributor ignores this eta and uses 1.0, because with nothing to
+# average `w_avg` is that cluster's own weights and eta<1 is pure damping -- it would
+# discard 30% of the round for no variance reduction. That is the normal opening of a run,
+# since min-clients is 1 so the first site out of the queue trains rather than idles.
+# --no-solo-full-step restores the old behaviour. See FEDERATION_GUIDE.md section 3.
 server-learning-rate: 0.7
 server-momentum: 0.9
 

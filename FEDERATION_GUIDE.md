@@ -284,6 +284,35 @@ plain FedAvg parameter averaging, `w_next = w_avg`. That is the control arm for 
 DiLoCo-vs-FedAvg comparison, and it is what the earlier WikiText run was actually
 doing while its config claimed FedMom.
 
+### A round with one contributor takes the full step
+
+With a single cluster there is nothing to average: `w_avg` is that cluster's own weights,
+so the update reduces to
+
+```
+w_next = (1 - eta) * w + eta * w_local
+```
+
+and `eta < 1` is pure damping. It buys variance reduction across replicas, and there are
+no replicas — at the paper's `eta = 0.7` it discards **30% of the round's local progress
+for nothing**. So the outer step uses `eta = 1` when exactly one cluster contributed,
+which makes such a round exactly "adopt that cluster's weights".
+
+This is not a tuning choice, it is the degenerate case of the formula, and it matters
+because solo rounds are the *normal opening* of a run: `min-clients: 1` exists so the
+first site out of the queue starts training instead of idling, and a run frequently spends
+its first hours with `k = 1`. It is also what makes the "DiLoCo with k=1 — correct, not
+degraded" claim above actually true; before this, those rounds were degraded.
+
+Momentum is deliberately left alone. Round 1 is momentum-free by construction
+(`v_prev = w`), so this alone makes the opening round lossless, and changing `beta` too
+would alter the behaviour of a long run that merely loses a site for a while.
+
+`--no-solo-full-step` restores the old behaviour. The reason you might want it: `eta < 1`
+bounds how far a single cluster can drag the global model, which is a real property if you
+do not trust a site. The non-finite check and the drift metric are the intended guards for
+that, so it is off by default.
+
 Two deliberate departures from the paper:
 
 - **Deltas are weighted by tokens contributed**, `p_i = tokens_i / sum tokens`, not
@@ -292,6 +321,18 @@ Two deliberate departures from the paper:
   more. Reduces exactly to `1/k` when token counts are equal.
 - **`k` varies between rounds**, per the elastic membership above. The paper assumes
   it fixed.
+- **Training starts from a random initialisation.** DiLoCo's Algorithm 1 takes an initial
+  *pretrained* `theta^(0)`, and the outer values above were tuned in that setting — with
+  `H = 500`, uniform `1/k` averaging and all replicas starting together. From scratch the
+  first rounds behave differently: a measured opening round had
+  `drift = ||local - global|| / ||global|| = 1.69`, i.e. the local update was larger than
+  the weights themselves, which is what you would expect while the weights are still near
+  initialisation. It fell to 0.93 by the next round. Worth knowing that `drift_ratio` is
+  this repo's instrument and not the paper's, so there is no published threshold to
+  compare it against — but an update exceeding the norm of the weights means averaging is
+  not combining progress, so the early rounds are the ones to watch. The cheap levers are
+  a smaller `darl.inner_steps` for the opening rounds, or `server-momentum: 0.0` until
+  drift settles.
 
 ---
 
