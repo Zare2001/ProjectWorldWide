@@ -53,15 +53,20 @@ fi
 # consumed correctly by the child.
 export PWW_CONTAINER="${TITAN_SIF}"
 
-# --rocm as an environment variable rather than a flag, for the same reason: it must
-# survive into the child, and singularity maps boolean flags to SINGULARITY_<FLAG>.
-# The scratch bind that used to be spelled out here is already covered by
-# SINGULARITY_BIND in sites/lumi.sh, which lists /scratch among the AI bindings.
-export SINGULARITY_ROCM=1
-export APPTAINER_ROCM=1
-
-# Still set for anything run in THIS shell before the handoff.
-PWW_LAUNCH=(singularity exec --rocm --bind "${PWW_SCRATCH}" "${TITAN_SIF}")
+# NO --rocm, deliberately. It binds the host's ROCm over the container's, and this
+# image ships its own complete ROCm 6.4 while LUMI's host stack is 6.2.4. The older
+# librccl then shadows the newer one that libtorch_hip.so was linked against:
+#
+#   ImportError: .../libtorch_hip.so: undefined symbol: ncclGroupSimulateEnd
+#
+# which is a link-time failure at `import torch`, before any GPU is touched -- so it
+# reproduces on a login node and does not need an allocation to test. Device access
+# does not need the flag: /dev/kfd and /dev/dri are visible without it, which is why
+# no other job script here uses it either.
+#
+# The scratch bind is likewise unnecessary: sites/lumi.sh lists /scratch in
+# SINGULARITY_BIND alongside the rest of the AI bindings.
+PWW_LAUNCH=(singularity exec "${TITAN_SIF}")
 
 # MIOpen writes a kernel cache and defaults to $HOME, which on LUMI is a small
 # quota and shared between concurrent jobs -- two jobs racing on the same cache
