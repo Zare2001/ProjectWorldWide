@@ -71,6 +71,7 @@ mode = "selective"
 enable = true
 interval = 10
 last_save_model_only = false
+keep_latest_k = 2
 
 [comm]
 train_timeout_seconds = 300

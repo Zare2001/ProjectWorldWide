@@ -94,10 +94,11 @@ mode = "full"
 
 [checkpoint]
 enable = true
-# DARL commits are gated on a checkpoint actually being written, so this also sets how
-# much leased work is re-done after a crash. 200 at H=100 is every other round.
-interval = 200
+# Saved after every outer aggregation round (H=100). DARL commits are triggered
+# immediately on every round alongside checkpoint creation.
+interval = 100
 last_save_model_only = false
+keep_latest_k = 2
 
 [comm]
 # A round now includes a 16 GiB upload and a 32 GiB download, so a rank can sit in a

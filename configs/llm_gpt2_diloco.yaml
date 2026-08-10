@@ -21,7 +21,7 @@ diloco-outer-optimizer: sgd
 diloco-outer-lr: 1.0
 diloco-outer-momentum: 0.0
 
-save-every: 5
+save-every: 1
 log-every: 10
 seed: 42
 

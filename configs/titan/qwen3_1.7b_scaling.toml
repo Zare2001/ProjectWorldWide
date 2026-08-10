@@ -75,8 +75,11 @@ mode = "selective"
 
 [checkpoint]
 enable = true
-interval = 1000
+# Saved after every outer aggregation round (H=100). DARL commits are triggered
+# immediately on every round alongside checkpoint creation.
+interval = 100
 last_save_model_only = false
+keep_latest_k = 2
 
 [comm]
 train_timeout_seconds = 300

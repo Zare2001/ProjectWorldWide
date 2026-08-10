@@ -83,12 +83,12 @@ mode = "selective"
 
 [checkpoint]
 enable = true
-# Every 5 outer rounds at H=100. DARL commits are gated on this write (see
-# src/pww/titan/trainer.py), so a longer interval means more work re-leased after
-# a crash -- and a shorter one means more Lustre traffic. 500 is a compromise;
-# tune it against how long a round actually takes on the slower site.
-interval = 500
+# Saved after every outer aggregation round (H=100). DARL commits are triggered
+# immediately on every round alongside checkpoint creation.
+interval = 100
 last_save_model_only = false
+# Keep only the 2 latest checkpoints on disk, automatically deleting older ones.
+keep_latest_k = 2
 
 [comm]
 # Generous relative to a single-site run: the outer step gathers a full parameter
