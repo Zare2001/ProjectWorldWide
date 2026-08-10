@@ -39,9 +39,29 @@ if [[ ! -r "${TITAN_SIF}" ]]; then
     exit 1
 fi
 
-# Replaces the PWW_LAUNCH env.sh set up for the torch 2.7.1 container.
+# Replaces the 2.7.1 container env.sh selects with the torch 2.9 one, for the CHILD
+# process that does the training.
+#
+# It has to travel as PWW_CONTAINER, not as PWW_LAUNCH. `export PWW_LAUNCH` looks
+# like it works and cannot: bash does not export arrays, so run_train.sh -- a separate
+# process that sources env.sh itself (scripts/titan/run_train.sh:67) -- rebuilt
+# PWW_LAUNCH from PWW_CONTAINER and silently got the 2.7.1 image. The symptom was
+# eight ranks dying on `ModuleNotFoundError: No module named 'tyro'` while the header
+# printed the 2.7.1 path, which is the only place it was visible.
+#
+# env.sh reads PWW_CONTAINER while building PWW_LAUNCH, so exporting it here is
+# consumed correctly by the child.
+export PWW_CONTAINER="${TITAN_SIF}"
+
+# --rocm as an environment variable rather than a flag, for the same reason: it must
+# survive into the child, and singularity maps boolean flags to SINGULARITY_<FLAG>.
+# The scratch bind that used to be spelled out here is already covered by
+# SINGULARITY_BIND in sites/lumi.sh, which lists /scratch among the AI bindings.
+export SINGULARITY_ROCM=1
+export APPTAINER_ROCM=1
+
+# Still set for anything run in THIS shell before the handoff.
 PWW_LAUNCH=(singularity exec --rocm --bind "${PWW_SCRATCH}" "${TITAN_SIF}")
-export PWW_LAUNCH
 
 # MIOpen writes a kernel cache and defaults to $HOME, which on LUMI is a small
 # quota and shared between concurrent jobs -- two jobs racing on the same cache
