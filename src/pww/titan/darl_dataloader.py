@@ -103,18 +103,33 @@ def _release_on_sigterm(session: LeaseSession) -> None:
     previous = signal.getsignal(signal.SIGTERM)
 
     def handler(signum, frame):
+        # Bounded, because this runs inside the SIGTERM/SIGKILL grace period.
+        #
+        # The client defaults are timeout 30s with 6 retries and 1.5x backoff -- about
+        # 200 seconds worst case. Slurm's grace is typically 30-60s, so an unreachable
+        # coordinator would make the handler burn the entire window retrying and the ranks
+        # would be SIGKILLed instead of exiting cleanly. That is worse than not releasing
+        # at all, and the fallback for a failed release is TTL expiry either way: a
+        # release that needs six attempts was never going to land in time.
+        client = session.client
+        saved = (client.retries, client.timeout)
+        client.retries, client.timeout = 1, 5.0
         try:
-            released = session.release_all()
+            # close() rather than release_all(): it also stops the heartbeat thread, which
+            # would otherwise keep renewing spans that have just been handed back.
+            session.close(release=True)
             get_logger().warning(
-                "SIGTERM: released %d uncommitted DARL block(s) back to the pool; the "
-                "other site can take them immediately rather than after a lease TTL",
-                released,
+                "SIGTERM: released this cluster's uncommitted DARL blocks back to the "
+                "pool; the other site can take them immediately rather than after a "
+                "lease TTL"
             )
         except Exception as exc:                                      # noqa: BLE001
             # Never let cleanup convert a clean shutdown into a traceback: the blocks
             # expire on their TTL anyway, which is exactly the old behaviour.
             get_logger().warning("SIGTERM: could not release DARL leases (%s); they will "
                                  "expire on their TTL instead", exc)
+        finally:
+            client.retries, client.timeout = saved
         if callable(previous) and previous not in (signal.SIG_DFL, signal.SIG_IGN):
             previous(signum, frame)
         else:
