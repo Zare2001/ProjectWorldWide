@@ -149,7 +149,11 @@ fi
 # ends rather than an exception. Forwarding SIGTERM lets the DARL session release
 # its uncommitted spans immediately instead of the other site waiting out a full
 # lease TTL before it can pick them up.
-trap 'echo "SIGTERM -- releasing DARL leases"; kill -TERM ${TRAIN_PID:-0} 2>/dev/null' TERM
+# The shell only forwards the signal; the release itself happens in the client, which
+# installs a SIGTERM handler on the leader rank (darl_dataloader._release_on_sigterm) and
+# logs how many blocks it actually returned. This message used to claim the release
+# outright, before any handler existed -- so read the client's line, not this one.
+trap 'echo "SIGTERM -- forwarding to torchrun so the leader can release its DARL leases"; kill -TERM ${TRAIN_PID:-0} 2>/dev/null' TERM
 
 "${PWW_ROOT}/scripts/titan/run_train.sh" \
     --config "${CONFIG}" \

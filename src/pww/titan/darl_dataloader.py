@@ -53,6 +53,7 @@ complete there is by definition nothing uncommitted left to give back.
 
 from __future__ import annotations
 
+import signal
 import time
 from typing import Any, Iterator
 
@@ -69,6 +70,62 @@ from ..logging_utils import get_logger
 from .shards import ShardedTokenCorpus, read_manifest, verify_compatible
 
 logger = get_logger("pww.titan.darl_dataloader")
+
+
+def _release_on_sigterm(session: LeaseSession) -> None:
+    """Hand uncommitted spans back on SIGTERM instead of waiting out their TTL.
+
+    Slurm sends SIGTERM before the walltime SIGKILL, and at walltime a long DiLoCo run
+    ends normally rather than exceptionally -- so this is the common path, not an edge
+    case. Releasing here returns the tail to the pool in milliseconds; without it the
+    other site waits out a full lease TTL before it can pick those blocks up.
+
+    It was previously not wired at all, and worse, both job scripts printed
+    "SIGTERM -- releasing DARL leases" before forwarding the signal. `release_all()` is
+    only reachable through `LeaseSession.close()`, i.e. `__exit__` or an explicit call,
+    and Python's default SIGTERM handler terminates the process without unwinding: no
+    `__exit__`, no `finally`, no release. The log asserted something that never happened,
+    which is worse than the gap it described.
+
+    Leader only, because only the leader holds a session; the other ranks have nothing to
+    return.
+
+    Two honest limits:
+
+    * If the main thread is inside a C-level collective (RCCL/NCCL) when the signal
+      arrives, the handler does not run until that collective returns. A kill landing
+      mid-all-reduce therefore still falls back to TTL expiry. Between phases -- which is
+      where a walltime kill usually lands, since a phase is minutes -- it runs.
+    * The previous handler is chained rather than replaced. torchrun and torchtitan
+      install their own, and swallowing the termination would turn a walltime kill into a
+      hang.
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def handler(signum, frame):
+        try:
+            released = session.release_all()
+            get_logger().warning(
+                "SIGTERM: released %d uncommitted DARL block(s) back to the pool; the "
+                "other site can take them immediately rather than after a lease TTL",
+                released,
+            )
+        except Exception as exc:                                      # noqa: BLE001
+            # Never let cleanup convert a clean shutdown into a traceback: the blocks
+            # expire on their TTL anyway, which is exactly the old behaviour.
+            get_logger().warning("SIGTERM: could not release DARL leases (%s); they will "
+                                 "expire on their TTL instead", exc)
+        if callable(previous) and previous not in (signal.SIG_DFL, signal.SIG_IGN):
+            previous(signum, frame)
+        else:
+            raise SystemExit(128 + signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        # Not the main thread. Nothing is lost -- this is an optimisation over TTL expiry.
+        get_logger().debug("not on the main thread; leaving SIGTERM to its default")
+
 
 
 class DARLWindowDataset(IterableDataset, Stateful):
@@ -316,6 +373,7 @@ def build_darl_dataloader(
             ranks=dp_world_size,
             commit_policy=darl_cfg.commit_policy,
         )
+        _release_on_sigterm(session)
 
     source = DARLDataSource(
         space,

@@ -121,7 +121,11 @@ fi
 # milliseconds instead of after a full TTL, which is the difference between the
 # other site idling for a quarter of an hour at every walltime kill and not idling
 # at all. Slurm sends SIGTERM before SIGKILL, so forward it to torchrun's group.
-trap 'echo "SIGTERM -- releasing DARL leases"; kill -TERM ${TRAIN_PID:-0} 2>/dev/null' TERM
+# The shell only forwards the signal; the release itself happens in the client, which
+# installs a SIGTERM handler on the leader rank (darl_dataloader._release_on_sigterm) and
+# logs how many blocks it actually returned. This message used to claim the release
+# outright, before any handler existed -- so read the client's line, not this one.
+trap 'echo "SIGTERM -- forwarding to torchrun so the leader can release its DARL leases"; kill -TERM ${TRAIN_PID:-0} 2>/dev/null' TERM
 
 "${PWW_ROOT}/scripts/titan/run_train.sh" \
     --config "${CONFIG}" \

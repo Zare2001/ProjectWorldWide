@@ -10,10 +10,21 @@ Both sites run the same code independently, verified end to end:
 | all-reduce, 1 node / 2 nodes | 123 / 88 GB/s | 300.8 / 133.1 GB/s |
 | torch | 2.7.1+rocm6.2.4 | 2.7.1+cu126 |
 
-The cross-site mechanism is built and CPU-verified: **DARL** partitions the corpus
-by lease so the sites cover it exactly once, and **Flower + `PWWFedMom`** does the
-DiLoCo outer step on the central VM. What has *not* happened is a real multi-site
-run of the torchtitan path on GPUs. That is the whole of the open work below.
+The cross-site mechanism is built, CPU-verified, and **has now run on GPUs at both
+sites simultaneously**: **DARL** partitions the corpus by lease so the sites cover it
+exactly once, and **Flower + `PWWFedMom`** does the DiLoCo outer step on the central VM.
+
+Where it actually stands, as of the last run:
+
+- **Real C4, 5.65B tokens** (2,756,597 windows), digest-matched at both sites.
+- **Rounds merge with both sites contributing.** A two-cluster round reported
+  19,660,800 tokens and completed the FedMom merge.
+- **One site's contribution came back non-finite**, and that is the live blocker. It is
+  dropped rather than averaged now, so the run survives it — but that site contributes
+  nothing until it is fixed. See § 4.
+
+So the open work is no longer "make it run". It is: find out why one site diverges, and
+close the verification gaps that a run which merges does not by itself close.
 
 ---
 
@@ -57,14 +68,15 @@ Verified by measurement, CPU-only (`tests/test_darl.py`, `test_titan.py`,
 
 ## Open
 
-### 1. Stand up the torch 2.9 environments — blocking everything else
+### 1. The torch 2.9 environments — done, except parity
 
 torchtitan at the pinned commit needs torch >= 2.9; this repo pins 2.7.1 on both
-sites for numerical comparability. The scripts exist but have not been run on the
-real machines.
+sites for numerical comparability.
 
-- [ ] Snellius: `./scripts/titan/setup_venv_snellius.sh` (torch 2.9.1+cu128)
-- [ ] LUMI: `sbatch scripts/lumi/build_titan_container.sh` (ROCm 6.4.4 / torch 2.9.1)
+- [x] Snellius: venv built and in use — job logs show
+      `activated torchtitan venv: ~/venvs/pww-titan-snellius`
+- [x] LUMI: container built and in use — job logs show
+      `singularity exec $PWW_SCRATCH/containers/pww-titan.sif`
 - [ ] **Re-establish parity at the new version.** Both sites on the same torch
       *minor* version, and the CIFAR-10 comparison re-run there. The 0.2-point
       agreement between sites is the evidence that the port is correct, and it does
@@ -72,31 +84,65 @@ real machines.
 
 ### 2. GPU verification of what CPU tests cannot reach
 
-Everything in this list is untested on hardware. `configs/titan/qwen3_0.6b_smoke.toml`
-is the smallest thing that exercises it.
+All of this has now **executed** on hardware at both sites. Executing is not the same
+as being correct, and the distinction is doing real work here: one site trains, merges,
+and returns non-finite weights, so something in this list runs without being right.
 
-- [ ] FSDP2 wrapping of Qwen3 through torchtitan's `TrainSpec`
-- [ ] a real Qwen3 forward/backward against the 128k-vocab embedding, padded to a
-      multiple of 256
-- [ ] the DTensor gather/scatter in `titan/params.py` and `delta.py` on real shards
-      across 8 GCDs and 4 H100s — verified on gloo, not on ROCm or NCCL
-- [ ] `bf16` numerics on MI250X vs H100 for the same config
+- [x] FSDP2 wrapping of Qwen3 through torchtitan's `TrainSpec` — both sites train
+- [x] a real Qwen3 forward/backward against the 128k-vocab embedding — losses of 10.9
+      falling to 7.3 over 8 rounds on one site, so the model learns
+- [ ] **the DTensor gather/scatter in `titan/params.py` and `delta.py` is the prime
+      suspect for the non-finite contributions.** It has run on 8 GCDs and 4 H100s, and
+      the evidence that it may be wrong at 8 ranks is that the site evaluating the *same*
+      global weights scored 0.93 nats off an untrained model (`ln 131,328 = 11.79`), which
+      means it was not running the weights it was sent. Verified on 2 gloo ranks only.
+- [ ] **`bf16` numerics on MI250X vs H100** — now a live question rather than a
+      precaution. Note the asymmetry that makes it sharp: local compute is bfloat16
+      (range ~3.4e38) and the wire is float16 (max 65,504), so a weight that is ordinary
+      locally becomes `inf` on the cast. Whether the non-finite values are produced by
+      training or by that cast is unresolved and is one finiteness check away.
 - [ ] DCP checkpoint save/load across the two sites' differing rank counts
 
 ### 3. Corpus staging at scale
 
-- [ ] run `stage_c4.sh` / `tokenize_c4.sh` on real C4, not `c4_test`, and record the
-      window count both sites must agree on
-- [ ] confirm the manifest digest matches across sites before the first run — a
-      mismatch is refused at registration, which is the intended behaviour, but
-      better to find out on a login node
+- [x] **done.** Real C4, `--max-files 32`: **2,756,597 windows = 5.65B training tokens**
+      at `seq_len 2048`, vocab 131,328. That is `training.dataset = "pww_tokens"` over the
+      shard directory, 5,077x the `c4_test` fixture — the fixture is only the *validation*
+      set, see below.
+- [x] **done.** Manifest digest `f1bfffe94c71a9ab…` confirmed identical at both sites, and
+      cross-checked three ways before either job was queued: the tokenizer.json sha256
+      against the manifest's own field, the shard byte total
+      (`2,756,597 x 2049 x 4 = 22,593,069,012`, exact), and all 22 shard boundaries walked
+      through `ShardedTokenCorpus`. The coordinator's block-space digest
+      (`20f69387b3d4ba09`, 2,692 blocks) was derived independently on both sides and
+      matched — which is the check that actually gates registration.
+- [ ] **validation is still the `c4_test` fixture, and that is the remaining gap.**
+      Training is real C4; the held-out number is 512 windows (~1.05M tokens) of
+      torchtitan's 2,000-document test asset. `run_train.sh` now fixes the window *total*
+      via `PWW_VAL_WINDOWS` so the sites score identical data and the figure is comparable
+      between them — but it is not a publishable C4 perplexity, and the fixture's
+      disjointness from a specific `--max-files` slice is plausible rather than verified.
+      A reportable number needs a held-out tail carved out of the run's own shards and
+      excluded from the DARL block space, which changes `num_samples` and the digest and so
+      is a `PWW_FRESH_RUN=1` change.
 - [ ] measure the tokenisation pass: it is offline and one-off, but it is also the
       only step whose cost scales with the corpus rather than the run
 
 ### 4. The first real cross-site run
 
-- [ ] 0.6B, inline transport, both sites, and confirm from the logs that `merge
-      round` advances with nonzero tokens from both
+- [x] **0.6B, inline transport, both sites, merging.** A two-cluster round reported
+      19,660,800 tokens (13,107,200 from the 8-GCD site, 6,553,600 from the 4-GPU one,
+      i.e. token weighting behaving as intended) and completed the merge. Throughput
+      263,721 tok/s combined.
+- [ ] **Find why one site returns non-finite weights. This is the blocker.** What is
+      known: it starts clean (`PWW_FRESH_RUN=1` clears its checkpoint), its learning rate
+      is *lower* than the other site's, its first held-out eval on the shared global model
+      read 0.93 nats off an untrained model, and its first training contribution is
+      non-finite in tensor 0 of 311 (the embedding). Two candidates, needing opposite
+      fixes: the parameter scatter at 8 ranks (§ 2), or the bfloat16-local /
+      float16-wire cast overflowing. The per-step loss trace added for this will say which
+      — a first non-finite step of 1 points at the weights it was handed, step 40-odd
+      points at optimisation.
 - [ ] deliberately kill one site at walltime mid-round and confirm the survivor
       continues and the requeued site's stale delta is rejected once, then rejoins
 - [ ] 8B, blob transport, and measure the actual WAN transfer time per round
@@ -104,9 +150,14 @@ is the smallest thing that exercises it.
 
 ### 5. Hyperparameters that are guesses until measured
 
-- [ ] **H.** `inner_steps: 100` follows the paper. `drift` per round is the number
-      to read: near zero means H is too small to be worth the WAN round trip, large
-      means the replicas diverged far enough that averaging loses information.
+- [ ] **H.** `inner_steps: 100`, against the paper's 500. Now partly measured rather
+      than a guess: from a random initialisation, drift was **1.69** on the opening round
+      and **0.93** on the next — i.e. the local update was larger than the norm of the
+      weights themselves. That is expected while the weights are near initialisation and
+      it is falling fast, so it may need nothing; the open question is whether it keeps
+      falling. If it does not, the levers are a smaller H for the opening rounds or
+      `server-momentum: 0.0` until it settles. Note this is a consequence of training from
+      scratch, which the paper's Algorithm 1 does not assume — see FEDERATION_GUIDE § 3.
 - [ ] **Outer LR.** Now 0.7 with momentum 0.9, the paper's values, and consistent
       with `src/pww/diloco.py`. Worth an A/B against `1.0 / 0.0` (exact FedAvg),
       which is the control arm.
@@ -225,9 +276,23 @@ one is caught by a human remembering to run two commands.
 
 - [ ] `--keep-rounds` prunes old blobs; confirm the pruning actually keeps disk
       bounded over a 200-round run rather than only in the test
-- [ ] wire `release_all()` to SIGTERM in the torchtitan job scripts, as the legacy
-      path does. Slurm sends SIGTERM before the walltime kill, and releasing there
-      returns blocks in milliseconds instead of after a full TTL.
+- [x] **done.** `release_all()` is wired to SIGTERM on the leader rank
+      (`darl_dataloader._release_on_sigterm`), so uncommitted spans go back to the pool in
+      milliseconds instead of after a full lease TTL. Slurm sends SIGTERM before the
+      walltime SIGKILL and a long DiLoCo run ends at walltime *normally*, so this is the
+      common path.
+
+      It was not merely missing before: both job scripts printed "SIGTERM -- releasing DARL
+      leases" and then forwarded the signal, while no handler existed anywhere in
+      `src/pww/titan/` — Python's default SIGTERM terminates without unwinding, so
+      `LeaseSession.close()` never ran. The log asserted a release that never happened, and
+      the shell messages now describe only what the shell does.
+
+      Two limits, stated in the code: a signal arriving while the main thread is inside a
+      C-level RCCL/NCCL collective is not handled until that collective returns, so a kill
+      landing mid-all-reduce still falls back to TTL expiry; and the previous handler is
+      chained rather than replaced, so termination is never swallowed into a hang.
+
 - [ ] a third site is already supported with no special handling (see below), but it
       has never been tried
 
