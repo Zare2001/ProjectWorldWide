@@ -102,6 +102,19 @@ enable = true
 # would report training loss. c4_test is the bundled offline fixture, which is
 # held out from a real C4 run by construction.
 dataset = "c4_test"
+# Both values below are OVERRIDDEN by scripts/titan/run_train.sh, and have to be:
+#
+#   dataset_path  is relative here, which resolves only when the job's working directory
+#                 is the repo root. run_train.sh passes the absolute path.
+#   steps         scores steps x local_batch_size x nproc windows, so a fixed number means
+#                 a site with 8 ranks evaluates twice as many windows as one with 4 --
+#                 against a ~543-window fixture, that is 1.2 vs 2.4 passes and two
+#                 held-out losses that cannot be compared. run_train.sh computes steps
+#                 from PWW_VAL_WINDOWS (default 512) so the window *total* is identical
+#                 at every site, which is what makes the cross-site check mean anything.
+#
+# Left here as the single-site defaults, so `python3 -m pww.titan.train` without the
+# launcher still validates on something.
 dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
 freq = 500
 steps = 20

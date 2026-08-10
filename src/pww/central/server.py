@@ -38,6 +38,15 @@ from .. import fedproto as proto
 
 logger = get_logger("pww.central.server")
 
+# Held-out loss spread across clusters that triggers a warning, in nats.
+#
+# Deliberately loose. Clusters evaluate the same global model, so on a decent held-out
+# split they should agree to well under a tenth of a nat -- but a small
+# validation.steps over a re-looped fixture makes the per-site samples genuinely
+# different, and then a nat of spread is data, not a bug. 1.0 catches the case that
+# preceded a real failure (2.05) without firing on that noise.
+EVAL_SPREAD_WARN_NATS = 1.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -119,6 +128,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recent global blobs to retain, so a cluster mid-download when the round "
              "advances can still finish it",
     )
+
+    g = parser.add_argument_group("global-model checkpoints")
+    g.add_argument(
+        "--checkpoint-dir", type=str, default=None,
+        help="Where to snapshot the merged global model and momentum buffer. Defaults "
+             "to <state-dir>/checkpoints. Without a state dir there is nowhere to put "
+             "them and checkpointing is off",
+    )
+    g.add_argument(
+        "--keep-ephemeral", type=int, default=2,
+        help="Per-merge snapshots retained (crash recovery). 0 disables them",
+    )
+    g.add_argument(
+        "--persist-every", type=int, default=5,
+        help="Write a retained snapshot every N merges (rollback history). 0 disables",
+    )
+    g.add_argument(
+        "--fresh-model", action="store_true",
+        help="Ignore existing checkpoints and re-seed from the first cluster to connect. "
+             "The counterpart of DARL_FRESH: needed when the architecture changes, since "
+             "a checkpoint's tensor shapes must match the model the sites build",
+    )
+    g.add_argument(
+        "--keep-persistent", type=int, default=4,
+        help="Retained snapshots kept, newest first. 0 means unbounded -- at 0.6B that "
+             "is ~4.8 GiB each, so 200 rounds at --persist-every 5 is ~192 GiB",
+    )
     return parser
 
 
@@ -181,20 +217,73 @@ def build_metric_aggregators():
         # the further apart the clusters are. Two sites at loss 2.0 and 4.0 report 31.0
         # against a true 20.1, and the error moves with cluster skew rather than with the
         # model, which is the worst property a training metric can have.
-        losses = [(n, float(m["eval_loss"])) for n, m in metrics if "eval_loss" in m]
+        reported = [(n, float(m["eval_loss"]), str(m.get(proto.CLUSTER, "?")))
+                    for n, m in metrics if "eval_loss" in m]
+
+        # A non-finite loss is excluded, not pooled.
+        #
+        # One cluster reporting nan otherwise makes the pooled loss nan, and the clamp
+        # below hides it: min(20.0, nan) returns 20.0, because `nan < 20.0` is False, so
+        # exp(20) = 485165195.41 gets printed as though it were a real perplexity. That
+        # is what ten consecutive rounds of a dead run looked like -- a specific,
+        # plausible-looking number rather than an obvious nan.
+        losses = [(n, v, c) for n, v, c in reported if math.isfinite(v)]
+        dropped = [(c, v) for n, v, c in reported if not math.isfinite(v)]
+        if dropped:
+            logger.error(
+                "  >> excluded %d non-finite held-out loss(es) from the pooled figure: "
+                "%s. A site reporting this is not producing a usable model; its training "
+                "loss is where to look.",
+                len(dropped), ", ".join(f"{c}={v}" for c, v in dropped),
+            )
+
         if losses:
-            weight = sum(n for n, _ in losses)
-            pooled_loss = sum(n * v for n, v in losses) / weight
+            weight = sum(n for n, _, _ in losses)
+            pooled_loss = sum(n * v for n, v, _ in losses) / weight
             pooled_ppl = math.exp(min(20.0, pooled_loss))
             per_cluster = ", ".join(
-                f"{math.exp(min(20.0, v)):.2f}" for _, v in losses
+                f"{math.exp(min(20.0, v)):.2f}" for _, v, _ in losses
             )
             logger.info(
                 "  >> Perplexity %.2f  (held-out loss %.4f; per-cluster ppl [%s], "
                 "%s eval tokens)",
                 pooled_ppl, pooled_loss, per_cluster, f"{weight:,}",
             )
+
+            # Every cluster evaluates the same global model, so a wide spread in held-out
+            # loss is worth looking at. It is a prompt, not a verdict, and the two
+            # explanations need different fixes:
+            #
+            #   the site is not running the weights it was sent -- a parameter-application
+            #   bug, which is the serious one, or
+            #
+            #   the sites are not scoring the same data. With validation.dataset pointed at
+            #   a small fixture and validation.steps small, sites with different rank
+            #   counts consume different amounts of a re-looped set, and the gap can be
+            #   large without anything being wrong with the model.
+            #
+            # A real run observed 10.85 vs 8.80 nats here one round before a site's
+            # contribution arrived as nan, so the signal is worth surfacing -- but that
+            # run also had validation on a 2,000-document fixture at 8 vs 4 ranks, which
+            # is enough on its own to explain a gap that size. Hence the wording.
+            if len(losses) > 1:
+                worst = max(losses, key=lambda item: item[1])
+                best = min(losses, key=lambda item: item[1])
+                spread = worst[1] - best[1]
+                if spread > EVAL_SPREAD_WARN_NATS:
+                    logger.warning(
+                        "  >> held-out loss spread %.2f nats across clusters (%s=%.2f vs "
+                        "%s=%.2f) on the same global model. Either %s is not applying the "
+                        "weights it was sent, or the clusters are not scoring the same "
+                        "data -- check validation.dataset/steps and the eval token counts "
+                        "above before reading anything into the model.",
+                        spread, worst[2], worst[1], best[2], best[1], worst[2],
+                    )
             return {"eval_loss": pooled_loss, "perplexity": pooled_ppl}
+        if reported:
+            logger.error("  >> every cluster reported a non-finite held-out loss; "
+                         "no perplexity for this round")
+            return {}
 
         values = [(n, float(m["accuracy"])) for n, m in metrics if "accuracy" in m]
         if values:
@@ -261,6 +350,30 @@ def main() -> None:
         if state is not None and state.initialised:
             state.log_disk_budget(sites=max(1, args.min_clients))
 
+    # Checkpoints of the merged global model. Only inline transport needs these: the
+    # blob path already writes the global model through GlobalState, while inline held
+    # it purely in memory -- --state-dir was set, the startup line said "durable state
+    # in ...", and the directory stayed empty through every successful merge.
+    checkpoint_dir = None
+    if args.checkpoint_dir:
+        checkpoint_dir = Path(args.checkpoint_dir)
+    elif args.state_dir and args.transport != proto.TRANSPORT_BLOB:
+        checkpoint_dir = Path(args.state_dir) / "checkpoints"
+    if checkpoint_dir is not None:
+        logger.info(
+            "global checkpoints in %s | %d ephemeral (every merge) + %s persistent "
+            "(every %d merges)",
+            checkpoint_dir, args.keep_ephemeral,
+            args.keep_persistent or "unbounded", args.persist_every,
+        )
+        if not args.keep_persistent:
+            logger.warning(
+                "--keep-persistent 0 is unbounded: at 0.6B a checkpoint is ~4.8 GiB, so "
+                "%d rounds at --persist-every %d would need ~%.0f GiB",
+                args.num_rounds, max(1, args.persist_every),
+                args.num_rounds / max(1, args.persist_every) * 4.8,
+            )
+
     logger.info("Starting Flower Aggregator Server (FedMom) on %s...", server_address)
     logger.info(
         "transport=%s | server_learning_rate=%s, server_momentum=%s | "
@@ -305,7 +418,22 @@ def main() -> None:
         blob_url=args.blob_url,
         run_id=args.run_id,
         keep_rounds=args.keep_rounds,
+        checkpoint_dir=checkpoint_dir,
+        keep_ephemeral=args.keep_ephemeral,
+        persist_every=args.persist_every,
+        keep_persistent=args.keep_persistent,
     )
+
+    # Resume from disk before Flower's INIT, so `initialize_parameters` answers from the
+    # checkpoint and no client is asked to re-seed a run that already has a model.
+    if checkpoint_dir is not None and not args.fresh_model:
+        resumed = strategy.resume_from_checkpoint()
+        if resumed is not None:
+            logger.info("resumed the global model at merge round %d from %s",
+                        resumed, checkpoint_dir)
+        else:
+            logger.info("no usable checkpoint in %s; the first cluster to connect will "
+                        "seed the global model", checkpoint_dir)
 
     if args.min_clients <= 1:
         logger.info(

@@ -130,6 +130,59 @@ overrides=()
 [[ -n "${SHARDS}" ]] && overrides+=(--training.dataset_path "${SHARDS}")
 [[ -n "${DUMP}" ]] && overrides+=(--job.dump_folder "${DUMP}")
 
+# --- validation, made identical across sites --------------------------------
+#
+# The held-out loss is the only cross-site check there is: every cluster evaluates the
+# *same* global weights, so a disagreement is a bug rather than variance. That only holds
+# if the sites score the same data, and two things stopped them.
+#
+#   dataset_path  relative in the TOML ("./third_party/..."), so it resolved only because
+#                 both jobs happened to run with the repo as their working directory. A
+#                 different CWD, or a container without the submodule visible, and
+#                 validation reads nothing or reads something else.
+#
+#   steps         total windows scored = steps x local_batch_size x nproc, so a fixed
+#                 `steps` scales with the rank count. At 20 steps and batch 8 that is 640
+#                 windows on 4 ranks and 1,280 on 8 -- against a fixture of ~543 windows,
+#                 so the sites re-looped it 1.2x and 2.4x and weighted the partial tail
+#                 differently. Observed as 1,310,720 vs 2,621,440 eval tokens.
+#
+# Fixing the window TOTAL instead of the step count makes coverage identical: the loader
+# shards round-robin, so taking the first k windows on each of n ranks covers windows
+# 0..(n*k - 1) for any n. Same union, same mean, comparable number.
+VAL_DATA="${PWW_VAL_DATA:-${PWW_ROOT}/third_party/torchtitan/tests/assets/c4_test}"
+if [[ -d "${VAL_DATA}" ]]; then
+    overrides+=(--validation.dataset_path "${VAL_DATA}")
+else
+    echo "WARNING: no validation data at ${VAL_DATA}; leaving validation.dataset_path as" \
+         "configured, which is relative and depends on the working directory" >&2
+fi
+
+VAL_WINDOWS="${PWW_VAL_WINDOWS:-512}"
+if [[ "${VAL_WINDOWS}" != "0" ]]; then
+    val_batch="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}" \
+                 | cut -d= -f2 | tr -d ' ')"
+    if [[ "${val_batch}" =~ ^[1-9][0-9]*$ ]]; then
+        per_step=$(( val_batch * NPROC ))
+        val_steps=$(( VAL_WINDOWS / per_step ))
+        (( val_steps < 1 )) && val_steps=1
+        if (( val_steps * per_step != VAL_WINDOWS )); then
+            echo "NOTE: PWW_VAL_WINDOWS=${VAL_WINDOWS} is not a multiple of ${per_step}" \
+                 "(local_batch_size ${val_batch} x ${NPROC} ranks), so this site will" \
+                 "score $(( val_steps * per_step )) windows. Sites whose rank counts give" \
+                 "a different remainder will not be comparable -- choose a multiple of" \
+                 "every site's local_batch_size x nproc." >&2
+        fi
+        overrides+=(--validation.steps "${val_steps}")
+        echo "validation  : ${val_steps} steps x ${val_batch} x ${NPROC} ranks =" \
+             "$(( val_steps * per_step )) windows (PWW_VAL_WINDOWS=${VAL_WINDOWS})"
+    else
+        echo "WARNING: could not read local_batch_size from ${CONFIG}; leaving" \
+             "validation.steps as configured. The held-out loss will not be comparable" \
+             "between sites with different rank counts." >&2
+    fi
+fi
+
 # The federation endpoints. Only added when the config actually asks for DARL, so
 # a plain single-site torchtitan run through this launcher needs no coordinator.
 if grep -qE '^[[:space:]]*dataset[[:space:]]*=[[:space:]]*"pww_tokens"' "${CONFIG}"; then

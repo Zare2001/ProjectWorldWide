@@ -141,6 +141,11 @@ if HAS_FLWR:
             blob_url: str = "",
             run_id: str = "pww",
             keep_rounds: int = 1,
+            # Global-model checkpoints, two tiers. See `_checkpoint`.
+            checkpoint_dir: str | Path | None = None,
+            keep_ephemeral: int = 2,
+            persist_every: int = 5,
+            keep_persistent: int = 4,
         ) -> None:
             super().__init__(
                 fraction_fit=fraction_fit,
@@ -184,6 +189,12 @@ if HAS_FLWR:
             self.v_vector: NDArrays | None = None
             self._global_fp32: NDArrays | None = None
             self._inline_round = 0
+            self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+            self.keep_ephemeral = max(0, int(keep_ephemeral))
+            self.persist_every = max(0, int(persist_every))
+            self.keep_persistent = max(0, int(keep_persistent))
+            if self.checkpoint_dir is not None:
+                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             # The dtype the clients put on the wire, remembered.
             #
             # It used to be a local inside `_aggregate_inline`, discovered from the
@@ -346,6 +357,160 @@ if HAS_FLWR:
             if self.transport == proto.TRANSPORT_BLOB:
                 return self._aggregate_blob(server_round, results, metrics)
             return self._aggregate_inline(server_round, results, metrics)
+
+        # --- global-model checkpoints ---------------------------------------
+
+        def _checkpoint(self, merge_round: int) -> Path | None:
+            """Snapshot the merged global model and its momentum buffer.
+
+            Two tiers, because they answer different questions:
+
+            **ephemeral** -- written every merge, only the newest `keep_ephemeral`
+            retained. This is crash recovery: if the aggregator dies, the run resumes
+            from a round or two ago rather than from scratch. Frequent and cheap to
+            discard.
+
+            **persistent** -- every `persist_every` merges, retained separately. This
+            is the one that matters for a poisoned run: it is a coarse history you can
+            roll *back* to after discovering that the model went bad several rounds
+            ago. An ephemeral-only scheme cannot do that, because by the time a human
+            reads the loss the good state has already been evicted -- which is exactly
+            what happened here: nan entered at round 9 and was noticed at round 18.
+
+            Both are pruned oldest-first, so the newest N survive.
+
+            Why this exists at all: with `transport=blob` the global model is written
+            through `GlobalState`, but every `self.state` call is on the blob path, so
+            **inline transport persisted nothing**. `--state-dir` was set, the log said
+            "durable state in ...", and the directory stayed empty through eighteen
+            successful merges. There was nothing to resume from and nothing to roll
+            back to.
+
+            Cost, stated because it is not small: weights and momentum are both
+            float32, so one checkpoint is 2x the parameter count in bytes -- ~4.8 GiB
+            at 0.6B. The defaults keep 2 ephemeral + 4 persistent, so ~29 GiB steady
+            state. `keep_persistent=0` means unbounded, which over 200 rounds at
+            `persist_every=5` is 40 checkpoints, ~192 GiB: check the filesystem first.
+            """
+            if self.checkpoint_dir is None or self._global_fp32 is None:
+                return None
+            persistent = (self.persist_every > 0
+                          and merge_round % self.persist_every == 0)
+            if not persistent and self.keep_ephemeral == 0:
+                return None
+
+            tier = "persistent" if persistent else "ephemeral"
+            name = f"round-{merge_round:06d}-{tier}.npz"
+            final = self.checkpoint_dir / name
+            tmp = final.with_suffix(".npz.tmp")
+            payload = {f"w{i}": layer for i, layer in enumerate(self._global_fp32)}
+            if self.v_vector is not None:
+                payload.update({f"v{i}": layer for i, layer in enumerate(self.v_vector)})
+            payload["meta"] = np.array(
+                [merge_round, len(self._global_fp32),
+                 0 if self.v_vector is None else len(self.v_vector)], dtype=np.int64)
+            try:
+                # Uncompressed on purpose: these are float32 weights, which compress
+                # by a few percent for several minutes of CPU. Write to .tmp and
+                # rename, so a kill mid-write cannot leave a half file that looks
+                # loadable -- the same reason the DARL snapshot does it this way.
+                with open(tmp, "wb") as handle:
+                    np.savez(handle, **payload)
+                tmp.replace(final)
+            except OSError as exc:
+                log(ERROR, "could not write checkpoint %s: %s", name, exc)
+                tmp.unlink(missing_ok=True)
+                return None
+
+            size = final.stat().st_size
+            logger.info("checkpoint %s (%s, %.2f GiB)", name, tier, size / 2 ** 30)
+            self._prune_checkpoints(tier, self.keep_persistent if persistent
+                                    else self.keep_ephemeral)
+            return final
+
+        def _prune_checkpoints(self, tier: str, keep: int) -> None:
+            """Keep the newest `keep`; 0 means unbounded."""
+            if self.checkpoint_dir is None or keep <= 0:
+                return
+            existing = sorted(self.checkpoint_dir.glob(f"round-*-{tier}.npz"))
+            for stale in existing[:-keep]:
+                try:
+                    freed = stale.stat().st_size
+                    stale.unlink()
+                    logger.info("pruned %s (%s, freed %.2f GiB)",
+                                stale.name, tier, freed / 2 ** 30)
+                except OSError as exc:
+                    log(WARNING, "could not prune %s: %s", stale.name, exc)
+
+        def latest_checkpoint(self) -> Path | None:
+            """Newest checkpoint of either tier, for a resume or a rollback."""
+            if self.checkpoint_dir is None:
+                return None
+            found = list(self.checkpoint_dir.glob("round-*-ephemeral.npz"))
+            found += list(self.checkpoint_dir.glob("round-*-persistent.npz"))
+            # Sort by the round in the name, not mtime: a rollback may reinstate an
+            # older round, and mtime would then pick the wrong one.
+            return max(found, key=lambda p: p.name.split("-")[1], default=None)
+
+        def resume_from_checkpoint(self) -> int | None:
+            """Adopt the newest *finite* checkpoint, newest-first. None if there is none.
+
+            Newest-first, but "newest that is not poisoned" rather than simply newest.
+            That distinction is the whole reason for two tiers: when a run dies from a
+            non-finite merge, the newest checkpoints are the dead ones, and blindly
+            loading the latest would reinstate exactly the state you are trying to
+            escape. Walking backwards past them lands on the last good round -- which,
+            with ephemerals evicted, is typically a persistent one.
+
+            Loading here rather than in `initialize_parameters` is deliberate: setting
+            `_global_fp32` makes that method return these weights, so Flower never asks a
+            client to seed the model and a resumed run cannot be re-seeded from whatever
+            site happens to connect first.
+            """
+            if self.checkpoint_dir is None:
+                return None
+            candidates = sorted(
+                list(self.checkpoint_dir.glob("round-*-ephemeral.npz"))
+                + list(self.checkpoint_dir.glob("round-*-persistent.npz")),
+                key=lambda p: p.name.split("-")[1],
+                reverse=True,
+            )
+            for path in candidates:
+                try:
+                    merge_round = self.load_checkpoint(path)
+                except Exception as exc:                              # noqa: BLE001
+                    log(WARNING, "checkpoint %s is unreadable (%s); trying the one "
+                        "before it", path.name, exc)
+                    continue
+                if all(np.all(np.isfinite(layer)) for layer in self._global_fp32 or []):
+                    if path is not candidates[0]:
+                        log(WARNING,
+                            "skipped %d newer checkpoint(s) containing nan/inf; resumed "
+                            "at merge round %d instead. The rounds after it trained on a "
+                            "poisoned model and are not recoverable.",
+                            candidates.index(path), merge_round)
+                    return merge_round
+                log(WARNING, "checkpoint %s contains nan/inf; trying the one before it",
+                    path.name)
+            self._global_fp32 = None
+            self.v_vector = None
+            self._inline_round = 0
+            if candidates:
+                log(ERROR, "every checkpoint in %s contains nan/inf -- cold starting from "
+                    "a client instead", self.checkpoint_dir)
+            return None
+
+        def load_checkpoint(self, path: str | Path) -> int:
+            """Reinstate weights and momentum from a checkpoint. Returns its round."""
+            with np.load(path) as data:
+                meta = data["meta"]
+                merge_round, n_w, n_v = int(meta[0]), int(meta[1]), int(meta[2])
+                self._global_fp32 = [data[f"w{i}"] for i in range(n_w)]
+                self.v_vector = [data[f"v{i}"] for i in range(n_v)] if n_v else None
+            self._inline_round = merge_round
+            logger.info("restored global model from %s at merge round %d",
+                        Path(path).name, merge_round)
+            return merge_round
 
         def _log_failures(self, server_round: int, failures) -> None:
             """Say *why* a round produced no results.
@@ -611,21 +776,65 @@ if HAS_FLWR:
             #             the first round. Normalised weights are bounded by 1.
             #   drift     momentum accumulates over hundreds of rounds; held in
             #             float16 it quantises each update toward zero.
+            # A cluster whose weights contain nan or inf is dropped, not averaged.
+            #
+            # This is not defensive tidiness. A single poisoned contribution does not
+            # degrade the average, it destroys it: nan propagates through the weighted
+            # sum, into w_next, into `self._global_fp32`, and from there into every
+            # future round via configure_fit -- so one bad round from one site ends the
+            # run, and the logs keep reporting healthy token counts and "merge complete"
+            # while doing it. Observed exactly once, and it cost 9 rounds across two
+            # allocations before anyone read the loss: a site joined at round 9, its
+            # first contribution was nan, and rounds 10-18 were arithmetic on nan.
+            #
+            # Dropping it degrades that to a skipped merge for one site, which is the
+            # same handling as a stale delta and is already a supported state (k varies
+            # by round in this implementation -- see the DiLoCo notes in the guide).
             wire_dtype = None
             weighted_sum: NDArrays | None = None
-            for _, res in results:
+            usable: list[tuple[Any, Any]] = []
+            for proxy, res in results:
                 if res.num_examples <= 0:
                     continue
-                share = res.num_examples / total_examples
                 layers = parameters_to_ndarrays(res.parameters)
+                bad = next((i for i, layer in enumerate(layers)
+                            if not np.all(np.isfinite(layer))), None)
+                if bad is not None:
+                    log(ERROR,
+                        "Round %s: dropping cluster %r -- tensor %d of %d contains "
+                        "nan/inf, and averaging it would poison the global model "
+                        "permanently. Its %s tokens are not counted this round. A site "
+                        "producing this is diverging locally: check its loss, its "
+                        "learning rate, and for float16 overflow on the wire.",
+                        server_round,
+                        res.metrics.get(proto.CLUSTER, getattr(proxy, "cid", "?")),
+                        bad, len(layers), f"{res.num_examples:,}")
+                    continue
+                usable.append((proxy, res))
                 if wire_dtype is None and layers:
                     wire_dtype = layers[0].dtype
+                share = res.num_examples / total_examples
                 scaled = [layer.astype(np.float32) * share for layer in layers]
                 if weighted_sum is None:
                     weighted_sum = scaled
                 else:
                     for index, layer in enumerate(scaled):
                         weighted_sum[index] += layer
+
+            if not usable:
+                log(WARNING,
+                    "Round %s: every cluster's contribution was non-finite; keeping the "
+                    "current global model unchanged", server_round)
+                return self._current_parameters(), metrics
+            if len(usable) != len([r for r in results if r[1].num_examples > 0]):
+                # Shares were computed against the original total, so renormalise over
+                # what survived or the merge silently under-weights the good sites.
+                kept = sum(res.num_examples for _, res in usable)
+                rescale = total_examples / kept
+                weighted_sum = [layer * rescale for layer in (weighted_sum or [])]
+                log(WARNING, "Round %s: merging %d of %d cluster(s), reweighted over "
+                    "%s surviving tokens", server_round, len(usable), len(results),
+                    f"{kept:,}")
             fedavg_result: NDArrays = weighted_sum or []
 
             w_t: NDArrays = self._global_fp32 or [
@@ -653,6 +862,8 @@ if HAS_FLWR:
                 self._wire_dtype = wire_dtype
             aggregated = self._on_wire(w_next)
             self.initial_parameters = aggregated
+            # After the merge, so a checkpoint is always a state the run actually had.
+            self._checkpoint(self._inline_round)
 
             metrics = dict(metrics)
             metrics["merge_round"] = self._inline_round

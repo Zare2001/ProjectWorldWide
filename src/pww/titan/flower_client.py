@@ -227,12 +227,32 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
                 self.set_parameters(parameters)
 
         loss, tokens = self.federated.validate()
-        if math.isnan(loss):
-            logger.warning(
-                "validation produced NaN loss; reporting token count 1 to prevent "
-                "server-side ZeroDivisionError in Flower aggregate_evaluate"
+        if not math.isfinite(loss):
+            # Report the real value, not 0.0.
+            #
+            # This used to return 0.0 as the loss while putting nan in the metrics, on the
+            # grounds of avoiding a server-side ZeroDivisionError. Two things wrong with
+            # that. The division in Flower's aggregate_evaluate is by sum(num_examples),
+            # which is zero only when *every* client reports zero -- and that case is
+            # guarded on the server -- so a fake loss was never needed to prevent it. And
+            # this strategy does not override aggregate_evaluate, so Flower averages the
+            # returned loss: 0.0 from a diverged cluster is reported as a *perfect* score.
+            # nan is loud; 0.0 looks like success, which is the one thing a broken run must
+            # not look like.
+            #
+            # isfinite rather than isnan, because inf is not nan: an infinite loss passed
+            # the old check untouched and reached the pooled figure as a real number.
+            logger.error(
+                "validation produced a non-finite loss (%s); reporting it as-is. The "
+                "central node excludes non-finite held-out losses from the pooled "
+                "perplexity, so this will not corrupt the reported metric -- but this "
+                "cluster is not producing a usable model and its training loss is where "
+                "to look.", loss,
             )
-            return 0.0, 1, {"eval_loss": float("nan"), "perplexity": float("nan")}
+            return float(loss), max(1, int(tokens)), {
+                "eval_loss": float(loss),
+                "perplexity": float("nan"),
+            }
         if tokens <= 0:
             # Should not happen with validation enabled and steps > 0. Reported rather
             # than dropped, but flagged: the cross-site aggregate is only a token-weighted
