@@ -46,11 +46,18 @@ from typing import Any
 import flwr as fl
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from .. import fedproto as proto
 from ..delta import BlobClient, stream_apply_global, stream_gather_delta, stream_write_full
 from ..logging_utils import get_logger
-from .params import ParameterCodec, gather_full_state, outer_agreement, scatter_full_state
+from .params import (
+    ParameterCodec,
+    as_plain_tensor,
+    gather_full_state,
+    outer_agreement,
+    scatter_full_state,
+)
 from .trainer import FederatedTrainer
 
 logger = get_logger("pww.titan.flower_client")
@@ -336,8 +343,24 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         result = self.federated.run_inner_phase()
         local = gather_full_state(self.trainer.model_parts)
 
+        # Both sides are normalised, not just the gather. `local` comes from
+        # gather_full_state, which unwraps already; `_reference` is either that same
+        # gather (cold start) or a wire decode (every later round), and on torch 2.9
+        # one of them can still arrive as a DTensor. Subtracting a DTensor from a
+        # plain tensor raises rather than promoting, so a single stray entry fails the
+        # whole outer round -- and the round-1 failure wedges the server, because its
+        # no-results path puts float32 on the wire. Log which keys were wrapped so the
+        # provenance is recorded rather than inferred.
+        stray = [k for k in local if isinstance(self._reference.get(k), DTensor)]
+        if stray:
+            logger.warning(
+                "reference held %d DTensor entries (e.g. %s); unwrapping before the "
+                "delta. Expected plain tensors from gather_full_state/codec.decode",
+                len(stray), ", ".join(stray[:3]),
+            )
         delta = {
-            key: local[key].to(torch.float32) - self._reference[key].to(torch.float32)
+            key: as_plain_tensor(local[key]).to(torch.float32)
+            - as_plain_tensor(self._reference[key]).to(torch.float32)
             for key in local
         }
         drift = outer_agreement(delta, self._reference)

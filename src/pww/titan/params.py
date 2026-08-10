@@ -6,7 +6,7 @@ parameters" is not something any single rank has. `torch.distributed.checkpoint`
 scatter a full state dict across whatever parallelism is configured, and driving the
 gather through them (rather than enumerating parameters and calling `.full_tensor()`
 on each) is what keeps this working when tensor or pipeline parallelism is switched
-on. They stay the mechanism; `_as_plain_tensor` only unwraps what they return, because
+on. They stay the mechanism; `as_plain_tensor` only unwraps what they return, because
 on torch 2.9 `full_state_dict=True` can still hand back a `DTensor`.
 
 Ordering is the subtle part. Flower carries an ordered *list* of arrays with no
@@ -97,7 +97,12 @@ class ParameterCodec:
             # float32 first: casting bf16 straight to a numpy dtype is not
             # supported, and the intermediate is what makes float16 output exact
             # rather than reinterpreted.
-            out.append(tensor.detach().to(torch.float32).cpu().numpy().astype(target, copy=False))
+            # as_plain_tensor first: .numpy() on a DTensor raises, and on torch 2.9 a
+            # gathered state dict can still contain them.
+            out.append(
+                as_plain_tensor(tensor).detach().to(torch.float32).cpu()
+                .numpy().astype(target, copy=False)
+            )
         return out
 
     def decode(self, arrays: list[np.ndarray]) -> dict[str, torch.Tensor]:
@@ -118,7 +123,7 @@ class ParameterCodec:
         return state
 
 
-def _as_plain_tensor(value: torch.Tensor) -> torch.Tensor:
+def as_plain_tensor(value: torch.Tensor) -> torch.Tensor:
     """A plain tensor, whatever `get_model_state_dict` chose to hand back.
 
     `full_state_dict=True` is documented to return ordinary tensors, and on torch
@@ -154,13 +159,13 @@ def gather_full_state(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     wrapped = 0
     for part in model_parts:
         part_state = get_model_state_dict(part, options=options)
-        # Sorted, not insertion order: `_as_plain_tensor` can issue a collective, and
+        # Sorted, not insertion order: `as_plain_tensor` can issue a collective, and
         # every rank has to reach them in the same sequence. Same ordering contract
         # the codec relies on.
         for key in sorted(part_state):
             value = part_state[key]
             wrapped += isinstance(value, DTensor)
-            state[key] = _as_plain_tensor(value)
+            state[key] = as_plain_tensor(value)
     if wrapped:
         logger.debug(
             "unwrapped %d/%d state entries that get_model_state_dict returned as "
@@ -194,7 +199,8 @@ def state_delta(
     `outer_agreement` measures, and what a delta-compressing transport would take.
     """
     return {
-        key: current[key].to(torch.float32) - reference[key].to(torch.float32)
+        key: as_plain_tensor(current[key]).to(torch.float32)
+        - as_plain_tensor(reference[key]).to(torch.float32)
         for key in current
     }
 
@@ -213,8 +219,8 @@ def outer_agreement(
     delta_sq = 0.0
     ref_sq = 0.0
     for key, value in delta.items():
-        delta_sq += float(value.pow(2).sum())
-        ref_sq += float(reference[key].to(torch.float32).pow(2).sum())
+        delta_sq += float(as_plain_tensor(value).pow(2).sum())
+        ref_sq += float(as_plain_tensor(reference[key]).to(torch.float32).pow(2).sum())
     delta_norm = delta_sq**0.5
     ref_norm = ref_sq**0.5
     return {
