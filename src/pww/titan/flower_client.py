@@ -228,7 +228,11 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
 
         loss, tokens = self.federated.validate()
         if math.isnan(loss):
-            return 0.0, 0, {}
+            logger.warning(
+                "validation produced NaN loss; reporting token count 1 to prevent "
+                "server-side ZeroDivisionError in Flower aggregate_evaluate"
+            )
+            return 0.0, 1, {"eval_loss": float("nan"), "perplexity": float("nan")}
         if tokens <= 0:
             # Should not happen with validation enabled and steps > 0. Reported rather
             # than dropped, but flagged: the cross-site aggregate is only a token-weighted
