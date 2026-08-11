@@ -1,0 +1,94 @@
+# Qwen3 0.6B on C4, DARL-leased, Snellius single-node central comparison run.
+#
+# Standalone comparison baseline for the cross-site DiLoCo run.
+# Uses the exact same DARL dataset sequence (space_seed = 42, block_size = 1024)
+# via dataset = "pww_tokens", but with flower.enable = false so training runs as a
+# continuous single-node job without outer aggregation rounds.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-central"
+description = "Qwen3 0.6B C4 central comparison run (DARL-leased, single-node)"
+# Adds the [darl] and [flower] sections to torchtitan's JobConfig.
+custom_config_module = "pww.titan.config"
+
+[experimental]
+# Registers the pww_qwen3 train spec and the pww dataset entries.
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+# Overridden by run_train.sh with the site's tokenizer directory.
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 200
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+# Total optimiser steps across the central run (matching the total steps of the DiLoCo run).
+steps = 20000
+max_norm = 1.0
+# 'pww_tokens' selects the DARL-leased dataloader over pre-tokenised shards.
+# dataset_path is overridden by run_train.sh with the site's shard directory.
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+interval = 500
+last_save_model_only = false
+keep_latest_k = 2
+
+[comm]
+train_timeout_seconds = 300
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 500
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+# url/site are supplied by run_train.sh (or job_titan_central.sh).
+url = ""
+site = ""
+inner_steps = 100
+# 1024 windows = ~2M tokens per leasable block at seq_len 2048.
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+# Must match the distributed run's space_seed so the central run sees the exact
+# same block-permuted sequence of training data.
+space_seed = 42
+
+[flower]
+# Disabled for central comparison run -- continuous training on 1 node.
+enable = false
+server_address = ""
+transport = "inline"
+wire_dtype = "float16"
