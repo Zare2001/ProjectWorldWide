@@ -372,13 +372,23 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
             if dist.is_initialized():
                 dist.broadcast(value, src=0)
             # Now every rank has the same full tensor — shard it.
-            if hasattr(param, "device_mesh"):
-                sharded = distribute_tensor(
-                    value, param.device_mesh, param.placements
+            try:
+                if hasattr(param, "to_local"):
+                    if hasattr(param, "device_mesh"):
+                        sharded = distribute_tensor(
+                            value, param.device_mesh, param.placements
+                        )
+                        param.detach().to_local().copy_(sharded.to_local())
+                    else:
+                        param.detach().to_local().copy_(value)
+                else:
+                    param.detach().copy_(value)
+            except Exception as e:
+                logger.error(
+                    "scatter failed for key=%s: param_type=%s, value_type=%s, value_device=%s, param_device=%s: %s",
+                    key, type(param).__name__, type(value).__name__, value.device, getattr(param, "device", None), e
                 )
-                param.detach().to_local().copy_(sharded.to_local())
-            else:
-                param.detach().copy_(value)
+                raise
 
 
 def state_delta(
