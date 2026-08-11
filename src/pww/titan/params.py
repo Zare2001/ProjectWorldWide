@@ -362,11 +362,11 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
                         f"with uninitialised memory -- the sender is serialising a "
                         f"different model."
                     )
-                value = incoming.to(param.dtype).contiguous().cuda()
+                value = incoming.to(dtype=param.dtype, device=param.device).contiguous()
             else:
                 # Workers: allocate a receive buffer matching the full shape. Fully
                 # overwritten by the broadcast below, so its contents do not matter.
-                value = torch.empty(full_shape, dtype=param.dtype, device="cuda")
+                value = torch.empty(full_shape, dtype=param.dtype, device=param.device)
             # Broadcast the full tensor from rank 0 to all ranks (NCCL, on GPU).
             if dist.is_initialized():
                 dist.broadcast(value, src=0)
