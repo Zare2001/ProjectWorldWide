@@ -193,6 +193,7 @@ if HAS_FLWR:
             self.v_vector: NDArrays | None = None
             self._global_fp32: NDArrays | None = None
             self._inline_round = 0
+            self._inline_global_step = 0
             self.solo_full_step = bool(solo_full_step)
             self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
             self.keep_ephemeral = max(0, int(keep_ephemeral))
@@ -231,6 +232,17 @@ if HAS_FLWR:
             return self.state.round if self.state is not None else self._inline_round
 
         @property
+        def global_step(self) -> int:
+            """Server-authoritative optimiser step counter.
+
+            With per-site H (different inner_steps on each cluster), a client can no
+            longer compute ``global_step = round * H`` locally.  The server tracks the
+            token-weighted average of steps across all contributing clusters and
+            broadcasts this so every site's LR schedule stays aligned.
+            """
+            return self.state.global_step if self.state is not None else self._inline_global_step
+
+        @property
         def _has_global(self) -> bool:
             if self.transport == proto.TRANSPORT_BLOB:
                 return self.state is not None and self.state.initialised
@@ -265,6 +277,7 @@ if HAS_FLWR:
                 proto.TRANSPORT: self.transport,
                 proto.ROUND: self.merge_round,
                 proto.RUN_ID: self.run_id,
+                proto.GLOBAL_STEP: self.global_step,
             }
             if self.on_fit_config_fn is not None:
                 config.update(self.on_fit_config_fn(server_round))
@@ -413,7 +426,8 @@ if HAS_FLWR:
                 payload.update({f"v{i}": layer for i, layer in enumerate(self.v_vector)})
             payload["meta"] = np.array(
                 [merge_round, len(self._global_fp32),
-                 0 if self.v_vector is None else len(self.v_vector)], dtype=np.int64)
+                 0 if self.v_vector is None else len(self.v_vector),
+                 self._inline_global_step], dtype=np.int64)
             try:
                 # Uncompressed on purpose: these are float32 weights, which compress
                 # by a few percent for several minutes of CPU. Write to .tmp and
@@ -500,6 +514,7 @@ if HAS_FLWR:
             self._global_fp32 = None
             self.v_vector = None
             self._inline_round = 0
+            self._inline_global_step = 0
             if candidates:
                 log(ERROR, "every checkpoint in %s contains nan/inf -- cold starting from "
                     "a client instead", self.checkpoint_dir)
@@ -512,9 +527,13 @@ if HAS_FLWR:
                 merge_round, n_w, n_v = int(meta[0]), int(meta[1]), int(meta[2])
                 self._global_fp32 = [data[f"w{i}"] for i in range(n_w)]
                 self.v_vector = [data[f"v{i}"] for i in range(n_v)] if n_v else None
+                # global_step was added after the initial checkpoint format; older
+                # checkpoints have only 3 elements in the meta array.
+                self._inline_global_step = int(meta[3]) if len(meta) > 3 else 0
             self._inline_round = merge_round
-            logger.info("restored global model from %s at merge round %d",
-                        Path(path).name, merge_round)
+            logger.info("restored global model from %s at merge round %d "
+                        "(global_step=%d)",
+                        Path(path).name, merge_round, self._inline_global_step)
             return merge_round
 
         def _log_failures(self, server_round: int, failures) -> None:
@@ -656,6 +675,7 @@ if HAS_FLWR:
                         path=path,
                         weight=float(res.num_examples),
                         tokens=int(res.num_examples),
+                        steps=int(res.metrics.get(proto.STEPS, 0)),
                         base_round=int(res.metrics.get(proto.BASE_ROUND, -1)),
                         blob=blob,
                     )
@@ -898,6 +918,19 @@ if HAS_FLWR:
             self._global_fp32 = w_next
             self._inline_round += 1
 
+            # Advance the server-authoritative global step by the token-weighted
+            # average of steps each cluster completed.  With identical H this is
+            # exactly H; with per-site H it places the schedule at the honest
+            # midpoint.
+            kept_tokens = sum(res.num_examples for _, res in usable)
+            if kept_tokens > 0:
+                step_increment = round(sum(
+                    (res.num_examples / kept_tokens)
+                    * int(res.metrics.get(proto.STEPS, 0))
+                    for _, res in usable
+                ))
+                self._inline_global_step += max(1, step_increment) if step_increment > 0 else 0
+
             # Keep it, so a later round that fails to merge leaves at the same dtype.
             if wire_dtype is not None:
                 self._wire_dtype = wire_dtype
@@ -908,9 +941,12 @@ if HAS_FLWR:
 
             metrics = dict(metrics)
             metrics["merge_round"] = self._inline_round
+            metrics["global_step"] = self._inline_global_step
             logger.info(
-                "round %s inline FedMom merge complete (%d cluster(s), %s tokens)",
+                "round %s inline FedMom merge complete (%d cluster(s), %s tokens, "
+                "global_step=%d)",
                 server_round, len(results), f"{total_examples:,}",
+                self._inline_global_step,
             )
             return aggregated, metrics
 

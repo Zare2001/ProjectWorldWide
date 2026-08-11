@@ -313,7 +313,7 @@ bounds how far a single cluster can drag the global model, which is a real prope
 do not trust a site. The non-finite check and the drift metric are the intended guards for
 that, so it is off by default.
 
-Two deliberate departures from the paper:
+Deliberate departures from the paper:
 
 - **Deltas are weighted by tokens contributed**, `p_i = tokens_i / sum tokens`, not
   uniformly by `1/k`. With 8 MI250X GCDs against 4 H100s the sites do different
@@ -333,6 +333,39 @@ Two deliberate departures from the paper:
   not combining progress, so the early rounds are the ones to watch. The cheap levers are
   a smaller `darl.inner_steps` for the opening rounds, or `server-momentum: 0.0` until
   drift settles.
+- **Per-site H (inner steps vary across clusters).** Algorithm 1 has every replica run
+  the same H. When clusters have very different throughput — e.g. Snellius at 2.73
+  steps/s vs LUMI at 0.58 steps/s — fixing H = 100 on both means the Flower round
+  barrier forces the fast site to idle for ~137 s out of every 194 s round, reducing
+  effective throughput to 101k tok/s out of hardware that can sustain 256k tok/s
+  instantaneously. Setting a higher H on the fast site (e.g. H = 200 on Snellius,
+  H = 100 on LUMI) lets it do more work per round and halves the idle time.
+
+  This is sound because the merge is already token-weighted (`p_i = tokens_i / Σtokens`),
+  which is exactly the correction for unequal work. The `darl.inner_steps` config
+  key is already per-site TOML, so the change is purely a configuration choice.
+
+  **LR schedule alignment.** With a single H the client could compute
+  `global_step = merge_round × H` locally. With per-site H that formula breaks — each
+  site would place itself at a different point on the schedule. The central server now
+  tracks a **server-authoritative `global_step`**, broadcast as `pww_global_step` in
+  every `configure_fit` config dict. After each merge it advances by the token-weighted
+  average of steps completed across all participating clusters:
+
+  ```
+  Δglobal_step = round( Σᵢ pᵢ × Hᵢ )    where pᵢ = tokensᵢ / Σ tokens
+  ```
+
+  When all sites use the same H this reduces exactly to H, preserving backward
+  compatibility. The global step is persisted in `meta.json` (blob transport) and in
+  the npz checkpoint meta array (inline transport), so it survives aggregator restarts.
+
+  **Drift caveat.** Drift scales with H. At H = 100 from scratch, `drift_ratio` was
+  already ~0.93 on Snellius. A very aggressive H (e.g. H = 473 to fill the full round)
+  would push drift well past 1, where averaging destroys rather than combines progress.
+  The recommended approach is to start modest (e.g. H = 200/100), observe
+  `drift_ratio_max` after each increase, and grow the fast site's H only once drift has
+  settled below ~0.1.
 
 ---
 

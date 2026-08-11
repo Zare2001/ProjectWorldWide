@@ -64,6 +64,7 @@ class Contribution:
     path: Path
     weight: float                # normalised share of this round's tokens
     tokens: int = 0
+    steps: int = 0
     base_round: int = -1
     blob: str = ""
 
@@ -115,6 +116,7 @@ class GlobalState:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.storage_dtype = storage_dtype
         self.round = 0
+        self.global_step = 0
         self.keys: tuple[str, ...] = ()
         self.clusters: dict[str, ClusterRecord] = {}
         self.total_tokens = 0
@@ -146,6 +148,7 @@ class GlobalState:
             return
         raw = json.loads(self.meta_path.read_text())
         self.round = int(raw.get("round", 0))
+        self.global_step = int(raw.get("global_step", 0))
         self.keys = tuple(raw.get("keys", ()))
         self.total_tokens = int(raw.get("total_tokens", 0))
         self.model_numel = int(raw.get("model_numel", 0))
@@ -166,6 +169,7 @@ class GlobalState:
     def _save_meta(self) -> None:
         payload = {
             "round": self.round,
+            "global_step": self.global_step,
             "storage_dtype": dtype_name(self.storage_dtype),
             "keys": list(self.keys),
             "model_numel": self.model_numel,
@@ -344,13 +348,25 @@ class GlobalState:
             record.rounds_contributed += 1
             record.tokens_total += item.tokens
             self.total_tokens += item.tokens
+
+        # Advance the server-authoritative global step by the token-weighted
+        # average of steps each cluster completed.  With identical H across
+        # sites this reduces to exactly H; with per-site H it places the LR
+        # schedule at the honest midpoint of the work that was done.
+        step_increment = round(sum(
+            share * item.steps for share, item in zip(shares, fresh)
+        ))
+        self.global_step += max(1, step_increment) if step_increment > 0 else 0
+
         self.round += 1
         self._save_meta()
 
         logger.info(
-            "round %d merged from %d cluster(s) in %.1fs (peak ~%s, lr=%g, momentum=%g)",
+            "round %d merged from %d cluster(s) in %.1fs (peak ~%s, lr=%g, momentum=%g, "
+            "global_step=%d)",
             self.round, len(fresh), time.monotonic() - started,
             _human(peak_bytes), server_learning_rate, server_momentum,
+            self.global_step,
         )
         return self.round
 
@@ -423,6 +439,7 @@ class GlobalState:
     def summary(self) -> dict[str, Any]:
         return {
             "round": self.round,
+            "global_step": self.global_step,
             "initialised": self.initialised,
             "tensors": len(self.keys),
             "parameters": self.model_numel,

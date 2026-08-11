@@ -1067,6 +1067,202 @@ def _():
                 assert safe_name(name) == name, name
 
 
+# --- per-site H and server-authoritative global step ------------------------
+
+
+@check("global_step advances by token-weighted step average")
+def _():
+    """With identical H on both sites, global_step advances by exactly H."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_state_dict(root / "init.pww", _model())
+        state = GlobalState(root / "state")
+        state.initialise_from_file(root / "init.pww")
+        assert state.global_step == 0
+
+        # Two clusters both doing H=100 steps, tokens proportional to work.
+        state.merge(
+            [
+                Contribution("lumi", _delta(root / "d1.pww", 0.1, 0), weight=1000.0,
+                             tokens=1000, steps=100, base_round=0),
+                Contribution("snellius", _delta(root / "d2.pww", 0.2, 0), weight=2000.0,
+                             tokens=2000, steps=100, base_round=0),
+            ],
+            server_learning_rate=1.0, server_momentum=0.0,
+        )
+        # Both did 100 steps, so weighted average = 100 regardless of tokens.
+        assert state.global_step == 100, f"expected 100, got {state.global_step}"
+        assert state.round == 1
+
+
+@check("per-site H produces correct token-weighted step increment")
+def _():
+    """Snellius does H=200, LUMI does H=100, tokens reflect the ratio."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_state_dict(root / "init.pww", _model())
+        state = GlobalState(root / "state")
+        state.initialise_from_file(root / "init.pww")
+
+        # Snellius: 200 steps * 32 windows * 2048 = 13,107,200 tokens
+        # LUMI:    100 steps * 64 windows * 2048 = 13,107,200 tokens
+        # Equal tokens, different H -> weighted average = (0.5*200 + 0.5*100) = 150
+        state.merge(
+            [
+                Contribution("snellius", _delta(root / "ds.pww", 0.1, 0),
+                             weight=13_107_200.0, tokens=13_107_200, steps=200,
+                             base_round=0),
+                Contribution("lumi", _delta(root / "dl.pww", 0.2, 0),
+                             weight=13_107_200.0, tokens=13_107_200, steps=100,
+                             base_round=0),
+            ],
+            server_learning_rate=1.0, server_momentum=0.0,
+        )
+        assert state.global_step == 150, f"expected 150, got {state.global_step}"
+
+        # Second round: same pattern, steps accumulate.
+        state.merge(
+            [
+                Contribution("snellius", _delta(root / "ds2.pww", 0.1, 1),
+                             weight=13_107_200.0, tokens=13_107_200, steps=200,
+                             base_round=1),
+                Contribution("lumi", _delta(root / "dl2.pww", 0.2, 1),
+                             weight=13_107_200.0, tokens=13_107_200, steps=100,
+                             base_round=1),
+            ],
+            server_learning_rate=1.0, server_momentum=0.0,
+        )
+        assert state.global_step == 300, f"expected 300, got {state.global_step}"
+
+
+@check("global_step survives an aggregator restart")
+def _():
+    """Persisted in meta.json so a restarted server resumes at the right step."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_state_dict(root / "init.pww", _model())
+        first = GlobalState(root / "state")
+        first.initialise_from_file(root / "init.pww")
+        first.merge(
+            [Contribution("lumi", _delta(root / "d.pww", 0.1, 0), weight=1.0,
+                          tokens=1000, steps=100, base_round=0)],
+            server_momentum=0.0,
+        )
+        assert first.global_step == 100
+
+        second = GlobalState(root / "state")
+        assert second.global_step == 100, f"expected 100 after restart, got {second.global_step}"
+        assert second.round == 1
+
+
+@check("global_step appears in summary")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_state_dict(root / "init.pww", _model())
+        state = GlobalState(root / "state")
+        state.initialise_from_file(root / "init.pww")
+        assert "global_step" in state.summary()
+        assert state.summary()["global_step"] == 0
+
+
+if HAS_FLWR:
+
+    @check("_round_config broadcasts pww_global_step")
+    def _():
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "blobs").mkdir()
+            state = GlobalState(root / "state")
+            write_state_dict(root / "init.pww", _model())
+            state.initialise_from_file(root / "init.pww")
+            strategy = FedMom(
+                transport=proto.TRANSPORT_BLOB, state=state,
+                blob_root=root / "blobs", blob_url="http://vm:29512", run_id="t",
+            )
+            instructions = strategy.configure_fit(
+                1, Parameters(tensors=[], tensor_type=proto.BLOB_PARAMETERS_TYPE),
+                _FakeManager(2),
+            )
+            config = instructions[0][1].config
+            assert proto.GLOBAL_STEP in config, f"missing {proto.GLOBAL_STEP} in config"
+            assert config[proto.GLOBAL_STEP] == 0
+
+    @check("inline transport advances global_step by token-weighted steps")
+    def _():
+        from pww.central.strategy import FedMom
+
+        weights = np.full((8,), 0.5, dtype=np.float16)
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([weights.copy()]),
+            server_learning_rate=1.0, server_momentum=0.0,
+        )
+        assert strategy.global_step == 0
+
+        strategy.configure_fit(
+            1, ndarrays_to_parameters([weights.copy()]), _FakeManager(2)
+        )
+        # Snellius: H=200, 2.4M tokens; LUMI: H=100, 1.6M tokens
+        # Weighted: (2.4/4.0)*200 + (1.6/4.0)*100 = 120+40 = 160
+        aggregated, metrics = strategy.aggregate_fit(
+            1,
+            [
+                (None, _fit_res({proto.CLUSTER: "snellius", proto.STEPS: 200},
+                                2_400_000,
+                                arrays=[np.full((8,), 0.6, dtype=np.float16)])),
+                (None, _fit_res({proto.CLUSTER: "lumi", proto.STEPS: 100},
+                                1_600_000,
+                                arrays=[np.full((8,), 0.4, dtype=np.float16)])),
+            ],
+            [],
+        )
+        assert strategy.global_step == 160, f"expected 160, got {strategy.global_step}"
+        assert metrics.get("global_step") == 160
+
+    @check("blob transport passes steps through to Contribution")
+    def _():
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blobs = root / "blobs"
+            blobs.mkdir()
+            state = GlobalState(root / "state")
+            write_state_dict(root / "init.pww", _model())
+            state.initialise_from_file(root / "init.pww")
+            strategy = FedMom(
+                transport=proto.TRANSPORT_BLOB, state=state, blob_root=blobs,
+                blob_url="http://vm:29512", run_id="t",
+            )
+            # Snellius H=200, LUMI H=100, equal tokens
+            _delta(blobs / proto.delta_blob("t", 0, "snellius"), 0.1, 0)
+            _delta(blobs / proto.delta_blob("t", 0, "lumi"), 0.2, 0)
+
+            strategy.aggregate_fit(
+                1,
+                [
+                    (None, _fit_res({
+                        proto.CLUSTER: "snellius",
+                        proto.DELTA_BLOB: proto.delta_blob("t", 0, "snellius"),
+                        proto.BASE_ROUND: 0,
+                        proto.STEPS: 200,
+                    }, 1_000_000)),
+                    (None, _fit_res({
+                        proto.CLUSTER: "lumi",
+                        proto.DELTA_BLOB: proto.delta_blob("t", 0, "lumi"),
+                        proto.BASE_ROUND: 0,
+                        proto.STEPS: 100,
+                    }, 1_000_000)),
+                ],
+                [],
+            )
+            # Equal tokens: weighted avg = 0.5*200 + 0.5*100 = 150
+            assert state.global_step == 150, f"expected 150, got {state.global_step}"
+
+
 def main() -> int:
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     if not HAS_FLWR:

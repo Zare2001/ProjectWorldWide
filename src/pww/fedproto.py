@@ -52,6 +52,14 @@ its freshly initialised weights to `INIT_BLOB` to become the starting point."""
 INIT_BLOB = "pww_init_blob"
 """Where to put those initial weights."""
 
+GLOBAL_STEP = "pww_global_step"
+"""Server-authoritative optimiser step counter.
+
+With per-site H (different ``darl.inner_steps`` on each cluster), a client can no
+longer compute ``global_step = round * H`` locally because H varies across sites.
+The server tracks the token-weighted average of steps across all contributing
+clusters and broadcasts this so every site's LR schedule stays aligned."""
+
 # --- metrics: cluster -> central node --------------------------------------
 
 DELTA_BLOB = "pww_delta_blob"

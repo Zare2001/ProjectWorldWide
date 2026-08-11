@@ -447,15 +447,22 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
     def _global_step_for(self, config: dict) -> int:
         """Where the run is, in optimiser steps, and align this rank to it.
 
-        merge_round * H, because a merge happens after exactly H inner steps on every
-        participating cluster. It is the merge round rather than Flower's round number
-        for the usual reason: a round that failed to merge advanced Flower's counter and
-        changed no weights, so it consumed no optimiser steps either.
+        The server broadcasts ``pww_global_step`` -- the token-weighted average
+        of steps across all contributing clusters.  With per-site H (different
+        ``darl.inner_steps`` on each cluster), each client can no longer compute
+        ``global_step = round * H`` locally because H varies across sites.
+
+        Falls back to ``merge_round * H`` when the server does not send the key,
+        which keeps old servers compatible until they are restarted with the new
+        strategy code.
 
         Rank 0 aligns here; the other ranks get the same number through the CMD_FIT
-        broadcast and align in `run_worker_loop`.
+        broadcast and align in ``run_worker_loop``.
         """
-        global_step = int(config.get(proto.ROUND, 0)) * self.federated.inner_steps
+        if proto.GLOBAL_STEP in config:
+            global_step = int(config[proto.GLOBAL_STEP])
+        else:
+            global_step = int(config.get(proto.ROUND, 0)) * self.federated.inner_steps
         self.federated.align_to_global_step(global_step)
         return global_step
 
