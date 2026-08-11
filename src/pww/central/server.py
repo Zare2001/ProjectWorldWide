@@ -176,14 +176,26 @@ def build_metric_aggregators():
     kind of thing that is wrong for years if nothing asserts it -- it produces a
     plausible number either way.
     """
+    state = {
+        "total_tokens": 0,
+        "site_tokens": {},
+    }
+
     def aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
         """Token-weighted training loss, plus how far replicas drifted."""
         total = sum(n for n, _ in metrics)
         if total == 0:
             logger.info("  >> no tokens trained this round")
             return {}
+        state["total_tokens"] += total
+        cum_tokens = state["total_tokens"]
+
+        for n, m in metrics:
+            cid = str(m.get(proto.CLUSTER, "?"))
+            state["site_tokens"][cid] = state["site_tokens"].get(cid, 0) + n
+
         avg_loss = sum(n * m.get(proto.LOSS, 0.0) for n, m in metrics) / total
-        out = {"loss": avg_loss}
+        out = {"loss": avg_loss, "cum_tokens": cum_tokens}
         drifts = [float(m["drift_ratio"]) for _, m in metrics if "drift_ratio" in m]
         detail = ""
         if drifts:
@@ -206,8 +218,8 @@ def build_metric_aggregators():
         # number that is comparable with published pre-training curves.
         out["perplexity"] = math.exp(min(20.0, avg_loss)) if math.isfinite(avg_loss) else float("nan")
         logger.info(
-            "  >> Training loss %.4f (ppl %.2f)  (%d cluster(s) [%s], %s tokens%s)",
-            avg_loss, out["perplexity"], len(metrics), names, f"{total:,}", detail,
+            "  >> Training loss %.4f (ppl %.2f)  (%d cluster(s) [%s], %s tokens this round | %s total tokens%s)",
+            avg_loss, out["perplexity"], len(metrics), names, f"{total:,}", f"{cum_tokens:,}", detail,
         )
 
         # Throughput and hardware, per cluster.
@@ -223,6 +235,8 @@ def build_metric_aggregators():
             slowest = max((float(m.get("seconds", 0.0)) for _, m in metrics), default=0.0)
             per_site = "; ".join(
                 f"{m.get(proto.CLUSTER, '?')} {float(m.get('tokens_per_s', 0)):,.0f} tok/s"
+                + (f" in {float(m['seconds']):.0f}s" if "seconds" in m else "")
+                + f" ({n:,} tok round | {state['site_tokens'].get(str(m.get(proto.CLUSTER, '?')), 0):,} tok total)"
                 + (f", {float(m['mfu_pct']):.1f}% MFU" if "mfu_pct" in m else "")
                 + (f", {float(m['tflops_per_rank']):.1f} TFLOP/s/rank"
                    if "tflops_per_rank" in m else "")
@@ -231,7 +245,7 @@ def build_metric_aggregators():
                    if "peak_memory_gib" in m else "")
                 + (f", {float(m['power_watts']):.0f}W" if "power_watts" in m else "")
                 + (f", grad_norm {float(m['grad_norm']):.4f}" if "grad_norm" in m else "")
-                for _, m in metrics
+                for n, m in metrics
             )
             logger.info("  >> Throughput %s tok/s combined | %s", f"{rate:,.0f}", per_site)
             if slowest > 0:
