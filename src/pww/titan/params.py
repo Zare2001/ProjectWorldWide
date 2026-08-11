@@ -40,6 +40,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.tensor import DTensor
 
+from ..delta import reshard_fsdp_modules
 from ..logging_utils import get_logger
 
 logger = get_logger("pww.titan.params")
@@ -161,6 +162,10 @@ def gather_full_state(model_parts: list[nn.Module]) -> dict[str, torch.Tensor]:
     `model_parts` is torchtitan's list because pipeline parallelism splits a model
     across ranks into several modules; without PP it has exactly one entry.
     """
+    # Before the read, not after: a group left unsharded by validation reports its
+    # bfloat16 all-gather buffer instead of the float32 DTensor that owns the
+    # weights, so the gather would put a stale, downcast `norm.weight` on the wire.
+    reshard_fsdp_modules(model_parts)
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
     state: dict[str, torch.Tensor] = {}
     wrapped = 0
@@ -328,6 +333,13 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
     """
     import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor
+
+    # Undo any unsharded state a no-grad forward left behind, so that the parameters
+    # this walks are the DTensors that own the weights rather than FSDP2's transient
+    # all-gather buffers. Without it the `norm.weight`/`output.weight` copies below
+    # either raise `CUDA error: invalid argument` or, worse, succeed and are thrown
+    # away by the next forward. See `reshard_fsdp_modules`.
+    reshard_fsdp_modules(model_parts)
 
     # Whether *this* rank holds the authoritative copy, asked of the process group
     # rather than inferred from `state` being non-empty. Inferring it is what let a

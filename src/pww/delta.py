@@ -241,6 +241,71 @@ class BlobClient:
 # --- per-tensor gather / scatter -------------------------------------------
 
 
+def reshard_fsdp_modules(model_parts: list[nn.Module]) -> int:
+    """Put every FSDP2 module back in its sharded state. Returns how many were not.
+
+    Call this before reading or writing parameters from outside a forward/backward.
+    Between rounds, `named_parameters()` is not guaranteed to hand back the model's
+    real weights, and the exception is not an edge case -- it is where the model
+    keeps `norm.weight` and `output.weight`.
+
+    torchtitan's `apply_fsdp` gives the last group `reshard_after_forward=False`
+    ("do not reshard_after_forward the last layers ... since FSDP would prefetch them
+    immediately after the forward pass"), which is a real speed win in a training
+    loop, where the backward reshards for free. Validation has no backward: it is
+    `@torch.no_grad()`, so FSDP2 registers no post-backward hook, `post_forward`
+    early-returns out of `reshard()`, and the group is left UNSHARDED once the
+    validator finishes. In that state `module.norm.weight` is FSDP2's
+    `_unsharded_param` -- a bfloat16 view aliasing the all-gather output buffer --
+    instead of the float32 DTensor that owns the weights.
+
+    Two things then go wrong on the outer round that follows a validation, and only
+    one of them is loud:
+    -   scatter writes the incoming global weights into that buffer. The write
+        appears to work and reads back correctly, and then the next forward
+        all-gathers the buffer from the sharded parameters it never touched, so the
+        aggregated weights are silently discarded for exactly those two tensors.
+        Measured on 2 ranks: write 3.5, read 3.5, forward, read 1.0.
+    -   the copy can also fail outright with `CUDA error: invalid argument`
+        (`hipErrorInvalidValue` on LUMI) when that buffer's storage is not live --
+        FSDP2 frees an unsharded parameter by resizing its storage to zero while
+        leaving the tensor's sizes intact, so the copy targets a pointer that is no
+        longer backed.
+
+    `reshard()` is per-module and not recursive, hence the walk. It is local -- no
+    collective -- so it needs no rank ordering, and it is a no-op on a group that is
+    already sharded, which is every group in a run that has not validated yet.
+
+    Do not call this from inside a forward or between forward and backward: the
+    unsharded parameters are live there and freeing them is what FSDP's own
+    pre-backward unshard exists to undo.
+    """
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:  # torch built without FSDP2; nothing is sharded
+        return 0
+
+    unsharded = 0
+    for part in model_parts:
+        for module in part.modules():
+            if not isinstance(module, FSDPModule):
+                continue
+            # `to_local` is the DTensor marker used throughout this codebase; its
+            # absence on an FSDP-managed parameter means the module is unsharded.
+            if any(
+                not hasattr(param, "to_local")
+                for param in module.parameters(recurse=False)
+            ):
+                unsharded += 1
+            module.reshard()
+    if unsharded:
+        logger.debug(
+            "resharded %d FSDP module(s) left unsharded by a no-grad forward before "
+            "touching parameters", unsharded,
+        )
+    return unsharded
+
+
 def _named_parameters(model_parts: list[nn.Module]) -> Iterator[tuple[str, torch.Tensor]]:
     """Every learned tensor, in an order identical on all ranks.
 
@@ -291,6 +356,7 @@ def stream_apply_global(
     is already on this node's disk after the download, and reading a tensor from page
     cache beats an all-ranks broadcast of the whole model.
     """
+    reshard_fsdp_modules(model_parts)
     applied = 0
     with TensorFile(path) as source:
         for key, param in _named_parameters(model_parts):
@@ -318,6 +384,7 @@ def stream_write_full(
     every later round is built on, so it is the one artefact worth storing at higher
     precision than the compute dtype.
     """
+    reshard_fsdp_modules(model_parts)
     writer = TensorWriter(out_path, meta={"kind": "full", **(meta or {})}) if is_writer else None
     try:
         for key, param in _named_parameters(model_parts):
@@ -358,6 +425,7 @@ def stream_gather_delta(
     should be tuned against: once it approaches 1, replicas have diverged far enough
     that averaging them destroys progress instead of combining it.
     """
+    reshard_fsdp_modules(model_parts)
     writer: TensorWriter | None = None
     if is_writer:
         writer = TensorWriter(

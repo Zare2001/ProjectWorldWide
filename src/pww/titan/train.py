@@ -38,7 +38,7 @@ import sys
 
 import torch.distributed as dist
 
-from ..logging_utils import get_logger
+from ..logging_utils import get_logger, setup_logging
 
 logger = get_logger("pww.titan.train")
 
@@ -56,6 +56,23 @@ def _require(condition: bool, message: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # torchtitan logs through the ROOT logger, and the only thing that gives that
+    # logger a level and a handler is init_logger() -- which upstream calls from its
+    # own `if __name__ == "__main__"` block in torchtitan/train.py. We are a different
+    # entrypoint, so that block never runs, root stays at its default WARNING with no
+    # handler, and every logger.info() is discarded. That includes the per-step
+    # `step: N loss: ... tps: ... tflops: ... mfu: ...` line from MetricsProcessor,
+    # so a healthy run looks like a silent one: the job logs nothing but warnings.
+    #
+    # Called before anything else in main() so a config error is logged too.
+    from torchtitan.tools.logging import init_logger
+
+    init_logger()
+    # Same treatment for the `pww` logger, which propagate=False keeps separate from
+    # torchtitan's root handler. RANK rather than dist.get_rank(): the process group
+    # does not exist yet here, and torchrun always sets it.
+    setup_logging(int(os.environ.get("RANK", "0")))
+
     argv = list(sys.argv[1:] if argv is None else argv)
     job_config = _parse_config(argv)
 
