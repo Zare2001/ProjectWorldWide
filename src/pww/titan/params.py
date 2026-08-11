@@ -44,13 +44,23 @@ from ..logging_utils import get_logger
 
 logger = get_logger("pww.titan.params")
 
-# numpy has no bfloat16, and Flower serialises numpy arrays, so bf16 cannot be a
-# wire dtype here even though it is the compute dtype. float16 halves WAN traffic and
-# is exact for weights of normal magnitude -- it has more mantissa than bfloat16 --
-# but it has far less range: bfloat16 reaches ~1e-38 while float16's smallest
-# subnormal is ~6e-08, so weights below that flush toward zero. Harmless (such a
-# weight contributes nothing to a forward pass) but real, and pinned by a test rather
-# than assumed away. float32 keeps everything, at twice the bytes.
+# Three ways to cross the wire, all 2 or 4 bytes per parameter.
+#
+# "bfloat16" maps to np.uint16 because numpy has no bfloat16 and Flower serialises numpy
+# arrays: the raw 16 bits travel as an integer and both ends **reinterpret** them
+# (`.view`) rather than convert them (`.astype`). This is the compute dtype, so it is
+# lossless here, and it keeps bfloat16's ~1e-38 range. Mixing up view and astype is the
+# one dangerous thing about it -- 0.5 reads back as 16128.0 -- so both directions live in
+# `encode`/`decode` and nowhere else, with the server's mirror in
+# central/strategy.py::_from_wire.
+#
+# "float16" also halves WAN traffic and is exact for weights of normal magnitude (11
+# mantissa bits against bfloat16's 8), but has far less range: float16's smallest
+# subnormal is ~6e-08, so weights below that flush toward zero. Harmless -- such a weight
+# contributes nothing to a forward pass -- but real, and pinned by a test rather than
+# assumed away.
+#
+# "float32" keeps everything, at twice the bytes. Watch the 2 GiB gRPC cap.
 WIRE_DTYPES = {"float16": np.float16, "float32": np.float32, "bfloat16": np.uint16}
 
 
@@ -256,6 +266,50 @@ def _without_tied_aliases(
     return {key: value for key, value in state.items() if key in owned}
 
 
+def keys_to_load(part: nn.Module) -> list[str]:
+    """The keys `scatter_full_state` should load, in a rank-independent order.
+
+    Derived from the *module*, never from the incoming dict, because neither of the
+    two obvious sources is correct:
+
+    * `state` cannot decide it. Worker ranks are called with an empty dict and still
+      have to reach every `broadcast` in the same order as rank 0, or the collective
+      deadlocks or pairs up mismatched tensors.
+    * `named_parameters() | named_buffers()` cannot decide it either, and this is what
+      the code used to iterate. `named_buffers()` reports **non-persistent** buffers;
+      `state_dict()` -- and therefore `get_model_state_dict`, the codec, and the wire --
+      deliberately omits them. On the Qwen3 0.6B flavor that difference is exactly one
+      tensor, `rope_cache`, registered `persistent=False` in Qwen3Model.__init__.
+
+    That one tensor was the whole bug. 311 tensors cross the wire (28 layers x 11,
+    plus tok_embeddings/norm/output), `rope_cache` is not among them, so iterating
+    `owned` reached a key with nothing to load and took the "worker rank" branch:
+
+        value = torch.empty(full_shape, dtype=param.dtype, device="cuda")
+        dist.broadcast(value, src=0)      # no-op at world_size 1
+        param.detach().copy_(value)       # <- uninitialised memory into rope_cache
+
+    So every `set_parameters` overwrote the RoPE cos/sin table with whatever the
+    caching allocator happened to hand back, on **every** rank including rank 0. When
+    that block was freshly mapped it was zeros, which silently disables RoPE -- q and k
+    are annihilated, attention goes uniform, and the model plateaus around the unigram
+    entropy (~7.5 nats) while looking like it is training. When the block was dirty it
+    was arbitrary float32 bit patterns, which is a nan on the first microbatch. Same
+    root cause, two symptoms, and the zeros case is the more dangerous of the two
+    because nothing reports it.
+
+    `rope_cache` is a pure function of (head_dim, max_seq_len, rope_theta) and is built
+    in the constructor and rebuilt by `init_weights`, so it must not be sent and must
+    not be touched here.
+
+    Tied aliases are dropped for the reason `_without_tied_aliases` documents: the 0.6B
+    flavor ties `output.weight` to `tok_embeddings.weight` after parallelising, so it is
+    absent from `named_parameters()` and loading the tying source already writes it.
+    """
+    owned = set(dict(part.named_parameters())) | set(dict(part.named_buffers()))
+    return [key for key in sorted(part.state_dict()) if key in owned]
+
+
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
     """Load a full state dict back into the sharded model.
 
@@ -268,25 +322,54 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
     on torch 2.9 raises ``aten.copy_.default: got mixed torch.Tensor and
     DTensor`` when the incoming state is plain tensors and the model is
     FSDP2-sharded.
+
+    Which keys get loaded is `keys_to_load`'s decision -- read its docstring before
+    changing the iteration, because the obvious choices are both wrong.
     """
     import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor
 
+    # Whether *this* rank holds the authoritative copy, asked of the process group
+    # rather than inferred from `state` being non-empty. Inferring it is what let a
+    # missing key silently become a receive buffer on the one rank that had the data.
+    is_source = not dist.is_initialized() or dist.get_rank() == 0
+
     for part in model_parts:
         owned = dict(part.named_parameters())
         owned.update(dict(part.named_buffers()))
-        for key in sorted(owned):
+        expected = keys_to_load(part)
+        if is_source:
+            extra = sorted(set(state) - set(expected))
+            if extra:
+                logger.info(
+                    "scatter: %d incoming key(s) not loaded directly: %s. Expected for "
+                    "a tied head -- the tying source carries the weights.",
+                    len(extra), ", ".join(extra),
+                )
+        for key in expected:
             param = owned[key]
             # DTensor.shape is the global (unsharded) shape.
             full_shape = tuple(param.shape)
-            if key in state:
-                # Rank 0: use the incoming full tensor.
-                value = state[key].to(param.dtype).contiguous().cuda()
+            if is_source:
+                incoming = state.get(key)
+                if incoming is None:
+                    # Loud, because the alternative is training on garbage. A key this
+                    # module needs and the wire did not carry means the sender's codec
+                    # and this model disagree, and there is no safe default value.
+                    raise KeyError(
+                        f"parameter {key!r} is required by this model but absent from "
+                        f"the incoming state ({len(state)} keys). Refusing to fill it "
+                        f"with uninitialised memory -- the sender is serialising a "
+                        f"different model."
+                    )
+                value = incoming.to(param.dtype).contiguous().cuda()
             else:
-                # Workers: allocate a receive buffer matching the full shape.
+                # Workers: allocate a receive buffer matching the full shape. Fully
+                # overwritten by the broadcast below, so its contents do not matter.
                 value = torch.empty(full_shape, dtype=param.dtype, device="cuda")
             # Broadcast the full tensor from rank 0 to all ranks (NCCL, on GPU).
-            dist.broadcast(value, src=0)
+            if dist.is_initialized():
+                dist.broadcast(value, src=0)
             # Now every rank has the same full tensor — shard it.
             if hasattr(param, "device_mesh"):
                 sharded = distribute_tensor(

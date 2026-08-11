@@ -60,6 +60,8 @@ class FederatedTrainer:
         # Patched in so loss survives train_step, which logs and returns None.
         self._loss_sum = 0.0
         self._loss_count = 0
+        self._step_sum = 0.0
+        self._step_count = 0
         self._last_loss: float | None = None
         self._reported_nonfinite = False
         original_fbs = trainer.forward_backward_step
@@ -70,9 +72,29 @@ class FederatedTrainer:
             # metrics path already syncs at log_freq; this is the price of having a
             # per-round loss to report to the aggregator, and it is amortised over
             # a full forward+backward.
-            value = float(loss.detach())
+            #
+            # Scaled back up by the accumulation factor, because what
+            # `forward_backward_step` returns is NOT the microbatch's loss. torchtitan
+            # wraps its loss_fn in `rescale_accumulated_loss(loss_fn, N)` (train.py, in
+            # Trainer.__init__) so that summing N microbatch backwards gives a mean
+            # rather than a sum -- every returned value is already divided by N. Its own
+            # metrics path compensates with `torch.sum` over the accumulated losses; this
+            # path took a *mean* over microbatches instead, so the reported figure was
+            # the true loss divided by N.
+            #
+            # Silent at N=1 and wrong by exactly N otherwise. Observed at
+            # PWW_GRAD_ACCUM=5: the aggregator logged "Training loss 1.9718 (ppl 7.18)"
+            # for a round whose real loss was 9.859, while the held-out loss for the same
+            # weights came in at 8.349. A training loss that reads 6 nats below the
+            # held-out loss is not a plausible generalisation gap, it is a unit error, and
+            # it made a crippled run look like a converging one.
+            value = float(loss.detach()) * self._accum_steps()
             self._loss_sum += value
             self._loss_count += 1
+            # Per step as well as per phase: with accumulation the honest per-step number
+            # is the mean over that step's microbatches, which is what torchtitan logs.
+            self._step_sum += value
+            self._step_count += 1
             # Kept so `_log_step` can report the loss of the step just finished, and
             # spot the first non-finite one, without a second device sync.
             self._last_loss = value
@@ -213,6 +235,8 @@ class FederatedTrainer:
                 break
             trainer.step += 1
             trainer.gc_handler.run(trainer.step)
+            self._step_sum = 0.0
+            self._step_count = 0
             try:
                 trainer.train_step(self._data_iterator)
             except DataloaderExhaustedError:
@@ -223,7 +247,7 @@ class FederatedTrainer:
                 logger.info("dataloader exhausted at step %d", trainer.step)
                 break
             steps_done += 1
-            self._log_step(trainer.step)
+            self._log_step(trainer.step, steps_done)
 
         # Checkpoint first, then commit the leases it covers: {weights, committed
         # blocks} then fail together, so a crash loses the same work from both
@@ -344,7 +368,7 @@ class FederatedTrainer:
         )
         return self.trainer.step
 
-    def _log_step(self, step: int) -> None:
+    def _log_step(self, step: int, steps_done: int) -> None:
         """Per-step loss, which torchtitan would log and this path skipped entirely.
 
         torchtitan's own logging lives inside `Trainer.train()`, and this class drives
@@ -363,7 +387,12 @@ class FederatedTrainer:
         with the step number. One line is enough to answer the question the round
         summary cannot.
         """
-        loss = self._last_loss
+        # The step's own mean, not the last microbatch: under accumulation those differ,
+        # and the mean is what torchtitan reports and what the phase average is built from.
+        if self._step_count:
+            loss = self._step_sum / self._step_count
+        else:
+            loss = self._last_loss
         if loss is None:
             return
         finite = math.isfinite(loss)
@@ -374,13 +403,22 @@ class FederatedTrainer:
                 "The %d step(s) before it were finite, so this is where to look. "
                 "Everything after it in this phase is meaningless, and the weights this "
                 "cluster reports will be rejected by the central node.",
-                step, loss, self._loss_count - 1,
+                step, loss, steps_done - 1,
             )
         freq = max(1, int(getattr(self.job_config.metrics, "log_freq", 10) or 10))
         if finite and step % freq == 0:
             lr = self._current_lr()
             logger.info("step %d  loss %.4f%s", step, loss,
                         f"  lr {lr:.3e}" if lr is not None else "")
+
+    def _accum_steps(self) -> int:
+        """torchtitan's microbatches-per-optimiser-step, or 1 if it is not set.
+
+        Read from the trainer each call rather than cached in __init__: it is derived
+        from `training.global_batch_size`, which run_train.sh sets from PWW_GRAD_ACCUM,
+        and a stale copy would reintroduce exactly the scaling error it exists to undo.
+        """
+        return max(1, int(getattr(self.trainer, "gradient_accumulation_steps", 1) or 1))
 
     def _current_lr(self) -> float | None:
         try:

@@ -11,13 +11,17 @@ Same shape as tests/test_darl.py: increasing cost, no GPU anywhere.
               port, with the rank broadcast stubbed so several ranks run in one
               process. This is the exactly-once check at the granularity that
               actually matters: windows fed to the model.
-  wire        the parameter codec, and the float16 aggregation regression that
-              overflowed to inf before central/strategy.py did its arithmetic in
-              float32
+  wire        the parameter codec (float16, float32, and the bfloat16 bit-pattern
+              hop), the float16 aggregation regression that overflowed to inf before
+              central/strategy.py did its arithmetic in float32, and the scatter key
+              set -- which must exclude non-persistent buffers, because including
+              them filled the RoPE cache with uninitialised memory
 
 What this file cannot cover: FSDP2 wrapping, the real Qwen3 forward pass, and the
 DTensor gather/scatter in titan/params.py all need GPUs and a process group. Those
-are what configs/titan/qwen3_0.6b_smoke.toml is for.
+are what configs/titan/qwen3_0.6b_smoke.toml is for. Note that the scatter *key
+selection* is covered here even though the scatter itself is not -- that was where
+the bug lived, and it is pure module introspection.
 """
 
 from __future__ import annotations
@@ -511,14 +515,100 @@ def _():
     )[0].tolist()
 
 
-@check("numpy has no bfloat16, so wire_dtype rejects it up front")
+@check("wire_dtype rejects anything it cannot carry")
 def _():
     state = {"w": torch.randn(4)}
     expect_raises(
         ValueError,
-        lambda: ParameterCodec.from_state_dict(state, wire_dtype="bfloat16"),
-        contains="numpy has no bfloat16",
+        lambda: ParameterCodec.from_state_dict(state, wire_dtype="float64"),
+        contains="wire_dtype must be one of",
     )
+
+
+@check("bfloat16 crosses the wire as uint16 bit patterns, exactly")
+def _():
+    """The bf16 wire path, which the config now actually uses.
+
+    numpy has no bfloat16, so the codec ships the raw 16 bits as uint16 and both ends
+    *reinterpret* them (`.view`) rather than convert (`.astype`). Getting that backwards
+    is not a rounding error, it is reading exponent bits as an integer: a weight of 0.5
+    becomes 16128.0. It cost a run -- see central/strategy.py::_from_wire -- so pin both
+    the exactness and the dtype on the wire.
+    """
+    state = {"w": torch.randn(64, 64, dtype=torch.bfloat16)}
+    codec = ParameterCodec.from_state_dict(state, wire_dtype="bfloat16")
+
+    arrays = codec.encode(state)
+    assert arrays[0].dtype == np.uint16, arrays[0].dtype
+    # Same element count as the tensor: uint16 is 2 bytes and so is bfloat16, so this is
+    # a reinterpretation and not a repacking.
+    assert arrays[0].shape == (64, 64), arrays[0].shape
+    assert codec.wire_bytes == 64 * 64 * 2, codec.wire_bytes
+
+    back = codec.decode(arrays)
+    # Exact, unlike the float16 hop above: no dtype change happens at all.
+    assert torch.equal(state["w"], back["w"]), (state["w"] - back["w"]).abs().max()
+
+    # The failure that actually happened: treating the bit patterns as values.
+    wrong = arrays[0].astype(np.float32)
+    assert wrong.max() > 1e3, (
+        "astype on the bit patterns should produce absurd magnitudes -- if it does not, "
+        "this test no longer demonstrates the bug it exists to pin"
+    )
+
+
+@check("scatter skips non-persistent buffers instead of filling them with garbage")
+def _():
+    """The rope_cache corruption, at the only granularity a CPU test can reach.
+
+    `scatter_full_state` needs CUDA and a process group, but the bug was entirely in
+    *which keys it iterated*: it used `named_parameters() | named_buffers()`, and
+    `named_buffers()` reports non-persistent buffers that `state_dict()` -- and so the
+    codec, and so the wire -- never carries. The key with nothing to load then took the
+    worker-rank branch and copied `torch.empty` into the buffer.
+
+    On Qwen3 that buffer is `rope_cache`. Zeros disable RoPE silently and the run
+    plateaus at unigram entropy; dirty memory is a nan on the first microbatch. So the
+    invariant is: every key scatter loads must be a key the codec sends.
+    """
+    from pww.titan.params import keys_to_load
+
+    class Tied(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tok_embeddings = torch.nn.Embedding(8, 4)
+            self.register_buffer("rope_cache", torch.arange(8.0), persistent=False)
+            self.register_buffer("kept", torch.ones(3), persistent=True)
+            self.output = torch.nn.Linear(4, 8, bias=False)
+            # What torchtitan does for the 0.6B flavor: tie after construction.
+            self.output.weight = self.tok_embeddings.weight
+
+    model = Tied()
+
+    # The premise: the two enumerations disagree, and they disagree about rope_cache.
+    owned = set(dict(model.named_parameters())) | set(dict(model.named_buffers()))
+    shipped = set(model.state_dict())
+    assert "rope_cache" in owned, "premise broken: named_buffers hides non-persistent"
+    assert "rope_cache" not in shipped, "premise broken: state_dict now ships it"
+    # And the tied alias runs the other way: shipped but not separately owned.
+    assert "output.weight" in shipped and "output.weight" not in owned
+
+    loaded = keys_to_load(model)
+    assert "rope_cache" not in loaded, (
+        f"scatter would fill rope_cache from nothing: {loaded}"
+    )
+    assert "output.weight" not in loaded, "tied alias must not be loaded twice"
+    assert "kept" in loaded, "persistent buffers still have to be loaded"
+    assert "tok_embeddings.weight" in loaded
+
+    # Every key scatter loads is a key the wire carries. This is the actual invariant.
+    codec = ParameterCodec.from_state_dict(model.state_dict(), wire_dtype="float32")
+    assert set(loaded) <= set(codec.keys), set(loaded) - set(codec.keys)
+
+    # Rank-independent and stable: worker ranks reach the same broadcasts in the same
+    # order without ever seeing the incoming dict.
+    assert loaded == sorted(loaded), loaded
+    assert keys_to_load(model) == loaded
 
 
 @check("outer_agreement reports drift relative to the weights")

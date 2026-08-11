@@ -31,6 +31,12 @@ carry. A model with *learned* buffer state (BatchNorm running statistics, say) w
 need them included, and that is exactly why the ResNet path pins outer momentum to
 zero; Qwen3 is RMSNorm with learned weights and has no such state.
 
+Do not "fix" this by widening it to `named_buffers()`. The inline path's equivalent
+did include buffers on the *apply* side, and because the wire never carried them it
+filled the RoPE table with uninitialised memory on every round -- silently zeroing
+RoPE when the allocator handed back fresh pages, and producing a first-microbatch nan
+when it handed back dirty ones. See `titan/params.py::keys_to_load`.
+
 Pipeline parallelism is refused rather than half-supported: with PP each rank holds a
 different subset of layers, so a naive walk over `model_parts` has ranks entering
 different collectives and the job deadlocks instead of failing.

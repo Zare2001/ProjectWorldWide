@@ -372,6 +372,32 @@ Deliberate departures from the paper:
   | **the LR schedule** | unchanged. Identical H at every site means the schedule advances identically, so there is no per-site H and nothing to align. |
   | **peak memory** | unchanged. Microbatches run *sequentially*, so only one set of activations is live at a time. This is the entire reason accumulation exists. |
 
+  **One thing it did disturb: the reported loss.** torchtitan wraps its loss function in
+  `rescale_accumulated_loss(loss_fn, N)` so that summing N microbatch backwards produces a
+  mean rather than a sum — which means every value `forward_backward_step` returns is
+  **already divided by N**. torchtitan's own metrics path compensates with a `torch.sum`;
+  this repo's per-round path took a *mean* over microbatches instead, and so reported the
+  true loss divided by N. Silent at `grad_accum = 1` and wrong by exactly N otherwise.
+
+  It looked like this, at `PWW_GRAD_ACCUM=5`:
+
+  ```
+  >> Training loss 1.9718 (ppl 7.18)   ...   8,192,000 tokens
+  >> Perplexity 4225.88  (held-out loss 8.3490)
+  ```
+
+  A training loss 6.4 nats *below* the held-out loss on the same weights is not a
+  generalisation gap; nothing generalises in that direction. The real figure was
+  1.9718 × 5 = 9.859, which is exactly what 100 steps from a random initialisation should
+  average. Fixed in `titan/trainer.py`, which now scales by
+  `trainer.gradient_accumulation_steps` and logs the per-step mean rather than the last
+  microbatch.
+
+  Worth noting *why* it mattered beyond cosmetics: the two sites ran different
+  `PWW_GRAD_ACCUM` values, so their reported losses were divided by different numbers and
+  the cross-site comparison in §5 was meaningless while it lasted. Held-out loss was never
+  affected — validation runs under `no_rescale()`.
+
   **How to set it.** Per site at submit time, because both sites share one TOML and the
   correct batch depends on the site's rank count:
 
@@ -675,6 +701,60 @@ All of it is pinned in `tests/test_darl.py` and `tests/test_federation.py`: seco
 concurrent refused, requeue after a clean exit, requeue after a hard crash, release
 scoping, and the duplicated-id round.
 
+### The non-persistent buffer trap
+
+Worth its own section because it produced two completely different symptoms from one
+cause, and one of them was silent.
+
+Applying incoming weights means writing a full state dict into an FSDP2-sharded model.
+`params.scatter_full_state` does that by broadcasting each tensor from rank 0 and letting
+every rank shard its own slice. The question it has to answer first is *which keys to
+iterate*, and both obvious answers are wrong:
+
+- **`state`, the incoming dict, cannot decide it.** Worker ranks are called with an empty
+  dict and still have to reach every `broadcast` in the same order as rank 0.
+- **`named_parameters() | named_buffers()` cannot decide it either**, and this is what the
+  code used. `named_buffers()` reports **non-persistent** buffers. `state_dict()` — and
+  therefore `get_model_state_dict`, the codec, and the wire — deliberately omits them.
+
+On the Qwen3 0.6B flavor the difference is exactly one tensor: `rope_cache`, registered
+`persistent=False`, holding the precomputed RoPE cos/sin table. **311** tensors cross the
+wire; `rope_cache` is not among them. So the loop reached a key with nothing to load and
+fell through to the worker-rank branch:
+
+```python
+value = torch.empty(full_shape, dtype=param.dtype, device="cuda")
+dist.broadcast(value, src=0)      # a no-op at world_size 1
+param.detach().copy_(value)       # uninitialised memory -> rope_cache
+```
+
+Every application of incoming weights destroyed the RoPE table, on every rank including
+rank 0. What happened next depended on what the caching allocator handed back:
+
+| the block was | RoPE becomes | symptom |
+|---|---|---|
+| freshly mapped (zeros) | `cos = sin = 0`, so RoPE annihilates q and k | **silent.** Attention goes uniform, the model keeps a finite loss and keeps descending — toward the unigram entropy rather than a language model. Nothing in any log says so. |
+| reused and dirty | arbitrary float32 bit patterns | `step 1: loss became NON-FINITE (nan)` on the first microbatch, the site's weights rejected, its blocks released. |
+
+Which one a site got was a matter of allocator history, not of hardware. The site that hit
+the nan had received an `evaluate` message before its first `train` message — a full
+validation pass, which allocates and frees, leaving dirty blocks to reuse.
+
+Two things generalise from it:
+
+- **A nan on the very first microbatch after a weight application is the weights.** Not the
+  data, not the learning rate, not the accelerator. That is precisely why `_log_step` logs
+  the first non-finite step and how many finite steps preceded it: `0 step(s) before it
+  were finite` pointed straight here, and gradual divergence would have pointed elsewhere.
+- **Prefer a rank-independent key list derived from the module.** `params.keys_to_load`
+  now returns `sorted(part.state_dict())` filtered to keys the module owns distinctly —
+  which excludes non-persistent buffers *and* the tied `output.weight` alias — and rank 0
+  raises rather than substituting a buffer if a key it needs is genuinely missing.
+  Defaulting was the real fault; the wrong key set was only how it got reached.
+
+`rope_cache` is a pure function of `(head_dim, max_seq_len, rope_theta)`, built in the
+constructor and rebuilt by `init_weights`. It must never be sent and never be written here.
+
 ### Failures
 
 | symptom | cause | what to do |
@@ -684,6 +764,8 @@ scoping, and the duplicated-id round.
 | `every delta for round N was stale` | all participating sites were requeued and computed against an older global model | expected after a walltime kill. The next round is current. |
 | a site hangs at the end of an epoch | was: a prefetched DARL lease nobody consumed, so the pool looked drained while the session held the missing blocks | fixed — `LeaseSession.acquire` now consumes a pending prefetch instead of waiting on it. Covered by `tests/test_darl.py`. |
 | `dropping cluster X -- tensor N contains nan/inf` | that site's weights are non-finite, usually local divergence or float16 overflow on the wire | the round proceeds without it and the global model is untouched. Read that site's own training loss: this is a symptom, not the cause. |
+| `step 1: loss became NON-FINITE`, `0 step(s) before it were finite`, on a site's **first** round | was: `scatter_full_state` overwrote the model's non-persistent buffers with uninitialised memory every time it applied incoming weights | fixed — see [the non-persistent buffer trap](#the-non-persistent-buffer-trap). A nan on the *first* microbatch after a weight application is always the weights, never the data or the learning rate. |
+| training loss far *below* the held-out loss (e.g. 1.97 against 8.35) | was: the per-round loss summed torchtitan's already-rescaled microbatch losses, so it read low by exactly `PWW_GRAD_ACCUM` | fixed — see [§3, gradient accumulation](#3-the-outer-step). A training loss several nats under the held-out loss is a unit error, not a generalisation gap. |
 | `Training loss nan` with `merge complete` | was: one non-finite contribution poisoned the global model, and every later round was arithmetic on nan | fixed — non-finite contributions are dropped before the merge. If it recurs, one site is diverging and the log now names it. |
 | `Round N failure: ...` | a client raised, or the transport rejected its reply | the reason is now logged. Previously only the count was, which is why an 18-round failure loop had no diagnosable cause. |
 | `held-out loss spread N nats across clusters` | either a site is not applying the weights it was sent, or the sites are not scoring the same data | check `validation.steps`/`PWW_VAL_WINDOWS` and the eval token counts first; equal counts mean the model is the suspect. |
@@ -780,7 +862,7 @@ python3 tests/test_federation.py
 | suite | checks | covers |
 |---|---|---|
 | `test_darl.py` | 45 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
-| `test_titan.py` | 19 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec, config feasibility |
+| `test_titan.py` | 21 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec including the bfloat16 bit-pattern hop, the scatter key set that must not include non-persistent buffers, config feasibility |
 | `test_federation.py` | 26 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)` |
 | `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
 | `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
