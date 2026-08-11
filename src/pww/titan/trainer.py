@@ -200,12 +200,16 @@ class FederatedTrainer:
         self._data_iterator = trainer.batch_generator(trainer.dataloader)
         self._started = True
 
-        # Hook into torchtitan's metrics_processor.log to record the last grad_norm
         proc = getattr(trainer, "metrics_processor", None)
         if proc is not None and not hasattr(proc, "_pww_hooked"):
             orig_log = proc.log
             def _log_wrapper(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
                 proc.last_grad_norm = grad_norm
+                p_watts = self._read_power_watts()
+                if p_watts is not None:
+                    if extra_metrics is None:
+                        extra_metrics = {}
+                    extra_metrics["power_watts"] = p_watts
                 return orig_log(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=extra_metrics)
             proc.log = _log_wrapper
             proc._pww_hooked = True
@@ -493,24 +497,30 @@ class FederatedTrainer:
             out["grad_norm"] = float(proc.last_grad_norm)
 
         # --- GPU Power Draw (Watts) ---
+        p_watts = self._read_power_watts()
+        if p_watts is not None:
+            out["power_watts"] = p_watts
+
+        return out
+
+    def _read_power_watts(self) -> float | None:
         try:
             import pynvml
             import torch
             pynvml.nvmlInit()
             device_idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
             handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-            out["power_watts"] = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+            return float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
         except Exception:                                             # noqa: BLE001
             try:
                 import glob
                 hwmon_paths = glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/power1_average")
                 if hwmon_paths:
                     with open(hwmon_paths[0], "r") as f:
-                        out["power_watts"] = float(f.read().strip()) / 1e6  # uW to W
+                        return float(f.read().strip()) / 1e6  # uW to W
             except Exception:                                         # noqa: BLE001
                 pass
-
-        return out
+        return None
 
     def _dp_degree(self) -> int:
         """Data-parallel ranks in this cluster, or 1 if not sharded."""
