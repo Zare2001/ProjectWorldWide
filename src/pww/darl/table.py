@@ -748,6 +748,7 @@ class LeaseTable:
         lease_id: str | None = None,
         *,
         incarnation: str = "",
+        count_attempt: bool = True,
         now: float | None = None,
     ) -> int:
         """Give back the uncommitted tail of one lease, or of all of them.
@@ -781,7 +782,8 @@ class LeaseTable:
             lease = self.leases.get(lid)
             if lease is None or lease.cluster != cluster_id:
                 continue
-            returned += self._reclaim(lease, now, reason="released")
+            returned += self._reclaim(lease, now, reason="released",
+                                      count_attempt=count_attempt)
         if returned:
             self._record("released", cluster=cluster_id, blocks=returned)
         return returned
@@ -845,8 +847,19 @@ class LeaseTable:
                              silent_for=round(now - lease.deadline + lease.ttl, 1))
         return reclaimed
 
-    def _reclaim(self, lease: Lease, now: float, *, reason: str) -> int:
-        """Uncommitted tail -> UNASSIGNED (or QUARANTINED), lease gone."""
+    def _reclaim(self, lease: Lease, now: float, *, reason: str,
+                 count_attempt: bool = True) -> int:
+        """Uncommitted tail -> UNASSIGNED (or QUARANTINED), lease gone.
+
+        `count_attempt=False` returns the tail without holding the *blocks*
+        responsible. Attempt counting exists to find a corrupt shard -- a position
+        that fails under several different clusters -- so it must not fire when the
+        cluster has already said the fault is its own. A site whose phase produced a
+        non-finite loss hands its spans back for that reason, and quarantining them
+        after three such rounds would retire perfectly good data because one
+        participant was broken: worse than the waste it replaced, because the
+        positions then leave the epoch permanently.
+        """
         lo, hi = lease.committed_end, lease.end
         del self.leases[lease.lease_id]
         if hi <= lo:
@@ -858,6 +871,8 @@ class LeaseTable:
         free_runs: list[tuple[int, int]] = []
         run_start = lo
         for position in range(lo, hi):
+            if not count_attempt:
+                continue
             attempts = self._attempts.get(position, 0) + 1
             self._attempts[position] = attempts
             if self.max_attempts and attempts >= self.max_attempts:

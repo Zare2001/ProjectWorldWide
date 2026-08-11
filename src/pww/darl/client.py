@@ -352,11 +352,13 @@ class LeaseClient:
         return self._call("/commit", {"cluster": self.cluster_id, "lease": lease_id,
                                       "through": int(through)})
 
-    def release(self, lease_id: str | None = None) -> dict[str, Any]:
+    def release(self, lease_id: str | None = None, *,
+                count_attempt: bool = True) -> dict[str, Any]:
         # The incarnation matters on a release-everything: it is the one operation
         # whose blast radius is every lease a cluster id owns, so the coordinator
         # checks that the asker is the process that currently holds the id.
         return self._call("/release", {"cluster": self.cluster_id, "lease": lease_id,
+                                       "count_attempt": bool(count_attempt),
                                        "incarnation": self.incarnation})
 
     def advance_epoch(self) -> dict[str, Any]:
@@ -705,13 +707,19 @@ class LeaseSession:
                        if span.valid and span.consumed > span.committed]
         return sum(self.commit(lease_id, through) for lease_id, through in targets)
 
-    def release_all(self) -> int:
+    def release_all(self, *, count_attempt: bool = True) -> int:
         """Hand back everything uncommitted. Wire this to SIGTERM.
 
         Slurm sends SIGTERM before it kills a job at walltime. Releasing there
         returns the tail in milliseconds rather than after a full TTL, which on a
         long TTL is the difference between the other clusters idling for a quarter
         of an hour and not idling at all.
+
+        `count_attempt=False` says the fault is this cluster's, not the blocks'. DARL
+        quarantines a position reclaimed `max_attempts` times, which is the right response
+        to a corrupt shard and the wrong one to a site whose phase produced a non-finite
+        loss: three such rounds would retire good data permanently. See
+        `LeaseTable._reclaim`.
         """
         with self._lock:
             if not self.spans:
@@ -721,7 +729,7 @@ class LeaseSession:
                 self._prefetch = None
                 return 0
         try:
-            reply = self.client.release(None)
+            reply = self.client.release(None, count_attempt=count_attempt)
         except DarlError as exc:
             get_logger().warning("darl: release failed: %s", exc)
             return 0

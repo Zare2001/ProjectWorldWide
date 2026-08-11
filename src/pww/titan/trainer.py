@@ -238,7 +238,30 @@ class FederatedTrainer:
             # policy wearing the 'checkpoint' policy's name.
             wrote = self._will_checkpoint(trainer.step, last_step)
             trainer.checkpointer.save(trainer.step, last_step=last_step)
-            if wrote or self._commit_every_phase:
+            # A phase whose loss went non-finite trained nothing usable, so its blocks
+            # must go back to the pool rather than be marked durable.
+            #
+            # Committing means "this run has consumed these tokens", and the central node
+            # will drop this contribution when it sees the non-finite weights -- so
+            # committing here retires blocks that no model ever learned from. They are
+            # never re-issued this epoch, and the loss is silent: DARL's coverage counter
+            # advances, the epoch completes, and the tokens are simply missing. Observed
+            # costing 2,400 windows in a single round with both sites diverged.
+            #
+            # Released rather than left to expire, so the other site can take them
+            # immediately instead of waiting out a lease TTL.
+            phase_ok = self._loss_count == 0 or math.isfinite(
+                self._loss_sum / max(1, self._loss_count)
+            )
+            if not phase_ok:
+                released = self._release_leases()
+                logger.error(
+                    "phase loss was non-finite, so its %d block(s) were released instead "
+                    "of committed -- the central node will drop this contribution, and "
+                    "committing would retire tokens no model learned from",
+                    released,
+                )
+            elif wrote or self._commit_every_phase:
                 committed = self._commit_leases()
 
         elapsed = max(1e-6, time.monotonic() - started)
@@ -280,35 +303,43 @@ class FederatedTrainer:
         FedMom weights contributions by tokens alone, so it has no way to account for one
         replica having taken its steps at half the learning rate of another.
 
-        Only ever forwards. A site *ahead* of the global round is not something to fix by
-        rewinding it mid-run; that would mean the coordinator and the model disagree,
-        which is a different fault with a different remedy.
+        Authoritative, in both directions.
+        
+        It used to move only forwards, on the reasoning that a site ahead of the global
+        round signalled a different fault. That was wrong once H varies per site: the fast
+        site's own scheduler outruns the server counter every round, so a forward-only
+        alignment silently becomes a no-op for it while still pulling the slow site --
+        and the two schedules diverge monotonically rather than converging. Forward-only
+        alignment is only safe when there is nothing to disagree about.
+        
+        `LambdaLR` recomputes from `last_epoch`, so setting it and stepping once places the
+        schedule exactly, backwards or forwards, without replaying every intervening step.
 
         Collective-free and cheap: LambdaLR recomputes from `last_epoch`, so catching up
         is one lambda evaluation per step, and it is called once per phase.
         """
         target = int(global_step)
-        if target <= self.trainer.step:
-            return self.trainer.step
+        was = self.trainer.step
+        if target == was:
+            return was
 
-        behind = target - self.trainer.step
         self.trainer.step = target
         schedulers = getattr(self.trainer, "lr_schedulers", None)
-        stepped = 0
-        if schedulers is not None:
-            for _ in range(behind):
-                try:
-                    schedulers.step()
-                    stepped += 1
-                except Exception as exc:                              # noqa: BLE001
-                    logger.warning("could not advance the LR schedule: %s", exc)
-                    break
+        placed = 0
+        for sched in getattr(schedulers, "schedulers", []) or []:
+            try:
+                # last_epoch + one step, rather than replaying `target - was` steps: exact,
+                # O(1), and works when target is behind as well as ahead.
+                sched.last_epoch = target - 1
+                sched.step()
+                placed += 1
+            except Exception as exc:                                  # noqa: BLE001
+                logger.warning("could not place the LR schedule at step %d: %s", target, exc)
         lr = self._current_lr()
         logger.info(
-            "joined at global step %d (was %d): advanced the step counter and %d LR "
-            "schedule step(s)%s so this cluster optimises on the same schedule as the "
-            "rest of the run",
-            target, target - behind, stepped,
+            "aligned to the run's global step %d (was %d, %s%d): placed %d LR "
+            "schedule(s)%s so this cluster optimises on the same schedule as the rest",
+            target, was, "+" if target > was else "", target - was, placed,
             f", lr now {lr:.3e}" if lr is not None else "",
         )
         return self.trainer.step
@@ -452,6 +483,18 @@ class FederatedTrainer:
             return bool(should_save(step, last_step))
         except TypeError:
             return bool(should_save(step))
+
+    def _release_leases(self) -> int:
+        """Hand the phase's spans back instead of committing them. See `run_inner_phase`."""
+        release = getattr(self.trainer.dataloader, "release", None)
+        if release is None:
+            return 0
+        try:
+            return release()
+        except Exception as exc:            # a refused release must not kill the run
+            logger.warning("darl release failed: %s; the spans will expire on their TTL "
+                           "instead", exc)
+            return 0
 
     def _commit_leases(self) -> int:
         commit = getattr(self.trainer.dataloader, "commit", None)

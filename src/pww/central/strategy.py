@@ -74,6 +74,15 @@ from ..logging_utils import get_logger
 
 logger = get_logger("pww.central.strategy")
 
+# How much larger than the incumbent global model a cluster's largest weight may be
+# before its contribution is refused. See `_aggregate_inline`.
+#
+# Deliberately loose. A DiLoCo phase from a random initialisation legitimately moves the
+# weights by more than their own norm -- drift of 1.69 was measured on a real opening
+# round -- so this must not fire on high drift. 1000x is far outside anything training
+# produces and far inside the 3.4e38 that bfloat16 will happily carry.
+MAX_WEIGHT_GROWTH = 1.0e3
+
 HAS_FLWR = False
 try:
     import flwr as fl  # noqa: F401
@@ -239,7 +248,7 @@ if HAS_FLWR:
 
             With per-site H (different inner_steps on each cluster), a client can no
             longer compute ``global_step = round * H`` locally.  The server tracks the
-            token-weighted average of steps across all contributing clusters and
+            largest number of steps any contributing cluster took, and
             broadcasts this so every site's LR schedule stays aligned.
             """
             return self.state.global_step if self.state is not None else self._inline_global_step
@@ -302,12 +311,13 @@ if HAS_FLWR:
                 # Round 1 only: adopt whatever the initial parameters are, then own
                 # them from here.
                 adopted = parameters_to_ndarrays(parameters)
-                # Record the wire dtype *before* upcasting, or it is gone. This is the
-                # only place it is observable on a cold start, because the first merge
-                # may never happen -- which is exactly the case that wedged the server.
+                # Record the wire dtype *before* decoding, or it is gone. This is the only
+                # place it is observable on a cold start, because the first merge may never
+                # happen -- which is exactly the case that wedged the server.
                 if self._wire_dtype is None and adopted:
                     self._wire_dtype = adopted[0].dtype
-                self._global_fp32 = [layer.astype(np.float32) for layer in adopted]
+                # _from_wire, NOT astype: see its docstring. This was the missed call site.
+                self._global_fp32 = self._from_wire(adopted)
 
             config = self._round_config(server_round)
 
@@ -564,6 +574,31 @@ if HAS_FLWR:
                         getattr(status, "code", "?"), getattr(status, "message", ""))
                 except Exception:                                     # noqa: BLE001
                     log(ERROR, "Round %s failure (unparseable): %r", server_round, failure)
+
+        @staticmethod
+        def _from_wire(arrays: NDArrays) -> NDArrays:
+            """Decode what arrived into float32. The exact inverse of `_on_wire`.
+
+            This exists because doing it inline was got wrong twice. bfloat16 crosses the
+            wire as uint16 bit patterns, because numpy has no bfloat16 -- so the decode is
+            a *reinterpretation*, and `astype(np.float32)` silently converts the integer
+            instead. A bf16 1.5 has bits 0x3FC0 = 16320, so `astype` yields 16320.0: the
+            model comes out four orders of magnitude too large, with no error anywhere.
+
+            Both sites then trained on a destroyed global model and returned non-finite
+            weights, and the only visible symptom was a held-out loss of exactly
+            ln(131328) = 11.7855 -- the vocabulary size, i.e. uniform logits.
+
+            One function, called everywhere parameters arrive, so a fourth call site cannot
+            reintroduce it.
+            """
+            if arrays and arrays[0].dtype == np.uint16:
+                return [
+                    torch.from_numpy(np.ascontiguousarray(layer))
+                    .view(torch.bfloat16).to(torch.float32).numpy()
+                    for layer in arrays
+                ]
+            return [layer.astype(np.float32) for layer in arrays]
 
         def _on_wire(self, arrays: NDArrays) -> Parameters:
             """Serialise for the wire, at the dtype the clients actually use.
@@ -832,13 +867,38 @@ if HAS_FLWR:
                 layers = parameters_to_ndarrays(res.parameters)
                 if wire_dtype is None and layers:
                     wire_dtype = layers[0].dtype
-                if layers and layers[0].dtype == np.uint16:
-                    layers = [
-                        torch.from_numpy(layer).view(torch.bfloat16).to(torch.float32).numpy()
-                        for layer in layers
-                    ]
+                layers = self._from_wire(layers)
                 bad = next((i for i, layer in enumerate(layers)
                             if not np.all(np.isfinite(layer))), None)
+                # isfinite alone stopped being enough when the wire moved to bfloat16.
+                #
+                # Under float16 a diverged cluster's weights overflowed at 65,504 and came
+                # in as inf, so the finiteness check caught divergence as a side effect.
+                # bfloat16 carries the same exponent range as float32 -- up to ~3.4e38 --
+                # so those same weights now arrive *finite* and would be averaged in,
+                # destroying the global model with a perfectly valid number. Widening the
+                # range removed the accidental detector; this is the deliberate one.
+                #
+                # Measured against the incumbent global rather than an absolute bound,
+                # because the scale of a healthy model is not known in advance. Skipped on
+                # a cold start, where there is no incumbent to compare against.
+                if bad is None and self._global_fp32 is not None:
+                    incumbent = max((float(np.abs(l).max()) for l in self._global_fp32),
+                                    default=0.0)
+                    arrived = max((float(np.abs(l).max()) for l in layers), default=0.0)
+                    if incumbent > 0 and arrived > incumbent * MAX_WEIGHT_GROWTH:
+                        log(ERROR,
+                            "Round %s: dropping cluster %r -- its largest weight is %.3e "
+                            "against the global model's %.3e, a %.0fx jump. Finite, so the "
+                            "nan/inf check passes, but a single phase cannot legitimately "
+                            "move weights that far: this is local divergence arriving as a "
+                            "valid number. Its %s tokens are not counted. Check that "
+                            "cluster's loss and learning rate.",
+                            server_round,
+                            res.metrics.get(proto.CLUSTER, getattr(proxy, "cid", "?")),
+                            arrived, incumbent, arrived / incumbent,
+                            f"{res.num_examples:,}")
+                        continue
                 if bad is not None:
                     log(ERROR,
                         "Round %s: dropping cluster %r -- tensor %d of %d contains "
@@ -875,10 +935,9 @@ if HAS_FLWR:
                     f"{kept:,}")
             fedavg_result: NDArrays = weighted_sum or []
 
-            w_t: NDArrays = self._global_fp32 or [
-                layer.astype(np.float32)
-                for layer in parameters_to_ndarrays(self.initial_parameters)
-            ]
+            w_t: NDArrays = self._global_fp32 or self._from_wire(
+                parameters_to_ndarrays(self.initial_parameters)
+            )
 
             # eta = 1 when there is only one contributor, because with one contributor
             # there is nothing to average.
@@ -931,18 +990,27 @@ if HAS_FLWR:
             self._global_fp32 = w_next
             self._inline_round += 1
 
-            # Advance the server-authoritative global step by the token-weighted
-            # average of steps each cluster completed.  With identical H this is
-            # exactly H; with per-site H it places the schedule at the honest
-            # midpoint.
-            kept_tokens = sum(res.num_examples for _, res in usable)
-            if kept_tokens > 0:
-                step_increment = round(sum(
-                    (res.num_examples / kept_tokens)
-                    * int(res.metrics.get(proto.STEPS, 0))
-                    for _, res in usable
-                ))
-                self._inline_global_step += max(1, step_increment) if step_increment > 0 else 0
+            # Advance the global step by the LARGEST number of steps any cluster
+            # took, not the token-weighted average.
+            #
+            # The average looks fairer and is the wrong quantity. It is strictly less than the
+            # fast site's H, and `align_to_global_step` only moved a site forward -- so the
+            # fast site outran the counter, its alignment became a permanent no-op, and the
+            # slow site alone was pulled to a value neither of them was at. The two schedules
+            # then diverged monotonically: with H=200/100 they are 265 steps apart after six
+            # rounds and growing, which is exactly the "learning rate differs across clusters"
+            # warning.
+            #
+            # A midpoint is a point where *no* replica is. max() is the only increment under
+            # which every site can sit at the same place, which is the whole purpose of a
+            # server-authoritative step -- and it matches what the run actually advanced by,
+            # since the global model absorbed the fast site's work.
+            #
+            # With identical H this is exactly H, unchanged.
+            steps_taken = [int(res.metrics.get(proto.STEPS, 0)) for _, res in usable]
+            step_increment = max(steps_taken, default=0)
+            if step_increment > 0:
+                self._inline_global_step += step_increment
 
             # Keep it, so a later round that fails to merge leaves at the same dtype.
             if wire_dtype is not None:

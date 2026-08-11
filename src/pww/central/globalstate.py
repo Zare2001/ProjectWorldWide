@@ -349,14 +349,26 @@ class GlobalState:
             record.tokens_total += item.tokens
             self.total_tokens += item.tokens
 
-        # Advance the server-authoritative global step by the token-weighted
-        # average of steps each cluster completed.  With identical H across
-        # sites this reduces to exactly H; with per-site H it places the LR
-        # schedule at the honest midpoint of the work that was done.
-        step_increment = round(sum(
-            share * item.steps for share, item in zip(shares, fresh)
-        ))
-        self.global_step += max(1, step_increment) if step_increment > 0 else 0
+        # Advance the global step by the LARGEST number of steps any cluster
+        # took, not the token-weighted average.
+        #
+        # The average looks fairer and is the wrong quantity. It is strictly less than the
+        # fast site's H, and `align_to_global_step` only moved a site forward -- so the
+        # fast site outran the counter, its alignment became a permanent no-op, and the
+        # slow site alone was pulled to a value neither of them was at. The two schedules
+        # then diverged monotonically: with H=200/100 they are 265 steps apart after six
+        # rounds and growing, which is exactly the "learning rate differs across clusters"
+        # warning.
+        #
+        # A midpoint is a point where *no* replica is. max() is the only increment under
+        # which every site can sit at the same place, which is the whole purpose of a
+        # server-authoritative step -- and it matches what the run actually advanced by,
+        # since the global model absorbed the fast site's work.
+        #
+        # With identical H this is exactly H, unchanged.
+        step_increment = max((item.steps for item in fresh), default=0)
+        if step_increment > 0:
+            self.global_step += step_increment
 
         self.round += 1
         self._save_meta()

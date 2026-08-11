@@ -870,6 +870,41 @@ def _():
     assert not lease_table.leases
 
 
+@check("a blameless release does not quarantine the blocks")
+def _():
+    # DARL quarantines a position reclaimed max_attempts times, because a block that fails
+    # under several clusters is a corrupt shard. A site handing spans back because its own
+    # phase produced a non-finite loss is the opposite case: the data is fine and the
+    # participant is broken. Counting those attempts would retire good positions
+    # permanently after three such rounds -- worse than the wasted tokens it replaced.
+    # ONE block, so every acquire returns the same position. With two the allocator's
+    # cursor alternates and `first_grant_fraction` halves the grant, so after three rounds
+    # each position has only two attempts and nothing is quarantined -- which would make
+    # the blameful half of this check pass for the wrong reason.
+    space = BlockSpace(num_samples=10, block_size=10, seed=1)
+
+    # Blameful releases still quarantine: that behaviour is the point of the counter.
+    blameful = LeaseTable(space.num_blocks, digest=space.digest(), max_attempts=3)
+    for _ in range(3):
+        grant = blameful.acquire("sick", 1)
+        assert grant.leases, grant.status
+        blameful.release("sick", grant.leases[0].lease_id)
+    assert blameful.quarantined > 0, "a blameful release must still be able to quarantine"
+
+    # Blameless ones do not, and the blocks come back to the pool.
+    blameless = LeaseTable(space.num_blocks, digest=space.digest(), max_attempts=3)
+    for _ in range(3):
+        grant = blameless.acquire("sick", 1)
+        assert grant.leases, grant.status
+        blameless.release("sick", grant.leases[0].lease_id, count_attempt=False)
+    assert blameless.quarantined == 0, (
+        f"a blameless release quarantined {blameless.quarantined} block(s); the phase "
+        f"failed, not the data"
+    )
+    assert blameless.committed == 0
+    blameless.verify()
+
+
 @check("HTTP: distinct replica ids keep two jobs at one site isolated")
 def _():
     """What --replica buys, over HTTP with real sessions: no refusal at all, and each

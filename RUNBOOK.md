@@ -451,6 +451,38 @@ scripts/titan/run_train.sh --replica a --config ...
 scripts/titan/run_train.sh --replica b --config ...
 ```
 
+### Stop the faster site idling at the round barrier
+
+A round cannot close until the slowest site delivers its delta — that is DiLoCo, not a
+setting. But the fast site does **not** have to spend the wait doing nothing. Measured:
+Snellius did 37 s of work inside a 154 s round and idled 118 s, **76% of every round**.
+
+`PWW_GRAD_ACCUM=N` makes each of that site's H optimiser steps consume N microbatches, so
+it trains N× the tokens in the same number of steps and finishes when the slow site does:
+
+```bash
+PWW_GRAD_ACCUM=2 DARL_TOKEN="<token>" \
+  sbatch --export=ALL,PWW_GRAD_ACCUM,DARL_TOKEN scripts/snellius/job_titan_diloco.sh
+```
+
+Set it **only on the faster site**. It prints what it chose:
+
+```
+grad accum  : 2x -> global_batch_size 64 (8 local x 4 ranks x 2); H is unchanged, so
+              drift and the LR schedule are unaffected
+```
+
+| | |
+|---|---|
+| **Start at 2** | halves the idle, ~1.5× throughput, and gives a clean comparison before 4 |
+| **Watch `drift_ratio_max`** | it should be **unchanged**. Accumulation adds no optimiser steps, so if drift moves, something else is going on |
+| **Judge by loss per *token***, not per round | a larger batch at the same LR is well-estimated but conservative, so per-round loss will look different for a reason that is not the model |
+
+Why not simply raise `darl.inner_steps` on the fast site, which also fills the round:
+drift scales with H and was already ~0.93 from a random init, where past 1 averaging
+destroys progress. Accumulation fills the same time at the same drift. Full reasoning in
+[FEDERATION_GUIDE.md § 3](FEDERATION_GUIDE.md).
+
 Sites may be queued for hours; that is fine and needs no coordination. The server holds
 the run and merges whoever is present.
 

@@ -210,7 +210,7 @@ class DARLDataSource:
         """
         return self.session.commit_all() if self.is_leader else 0
 
-    def release_unused(self) -> int:
+    def release_unused(self, *, count_attempt: bool = True) -> int:
         """Release any pre-fetched but un-trained leases back to the pool.
 
         Call this when the caller is done with its inner steps but the session
@@ -223,7 +223,7 @@ class DARLDataSource:
         """
         if not self.is_leader:
             return 0
-        released = self.session.release_all()
+        released = self.session.release_all(count_attempt=count_attempt)
         if released > 0:
             get_logger().info("darl: released %d unused leases back to pool", released)
         return released

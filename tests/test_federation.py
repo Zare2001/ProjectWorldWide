@@ -950,6 +950,92 @@ if HAS_FLWR:
         assert strategy.v_vector[0].dtype == np.float32
         assert metrics["merge_round"] == 1
 
+    @check("a diverged-but-finite cluster is refused, which bfloat16 range made possible")
+    def _():
+        # Under float16 a diverged cluster overflowed at 65,504 and arrived as inf, so the
+        # finiteness check caught divergence by accident. bfloat16 carries float32's
+        # exponent range, so the same weights now arrive finite and would be averaged in --
+        # destroying the global model with a perfectly valid number.
+        from pww.central.strategy import FedMom
+
+        def build():
+            s = FedMom(
+                transport=proto.TRANSPORT_INLINE,
+                initial_parameters=ndarrays_to_parameters([np.ones((4,), dtype=np.float32)]),
+                server_learning_rate=0.7, server_momentum=0.9,
+            )
+            s.configure_fit(1, ndarrays_to_parameters([np.ones((4,), dtype=np.float32)]),
+                            _FakeManager(2))
+            return s
+
+        # 1e30 is finite -- isfinite passes -- and 1e30x the incumbent.
+        s = build()
+        s.aggregate_fit(1, [
+            (None, _fit_res({proto.CLUSTER: "good"}, 1_000_000,
+                            arrays=[np.full((4,), 1.1, dtype=np.float32)])),
+            (None, _fit_res({proto.CLUSTER: "diverged"}, 1_000_000,
+                            arrays=[np.full((4,), 1e30, dtype=np.float32)])),
+        ], [])
+        peak = float(np.abs(s._global_fp32[0]).max())
+        assert peak < 10.0, f"a finite 1e30 cluster was merged: global peak {peak:.3e}"
+
+        # High drift must NOT trip it: a real opening round moved weights 1.69x their norm.
+        s = build()
+        s.aggregate_fit(1, [
+            (None, _fit_res({proto.CLUSTER: "a"}, 1_000_000,
+                            arrays=[np.full((4,), 3.0, dtype=np.float32)])),
+            (None, _fit_res({proto.CLUSTER: "b"}, 1_000_000,
+                            arrays=[np.full((4,), 3.0, dtype=np.float32)])),
+        ], [])
+        assert abs(float(s._global_fp32[0][0]) - 3.0) > 1e-6, "legitimate drift was refused"
+
+    @check("bfloat16 wire survives a full round trip through the server, not just inbound")
+    def _():
+        # The regression this pins destroyed a two-site run. bfloat16 crosses the wire as
+        # uint16 bit patterns, so decoding is a *reinterpretation* -- and configure_fit's
+        # round-1 adoption used astype(np.float32), which converts the integer instead. A
+        # bf16 1.5 has bits 0x3FC0 = 16320, so the adopted global was 16320.0: four orders
+        # of magnitude too large, with no error raised anywhere.
+        #
+        # The only symptom was a held-out loss of exactly ln(131328) = 11.7855, the
+        # vocabulary size, i.e. uniform logits from a destroyed model -- and then both
+        # sites returned non-finite weights after training on it.
+        #
+        # Inbound-only tests passed throughout. This one goes in AND out.
+        from flwr.common import parameters_to_ndarrays
+        from pww.central.strategy import FedMom
+
+        def pack(x):
+            return torch.tensor(x, dtype=torch.bfloat16).view(torch.uint16).numpy()
+        def unpack(a):
+            return torch.from_numpy(a).view(torch.bfloat16).to(torch.float32).numpy()
+
+        real = [1.5, -0.02, 0.7]
+        wire = pack(real)
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([wire.copy()]),
+            server_learning_rate=0.7, server_momentum=0.9,
+        )
+        strategy.configure_fit(1, ndarrays_to_parameters([wire.copy()]), _FakeManager(1))
+
+        # Adoption must reinterpret, not convert. 16320.0 is the failure mode.
+        adopted = strategy._global_fp32[0]
+        assert np.abs(adopted).max() < 10.0, (
+            f"configure_fit adopted bit patterns as values: {adopted} -- expected ~{real}"
+        )
+        assert np.allclose(adopted, unpack(wire), atol=1e-6), adopted
+
+        out, _ = strategy.aggregate_fit(
+            1, [(None, _fit_res({proto.CLUSTER: "snellius"}, 1_000_000, arrays=[wire.copy()]))], [])
+
+        # Outbound must be bit-packed, and a client decoding it must get the weights back.
+        sent = parameters_to_ndarrays(out)[0]
+        assert sent.dtype == np.uint16, sent.dtype
+        back = unpack(sent)
+        assert np.abs(back).max() < 10.0, f"round trip inflated the model: {back}"
+        assert np.allclose(back, unpack(wire), atol=1e-2), (back, unpack(wire))
+
     @check("a solo round takes the full step, because there is nothing to average")
     def _():
         # eta < 1 damps toward the previous global to reduce variance across replicas.
@@ -1072,7 +1158,7 @@ def _():
 # --- per-site H and server-authoritative global step ------------------------
 
 
-@check("global_step advances by token-weighted step average")
+@check("global_step advances by the largest H any cluster took")
 def _():
     """With identical H on both sites, global_step advances by exactly H."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -1097,7 +1183,7 @@ def _():
         assert state.round == 1
 
 
-@check("per-site H produces correct token-weighted step increment")
+@check("per-site H advances global_step by max(H), not the average")
 def _():
     """Snellius does H=200, LUMI does H=100, tokens reflect the ratio."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -1108,7 +1194,10 @@ def _():
 
         # Snellius: 200 steps * 32 windows * 2048 = 13,107,200 tokens
         # LUMI:    100 steps * 64 windows * 2048 = 13,107,200 tokens
-        # Equal tokens, different H -> weighted average = (0.5*200 + 0.5*100) = 150
+        # Equal tokens, different H. max(200, 100) = 200, NOT the weighted average of
+        # 150: a midpoint is a step neither replica is at, and because alignment only
+        # ever moved forward, the fast site outran it and the two schedules diverged
+        # monotonically. max() is the only increment where both sites can sit together.
         state.merge(
             [
                 Contribution("snellius", _delta(root / "ds.pww", 0.1, 0),
@@ -1120,7 +1209,7 @@ def _():
             ],
             server_learning_rate=1.0, server_momentum=0.0,
         )
-        assert state.global_step == 150, f"expected 150, got {state.global_step}"
+        assert state.global_step == 200, f"expected max(200,100)=200, got {state.global_step}"
 
         # Second round: same pattern, steps accumulate.
         state.merge(
@@ -1134,7 +1223,7 @@ def _():
             ],
             server_learning_rate=1.0, server_momentum=0.0,
         )
-        assert state.global_step == 300, f"expected 300, got {state.global_step}"
+        assert state.global_step == 400, f"two rounds of max(200,100): expected 400, got {state.global_step}"
 
 
 @check("global_step survives an aggregator restart")
@@ -1192,7 +1281,7 @@ if HAS_FLWR:
             assert proto.GLOBAL_STEP in config, f"missing {proto.GLOBAL_STEP} in config"
             assert config[proto.GLOBAL_STEP] == 0
 
-    @check("inline transport advances global_step by token-weighted steps")
+    @check("inline transport advances global_step by max(H)")
     def _():
         from pww.central.strategy import FedMom
 
@@ -1221,8 +1310,8 @@ if HAS_FLWR:
             ],
             [],
         )
-        assert strategy.global_step == 160, f"expected 160, got {strategy.global_step}"
-        assert metrics.get("global_step") == 160
+        assert strategy.global_step == 200, f"expected max(H)=200, got {strategy.global_step}"
+        assert metrics.get("global_step") == 200
 
     @check("uint16 (bfloat16) wire dtype is preserved across inline aggregation rounds")
     def _():
@@ -1247,7 +1336,15 @@ if HAS_FLWR:
         )
         assert strategy._wire_dtype == np.uint16, f"expected np.uint16, got {strategy._wire_dtype}"
         assert aggregated is not None
-        assert aggregated.tensors[0] is not None
+        # `aggregated.tensors[0] is not None` was the original assertion and is vacuous --
+        # always true, so a bug producing the right dtype and garbage values passed. Check
+        # the values: eta=1 with one contributor means the global IS that contributor's
+        # weights.
+        from flwr.common import parameters_to_ndarrays
+
+        back = torch.from_numpy(parameters_to_ndarrays(aggregated)[0]) \
+                    .view(torch.bfloat16).to(torch.float32).numpy()
+        assert np.allclose(back, [1.0, 2.0], atol=1e-2), back
 
     @check("blob transport passes steps through to Contribution")
     def _():
@@ -1286,16 +1383,20 @@ if HAS_FLWR:
                 ],
                 [],
             )
-            # Equal tokens: weighted avg = 0.5*200 + 0.5*100 = 150
-            assert state.global_step == 150, f"expected 150, got {state.global_step}"
+            # Equal tokens, H=200/100 -> max() = 200. See the note above.
+            assert state.global_step == 200, f"expected 200, got {state.global_step}"
 
 
 @check("bfloat16 wire dtype round-trips values exceeding float16 max (65504)")
 def _():
     try:
         from pww.titan.params import ParameterCodec
-    except (ImportError, ModuleNotFoundError):
-        return  # torchtitan dependencies (tyro) not installed in this venv
+    except (ImportError, ModuleNotFoundError) as exc:
+        # A bare `return` here reported PASS, which is how this check looked green on the
+        # central VM while never executing. Say so instead: a skip that reads as a pass is
+        # worse than no check, because it is counted in "36/36 passing".
+        print(f"        (skipped: {type(exc).__name__} -- needs the torchtitan env)")
+        return
 
     state = {
         "w": torch.tensor([70000.0, -1e30, 1.0], dtype=torch.bfloat16)

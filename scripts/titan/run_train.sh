@@ -172,6 +172,57 @@ overrides=()
 [[ -n "${SHARDS}" ]] && overrides+=(--training.dataset_path "${SHARDS}")
 [[ -n "${DUMP}" ]] && overrides+=(--job.dump_folder "${DUMP}")
 
+# --- gradient accumulation: let a fast site fill the round instead of idling -----
+#
+# The Flower round is a barrier: DiLoCo's outer step averages every participant's delta,
+# so the round cannot close until the slowest site delivers. That barrier cannot be
+# removed without changing the algorithm. What *can* be removed is the idling at it.
+#
+# A fast site finishes its H steps early and then waits. Measured on a real round: one
+# site did 37s of work inside a 154s round and sat still for 118s -- 76% of every round,
+# turning hardware sustaining 256k tok/s into a run averaging 101k.
+#
+# PWW_GRAD_ACCUM=N makes each of that site's H optimiser steps consume N microbatches
+# instead of one. It processes N times the data in the same number of steps, so it finishes
+# when the slow site does rather than early.
+#
+# Why this rather than raising H on the fast site, which also fills the round:
+#
+#   drift      unchanged. `drift = ||local - global|| / ||global||` measures how far the
+#              weights moved, and they move once per *optimiser* step -- still H of them.
+#              Accumulation improves each step's gradient estimate; it does not take more
+#              steps or larger ones. Raising H multiplies drift, and drift was already
+#              ~0.93 from a random init, where past 1 averaging destroys progress.
+#   LR         unchanged. Identical H at every site means the schedule advances identically,
+#              so there is no per-site H and nothing to align.
+#   memory     unchanged. Microbatches run sequentially, so only one set of activations is
+#              live at a time. This is the entire reason accumulation exists.
+#
+# Expressed as a multiplier rather than as training.global_batch_size, because the batch
+# that gives a 2x accumulation depends on the site's rank count -- 64 on 4 ranks, 128 on 8 --
+# so "accumulate 2x" is the site-independent way to say it.
+#
+# The cost, so it is not a surprise: a site running a larger effective batch at the same
+# learning rate is under-using that batch (the linear-scaling rule would want a larger LR).
+# That is an optimisation inefficiency, not an instability, and the way to see it is
+# loss per *token* rather than per round.
+#
+# DARL needs no change: blocks_for_phase already takes grad_accum, so the lease grows with
+# the phase.
+GRAD_ACCUM="${PWW_GRAD_ACCUM:-1}"
+if [[ "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]] && (( GRAD_ACCUM > 1 )); then
+    ga_batch="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}"                 | cut -d= -f2 | tr -d ' ')"
+    if [[ "${ga_batch}" =~ ^[1-9][0-9]*$ ]]; then
+        global_batch=$(( GRAD_ACCUM * ga_batch * NPROC ))
+        overrides+=(--training.global_batch_size "${global_batch}")
+        echo "grad accum  : ${GRAD_ACCUM}x -> global_batch_size ${global_batch}"              "(${ga_batch} local x ${NPROC} ranks x ${GRAD_ACCUM}); H is unchanged, so"              "drift and the LR schedule are unaffected"
+    else
+        echo "WARNING: PWW_GRAD_ACCUM=${GRAD_ACCUM} but local_batch_size could not be read"              "from ${CONFIG}; leaving gradient accumulation at 1" >&2
+    fi
+elif [[ ! "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WARNING: PWW_GRAD_ACCUM=${GRAD_ACCUM} is not a positive integer; ignoring" >&2
+fi
+
 # --- validation, made identical across sites --------------------------------
 #
 # The held-out loss is the only cross-site check there is: every cluster evaluates the

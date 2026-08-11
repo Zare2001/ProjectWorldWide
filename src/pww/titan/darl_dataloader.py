@@ -235,6 +235,19 @@ class DARLWindowDataset(IterableDataset, Stateful):
         time.sleep(1.0)
         return True
 
+    def release(self) -> int:
+        """Hand every held span back, committing nothing.
+
+        The counterpart of `commit` for a phase that produced nothing usable -- a
+        non-finite loss, say. Committing there would retire tokens no model learned from:
+        the central node drops such a contribution, but DARL would have marked the blocks
+        durable, so they are never re-issued and quietly vanish from the epoch while the
+        coverage counter says otherwise.
+        """
+        # count_attempt=False: the phase failed, not the data. See
+        # LeaseTable._reclaim -- otherwise three such rounds quarantine good blocks.
+        return self.source.release_unused(count_attempt=False)
+
     def commit(self) -> int:
         """Tell the coordinator the held spans are durably in a checkpoint.
 
@@ -301,6 +314,9 @@ class DARLDataLoader(torch.utils.data.DataLoader, BaseDataLoader):
 
     def commit(self) -> int:
         return self.darl_dataset.commit()
+
+    def release(self) -> int:
+        return self.darl_dataset.release()
 
     @property
     def exhausted(self) -> bool:

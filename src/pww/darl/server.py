@@ -333,7 +333,10 @@ class Coordinator:
             now = time.time()
             blocks = self.table.release(
                 payload["cluster"], payload.get("lease"),
-                incarnation=str(payload.get("incarnation", "")), now=now,
+                incarnation=str(payload.get("incarnation", "")),
+                # Default True, so an older client is unchanged. False means the cluster
+                # has already blamed itself -- see LeaseTable._reclaim.
+                count_attempt=bool(payload.get("count_attempt", True)), now=now,
             )
             self._log_op("release", {"cluster": payload["cluster"],
                                      "lease": payload.get("lease"),

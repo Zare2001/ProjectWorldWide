@@ -333,6 +333,75 @@ Deliberate departures from the paper:
   not combining progress, so the early rounds are the ones to watch. The cheap levers are
   a smaller `darl.inner_steps` for the opening rounds, or `server-momentum: 0.0` until
   drift settles.
+- **Gradient accumulation on the faster site, so nobody idles.** This is the preferred
+  answer to unequal throughput, and it is worth understanding before the per-site H
+  option below.
+
+  **The barrier is not removable.** DiLoCo's outer step averages every participant's
+  delta, so a round cannot close until the slowest site delivers. That is the algorithm.
+  What *is* removable is the **idling** at that barrier.
+
+  Measured on a real round: Snellius did 37 s of work inside a 154 s round and then sat
+  still for 118 s — **76% of every round** — so hardware sustaining 256k tok/s produced a
+  run averaging 101k tok/s.
+
+  **What gradient accumulation does.** An optimiser step normally means one batch in,
+  forward, backward, update. With `grad_accum = N` it means *N* smaller microbatches in,
+  forward and backward on each, gradients **summed**, then **one** update:
+
+  ```
+  grad_accum = 1    [batch] -> fwd/bwd -> UPDATE                       1 update,  32 windows
+  grad_accum = 4    [mb][mb][mb][mb] -> fwd/bwd each, sum -> UPDATE     1 update, 128 windows
+  ```
+
+  So the site consumes N× the data per optimiser step and takes N× as long per step —
+  which is exactly what fills the wait. At `grad_accum = 4`, Snellius's 100 steps take
+  ~146 s instead of 37 s and it arrives when LUMI does, having trained 4× the tokens.
+
+  | | round | tokens merged | effective |
+  |---|---|---|---|
+  | `grad_accum = 1` (now) | 175 s | 19.7 M | 112k tok/s |
+  | `grad_accum = 2` | 175 s | 26.2 M | ~150k tok/s |
+  | `grad_accum = 4` | 175 s | **39.3 M** | **224k tok/s** |
+
+  **Three things it does not disturb**, which is why it is preferred over raising H:
+
+  | | |
+  |---|---|
+  | **drift** | unchanged. `drift = ‖local − global‖ / ‖global‖` measures how far the weights moved, and they move once per *optimiser* step — still H of them. Accumulation improves each step's gradient estimate; it does not take more steps or larger ones. Raising H multiplies drift, and drift was already ~0.93 from a random initialisation, where past 1 averaging destroys rather than combines progress. |
+  | **the LR schedule** | unchanged. Identical H at every site means the schedule advances identically, so there is no per-site H and nothing to align. |
+  | **peak memory** | unchanged. Microbatches run *sequentially*, so only one set of activations is live at a time. This is the entire reason accumulation exists. |
+
+  **How to set it.** Per site at submit time, because both sites share one TOML and the
+  correct batch depends on the site's rank count:
+
+  ```bash
+  PWW_GRAD_ACCUM=2 DARL_TOKEN="..." sbatch --export=ALL,PWW_GRAD_ACCUM,DARL_TOKEN \
+    scripts/snellius/job_titan_diloco.sh
+  ```
+
+  `run_train.sh` turns that into `--training.global_batch_size = N × local_batch_size ×
+  nproc` — 64 for 2× on Snellius's 4 ranks, 128 for 2× on LUMI's 8 — and prints what it
+  chose. Expressed as a multiplier rather than a batch size precisely because the batch
+  that gives "2×" differs per site. DARL needs no change: `blocks_for_phase` already takes
+  `grad_accum`, so each lease grows with the phase.
+
+  **The cost, stated plainly.** A site running a larger effective batch at the *same*
+  learning rate is under-using that batch — the linear-scaling rule would want a larger LR
+  — so its steps are well estimated but conservatively small. That is an optimisation
+  inefficiency, not an instability, and the way to see it is **loss per token** rather than
+  loss per round. Raising only that site's LR to compensate would make the two sites
+  optimise differently, which is a larger departure than the batch asymmetry it fixes.
+
+  **Start at 2, not 4.** Half the idle, ~1.5× throughput, and a clean comparison first.
+  Two numbers to watch: `drift_ratio_max` should be **unchanged** (if it moves, the
+  reasoning above is wrong), and loss per token should not get worse.
+
+  **What this is not.** It fills the wait; it does not remove the barrier. Removing it
+  means asynchronous DiLoCo — sites pushing deltas whenever they finish, merged
+  continuously — which is a different algorithm, and this implementation's generation check
+  deliberately *rejects* any delta not computed against the current round.
+
 - **Per-site H (inner steps vary across clusters).** Algorithm 1 has every replica run
   the same H. When clusters have very different throughput — e.g. Snellius at 2.73
   steps/s vs LUMI at 0.58 steps/s — fixing H = 100 on both means the Flower round
@@ -349,15 +418,35 @@ Deliberate departures from the paper:
   `global_step = merge_round × H` locally. With per-site H that formula breaks — each
   site would place itself at a different point on the schedule. The central server now
   tracks a **server-authoritative `global_step`**, broadcast as `pww_global_step` in
-  every `configure_fit` config dict. After each merge it advances by the token-weighted
-  average of steps completed across all participating clusters:
+  every `configure_fit` config dict. After each merge it advances by the **largest**
+  number of steps any participating cluster took:
 
   ```
-  Δglobal_step = round( Σᵢ pᵢ × Hᵢ )    where pᵢ = tokensᵢ / Σ tokens
+  Δglobal_step = max_i( H_i )
   ```
 
   When all sites use the same H this reduces exactly to H, preserving backward
-  compatibility. The global step is persisted in `meta.json` (blob transport) and in
+  compatibility.
+
+  **This was originally the token-weighted average `Σᵢ pᵢ × Hᵢ`, and that was wrong.**
+  The average is strictly less than the fast site's H, and alignment only moved a site
+  forward — so the fast site outran the counter, its alignment became a permanent no-op,
+  and the slow site alone was pulled to a value neither of them occupied. The schedules
+  then diverged *monotonically*: at H = 200/100 they are 265 steps apart after six rounds
+  and growing, which surfaced as `learning rate differs across clusters: 1.515e-04,
+  3.000e-04`. A midpoint is a step where no replica is. `max()` is the only increment
+  under which every site can sit at the same place, and it matches what the run actually
+  advanced by, since the global model absorbed the fast site's work.
+
+  Alignment is correspondingly **authoritative in both directions** now: `LambdaLR`
+  recomputes from `last_epoch`, so the client places the schedule exactly rather than
+  replaying steps forward. Forward-only alignment is only safe when there is nothing to
+  disagree about.
+
+  The trade-off to know: with `max()`, the slow site's LR advances faster than its own step
+  count — 200 schedule steps for 100 optimiser steps at H = 200/100. That is the intended
+  reading (the schedule tracks the *run*, not one replica), but it means a slow site sees a
+  decayed LR sooner than it would training alone. The global step is persisted in `meta.json` (blob transport) and in
   the npz checkpoint meta array (inline transport), so it survives aggregator restarts.
 
   **Drift caveat.** Drift scales with H. At H = 100 from scratch, `drift_ratio` was

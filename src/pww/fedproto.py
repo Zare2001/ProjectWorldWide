@@ -57,8 +57,7 @@ GLOBAL_STEP = "pww_global_step"
 
 With per-site H (different ``darl.inner_steps`` on each cluster), a client can no
 longer compute ``global_step = round * H`` locally because H varies across sites.
-The server tracks the token-weighted average of steps across all contributing
-clusters and broadcasts this so every site's LR schedule stays aligned."""
+The server tracks the largest number of steps any contributing cluster took, and broadcasts this so every site's LR schedule stays aligned."""
 
 # --- metrics: cluster -> central node --------------------------------------
 
