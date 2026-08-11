@@ -1224,6 +1224,31 @@ if HAS_FLWR:
         assert strategy.global_step == 160, f"expected 160, got {strategy.global_step}"
         assert metrics.get("global_step") == 160
 
+    @check("uint16 (bfloat16) wire dtype is preserved across inline aggregation rounds")
+    def _():
+        from flwr.common import ndarrays_to_parameters
+        from pww.central.strategy import FedMom
+
+        weights = np.array([1.0, 2.0], dtype=np.float32)
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([weights.copy()]),
+            server_learning_rate=1.0, server_momentum=0.0,
+        )
+        strategy.configure_fit(1, ndarrays_to_parameters([weights.copy()]), _FakeManager(1))
+
+        bf16_arr = torch.tensor([1.0, 2.0], dtype=torch.bfloat16).view(torch.uint16).numpy()
+        aggregated, metrics = strategy.aggregate_fit(
+            1,
+            [(None, _fit_res({proto.CLUSTER: "snellius", proto.STEPS: 100},
+                            1_000_000,
+                            arrays=[bf16_arr]))],
+            [],
+        )
+        assert strategy._wire_dtype == np.uint16, f"expected np.uint16, got {strategy._wire_dtype}"
+        assert aggregated is not None
+        assert aggregated.tensors[0] is not None
+
     @check("blob transport passes steps through to Contribution")
     def _():
         from pww.central.strategy import FedMom
@@ -1267,7 +1292,10 @@ if HAS_FLWR:
 
 @check("bfloat16 wire dtype round-trips values exceeding float16 max (65504)")
 def _():
-    from pww.titan.params import ParameterCodec
+    try:
+        from pww.titan.params import ParameterCodec
+    except (ImportError, ModuleNotFoundError):
+        return  # torchtitan dependencies (tyro) not installed in this venv
 
     state = {
         "w": torch.tensor([70000.0, -1e30, 1.0], dtype=torch.bfloat16)

@@ -67,6 +67,8 @@ from logging import ERROR, INFO, WARNING
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from .. import fedproto as proto
 from ..logging_utils import get_logger
 
@@ -828,6 +830,8 @@ if HAS_FLWR:
                 if res.num_examples <= 0:
                     continue
                 layers = parameters_to_ndarrays(res.parameters)
+                if wire_dtype is None and layers:
+                    wire_dtype = layers[0].dtype
                 if layers and layers[0].dtype == np.uint16:
                     layers = [
                         torch.from_numpy(layer).view(torch.bfloat16).to(torch.float32).numpy()
@@ -847,8 +851,6 @@ if HAS_FLWR:
                         bad, len(layers), f"{res.num_examples:,}")
                     continue
                 usable.append((proxy, res))
-                if wire_dtype is None and layers:
-                    wire_dtype = layers[0].dtype
                 share = res.num_examples / total_examples
                 scaled = [layer.astype(np.float32) * share for layer in layers]
                 if weighted_sum is None:
