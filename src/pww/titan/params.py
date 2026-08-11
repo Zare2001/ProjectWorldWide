@@ -350,6 +350,7 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
             param = owned[key]
             # DTensor.shape is the global (unsharded) shape.
             full_shape = tuple(param.shape)
+            target_device = param.to_local().device if hasattr(param, "to_local") else param.device
             if is_source:
                 incoming = state.get(key)
                 if incoming is None:
@@ -362,11 +363,11 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
                         f"with uninitialised memory -- the sender is serialising a "
                         f"different model."
                     )
-                value = incoming.to(dtype=param.dtype, device=param.device).contiguous()
+                value = incoming.to(dtype=param.dtype, device=target_device).contiguous()
             else:
                 # Workers: allocate a receive buffer matching the full shape. Fully
                 # overwritten by the broadcast below, so its contents do not matter.
-                value = torch.empty(full_shape, dtype=param.dtype, device=param.device)
+                value = torch.empty(full_shape, dtype=param.dtype, device=target_device)
             # Broadcast the full tensor from rank 0 to all ranks (NCCL, on GPU).
             if dist.is_initialized():
                 dist.broadcast(value, src=0)

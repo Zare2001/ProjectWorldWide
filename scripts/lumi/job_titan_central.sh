@@ -53,11 +53,13 @@ for var in NCCL_SOCKET_IFNAME NCCL_NET_GDR_LEVEL FI_CXI_DISABLE_HOST_REGISTER; d
     export "SINGULARITYENV_${var}=${!var}"
 done
 
+PWW_LAUNCH=(singularity exec "${TITAN_SIF}")
+
 CONFIG="${CONFIG:-${PWW_ROOT}/configs/titan/qwen3_0.6b_c4_central.toml}"
 TOKENIZER="${TOKENIZER:-${PWW_DATA_DIR}/tokenizers/tokenizer-128k}"
 SHARDS="${SHARDS:-${PWW_DATA_DIR}/c4-tokenizer-128k-2048}"
 
-DARL_PORT="${PWW_DARL_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo "29510")}"
+DARL_PORT="${PWW_DARL_PORT:-$("${PWW_LAUNCH[@]}" python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo "29510")}"
 CENTRAL_IP="127.0.0.1"
 
 if [[ -z "${DARL_TOKEN:-}" ]]; then
@@ -65,7 +67,7 @@ if [[ -z "${DARL_TOKEN:-}" ]]; then
 fi
 export SINGULARITYENV_DARL_TOKEN="${DARL_TOKEN}"
 
-NUM_SAMPLES=$(python3 - "${SHARDS}" <<'EOF'
+NUM_SAMPLES=$("${PWW_LAUNCH[@]}" python3 - "${SHARDS}" <<'EOF'
 import json, pathlib, sys
 raw = json.loads((pathlib.Path(sys.argv[1]) / "manifest.json").read_text())
 print(int(raw["num_windows"]))
@@ -82,7 +84,7 @@ LOCAL_STATE_DIR="${PWW_ROOT}/outputs/darl_local_central_${SLURM_JOB_ID:-0}"
 mkdir -p "${LOCAL_STATE_DIR}"
 
 echo "darl: launching local coordinator on http://127.0.0.1:${DARL_PORT} (num_samples=${NUM_SAMPLES}, seed=42)..."
-PYTHONPATH="${PWW_ROOT}/src:${PYTHONPATH:-}" python3 -m pww.darl.server \
+PYTHONPATH="${PWW_ROOT}/src:${PYTHONPATH:-}" "${PWW_LAUNCH[@]}" python3 -m pww.darl.server \
     --num-samples "${NUM_SAMPLES}" \
     --block-size 1024 \
     --seed 42 \
