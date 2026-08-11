@@ -57,6 +57,13 @@ else
     exit 1
 fi
 
+# The paths, which this script was missing entirely. Without them `set -u` makes
+# ${CONFIG} an unbound-variable error at the run_train.sh call, and -- worse -- makes the
+# NUM_SAMPLES probe below fail into its own fallback rather than reporting anything.
+CONFIG="${CONFIG:-${PWW_ROOT}/configs/titan/qwen3_0.6b_c4_central.toml}"
+TOKENIZER="${TOKENIZER:-${PWW_DATA_DIR}/tokenizers/tokenizer-128k}"
+SHARDS="${SHARDS:-${PWW_DATA_DIR}/c4-tokenizer-128k-2048}"
+
 # Always run a local DARL coordinator on 127.0.0.1 for local standalone Snellius execution.
 # Probe an unused local port to prevent collisions with any concurrent jobs.
 DARL_PORT="${PWW_DARL_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo "29510")}"
@@ -66,8 +73,30 @@ if [[ -z "${DARL_TOKEN:-}" ]]; then
     export DARL_TOKEN="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
 fi
 
-# Extract num_samples from shards manifest
-NUM_SAMPLES=$(python3 -c "from pww.titan.shards import read_manifest; print(read_manifest('${SHARDS}').num_samples)" 2>/dev/null || echo "1000000")
+# The window count, read from the manifest and NOT allowed to fall back.
+#
+# This was `read_manifest(...).num_samples`, and Manifest has no such attribute -- the
+# field is `num_windows`. The AttributeError was swallowed by a `|| echo "1000000"`
+# fallback, so the local coordinator came up on a 1,000,000-sample block space instead of
+# the corpus's 2,756,597. A different sample count is a different permutation and a
+# different digest, so the baseline trained on a *different data sequence* from the DiLoCo
+# run -- which is the one thing this script exists to make identical.
+#
+# Read directly from manifest.json rather than through pww.titan.shards, so it needs no
+# torchtitan import, and fail loudly: a silent wrong number here produces a comparison that
+# looks valid and is not.
+NUM_SAMPLES=$(python3 - "${SHARDS}" <<'EOF'
+import json, pathlib, sys
+raw = json.loads((pathlib.Path(sys.argv[1]) / "manifest.json").read_text())
+print(int(raw["num_windows"]))
+EOF
+) || {
+    echo "ERROR: could not read num_windows from ${SHARDS}/manifest.json." >&2
+    echo "The baseline must use the same block space as the DiLoCo run, so this is fatal" >&2
+    echo "rather than defaulted -- a different sample count is a different data sequence." >&2
+    exit 1
+}
+echo "darl: block space from ${SHARDS}/manifest.json -> ${NUM_SAMPLES} windows"
 
 LOCAL_STATE_DIR="${PWW_ROOT}/outputs/darl_local_central_${SLURM_JOB_ID:-0}"
 mkdir -p "${LOCAL_STATE_DIR}"
