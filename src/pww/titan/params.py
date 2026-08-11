@@ -51,7 +51,7 @@ logger = get_logger("pww.titan.params")
 # subnormal is ~6e-08, so weights below that flush toward zero. Harmless (such a
 # weight contributes nothing to a forward pass) but real, and pinned by a test rather
 # than assumed away. float32 keeps everything, at twice the bytes.
-WIRE_DTYPES = {"float16": np.float16, "float32": np.float32}
+WIRE_DTYPES = {"float16": np.float16, "float32": np.float32, "bfloat16": np.uint16}
 
 
 @dataclass
@@ -72,8 +72,7 @@ class ParameterCodec:
     def from_state_dict(cls, state: dict[str, torch.Tensor], wire_dtype: str = "float16") -> "ParameterCodec":
         if wire_dtype not in WIRE_DTYPES:
             raise ValueError(
-                f"wire_dtype must be one of {sorted(WIRE_DTYPES)}, got {wire_dtype!r} "
-                f"(numpy has no bfloat16, so bf16 cannot cross a Flower connection)"
+                f"wire_dtype must be one of {sorted(WIRE_DTYPES)}, got {wire_dtype!r}"
             )
         keys = tuple(sorted(state))
         return cls(
@@ -92,16 +91,11 @@ class ParameterCodec:
         target = WIRE_DTYPES[self.wire_dtype]
         out = []
         for key in self.keys:
-            tensor = state[key]
-            # float32 first: casting bf16 straight to a numpy dtype is not
-            # supported, and the intermediate is what makes float16 output exact
-            # rather than reinterpreted.
-            # as_plain_tensor first: .numpy() on a DTensor raises, and on torch 2.9 a
-            # gathered state dict can still contain them.
-            out.append(
-                as_plain_tensor(tensor).detach().to(torch.float32).cpu()
-                .numpy().astype(target, copy=False)
-            )
+            tensor = as_plain_tensor(state[key]).detach()
+            if self.wire_dtype == "bfloat16":
+                out.append(tensor.to(torch.bfloat16).cpu().view(torch.uint16).numpy())
+            else:
+                out.append(tensor.to(torch.float32).cpu().numpy().astype(target, copy=False))
         return out
 
     def decode(self, arrays: list[np.ndarray]) -> dict[str, torch.Tensor]:
@@ -118,7 +112,11 @@ class ParameterCodec:
                     f"parameter {key} arrived with shape {tuple(array.shape)}, "
                     f"expected {shape}"
                 )
-            state[key] = torch.from_numpy(np.ascontiguousarray(array)).to(dtype)
+            arr = np.ascontiguousarray(array)
+            if self.wire_dtype == "bfloat16" or arr.dtype == np.uint16:
+                state[key] = torch.from_numpy(arr).view(torch.bfloat16).to(dtype)
+            else:
+                state[key] = torch.from_numpy(arr).to(dtype)
         return state
 
 

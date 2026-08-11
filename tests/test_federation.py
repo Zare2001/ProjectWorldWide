@@ -36,6 +36,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+if (ROOT / "third_party" / "torchtitan").is_dir():
+    sys.path.insert(0, str(ROOT / "third_party" / "torchtitan"))
 
 PASSED, FAILED = [], []
 CHECK_TIMEOUT_S = 60
@@ -1261,6 +1263,21 @@ if HAS_FLWR:
             )
             # Equal tokens: weighted avg = 0.5*200 + 0.5*100 = 150
             assert state.global_step == 150, f"expected 150, got {state.global_step}"
+
+
+@check("bfloat16 wire dtype round-trips values exceeding float16 max (65504)")
+def _():
+    from pww.titan.params import ParameterCodec
+
+    state = {
+        "w": torch.tensor([70000.0, -1e30, 1.0], dtype=torch.bfloat16)
+    }
+    codec = ParameterCodec.from_state_dict(state, wire_dtype="bfloat16")
+    encoded = codec.encode(state)
+    assert encoded[0].dtype == np.uint16
+    decoded = codec.decode(encoded)
+    assert torch.all(torch.isfinite(decoded["w"]))
+    assert torch.equal(state["w"], decoded["w"])
 
 
 def main() -> int:

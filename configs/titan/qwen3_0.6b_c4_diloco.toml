@@ -154,4 +154,4 @@ server_address = ""
 # under the 2 GiB cap); see configs/titan/qwen3_8b_c4_diloco.toml for the
 # out-of-band transport that any larger model needs.
 transport = "inline"
-wire_dtype = "float16"
+wire_dtype = "bfloat16"

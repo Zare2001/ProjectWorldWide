@@ -573,7 +573,13 @@ if HAS_FLWR:
             that size ever goes into a gRPC message.
             """
             if self._wire_dtype is not None and self._wire_dtype != np.float32:
-                arrays = [layer.astype(self._wire_dtype) for layer in arrays]
+                if self._wire_dtype == np.uint16:
+                    arrays = [
+                        torch.from_numpy(layer).to(torch.bfloat16).view(torch.uint16).numpy()
+                        for layer in arrays
+                    ]
+                else:
+                    arrays = [layer.astype(self._wire_dtype) for layer in arrays]
             params = ndarrays_to_parameters(arrays)
             # gRPC's cap is hard: 2**31 - 1 bytes, and no setting raises it. Exceeding
             # it fails the *send*, which Flower reports as an ordinary round failure
@@ -822,6 +828,11 @@ if HAS_FLWR:
                 if res.num_examples <= 0:
                     continue
                 layers = parameters_to_ndarrays(res.parameters)
+                if layers and layers[0].dtype == np.uint16:
+                    layers = [
+                        torch.from_numpy(layer).view(torch.bfloat16).to(torch.float32).numpy()
+                        for layer in layers
+                    ]
                 bad = next((i for i, layer in enumerate(layers)
                             if not np.all(np.isfinite(layer))), None)
                 if bad is not None:
