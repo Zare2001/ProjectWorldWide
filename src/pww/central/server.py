@@ -229,6 +229,8 @@ def build_metric_aggregators():
                 + (f", {float(m['peak_memory_gib']):.1f} GiB"
                    f" ({float(m.get('peak_memory_pct', 0)):.0f}%)"
                    if "peak_memory_gib" in m else "")
+                + (f", {float(m['power_watts']):.0f}W" if "power_watts" in m else "")
+                + (f", grad_norm {float(m['grad_norm']):.4f}" if "grad_norm" in m else "")
                 for _, m in metrics
             )
             logger.info("  >> Throughput %s tok/s combined | %s", f"{rate:,.0f}", per_site)

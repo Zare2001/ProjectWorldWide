@@ -340,7 +340,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             # rather than aggregated: MFU against an MI250X GCD and against an H100 are
             # not the same quantity, so a mean of the two would describe neither.
             **{key: float(result[key]) for key in
-               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr")
+               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr", "grad_norm", "power_watts")
                if key in result},
             **{key: float(value) for key, value in drift.items()},
         }
@@ -417,7 +417,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             # rather than aggregated: MFU against an MI250X GCD and against an H100 are
             # not the same quantity, so a mean of the two would describe neither.
             **{key: float(result[key]) for key in
-               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr")
+               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr", "grad_norm", "power_watts")
                if key in result},
             **{key: float(value) for key, value in drift.items()},
         }
