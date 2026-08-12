@@ -218,11 +218,14 @@ class FederatedTrainer:
             orig_log = proc.log
             def _log_wrapper(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
                 proc.last_grad_norm = grad_norm
+                if extra_metrics is None:
+                    extra_metrics = {}
                 p_watts = self._read_power_watts()
                 if p_watts is not None:
-                    if extra_metrics is None:
-                        extra_metrics = {}
                     extra_metrics["power_watts"] = p_watts
+                if math.isfinite(global_avg_loss):
+                    extra_metrics["train/loss"] = float(global_avg_loss)
+                    extra_metrics["train/perplexity"] = float(math.exp(min(20.0, global_avg_loss)))
                 return orig_log(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=extra_metrics)
             proc.log = _log_wrapper
             proc._pww_hooked = True
@@ -370,6 +373,7 @@ class FederatedTrainer:
         Collective-free and cheap: LambdaLR recomputes from `last_epoch`, so catching up
         is one lambda evaluation per step, and it is called once per phase.
         """
+        self.start()
         target = int(global_step)
         was = self.trainer.step
         if target == was:
