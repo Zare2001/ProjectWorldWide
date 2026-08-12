@@ -290,8 +290,39 @@ fi
 if [[ -z "${VAL_DATA}" ]]; then
     VAL_DATA="${PWW_ROOT}/third_party/torchtitan/tests/assets/c4_test"
 fi
+# Readable, not merely present. `compgen -G` matches a name, and a dangling symlink has a
+# name -- so a staged directory copied between sites with `rsync -a` (which preserves the
+# link rather than the bytes) passed this check and then died inside HuggingFace's loader
+# at Trainer construction, forty seconds into the allocation, with the real cause buried in
+# four ranks of traceback. Fail here instead, with the repair command.
 if [[ -z "${VAL_DATASET}" ]] && compgen -G "${VAL_DATA}/c4-validation.*.json*" > /dev/null; then
-    VAL_DATASET="c4_local"
+    val_readable=0
+    for candidate in "${VAL_DATA}"/c4-validation.*.json*; do
+        [[ -r "${candidate}" && -s "${candidate}" ]] && val_readable=1 && break
+    done
+    if [[ "${val_readable}" == "1" ]]; then
+        VAL_DATASET="c4_local"
+    else
+        cat >&2 <<EOF
+ERROR: ${VAL_DATA} holds c4-validation file(s) that cannot be read. The usual cause is a
+dangling symlink: stage_c4.sh used to link into c4-hub, and \`rsync -a\` between sites
+copies the link, not the bytes, leaving it pointing at the source site's path.
+
+\`ls\` shows a dangling symlink exactly like a real file, so this is not visible without
+following it:
+
+    ls -lL ${VAL_DATA}
+
+Re-stage on THIS site (it now hard-links, which survives an rsync, and repairs a broken
+entry in place):
+
+    scripts/titan/stage_c4.sh --split validation --files 1 --out ${VAL_DATA}
+
+Refusing rather than falling back to the bundled fixture: the fixture overlaps the C4
+training files, so a silent fallback would bias the very comparison this run exists for.
+EOF
+        exit 1
+    fi
 fi
 if [[ -d "${VAL_DATA}" ]]; then
     overrides+=(--validation.dataset_path "${VAL_DATA}")

@@ -49,6 +49,8 @@ echo "output : ${OUT_DIR}"
 echo
 
 pww_run python3 - "${OUT_DIR}" "${SPLIT}" "${FILES}" <<'PY'
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -63,17 +65,39 @@ if count > total:
 
 for index in range(count):
     name = f"en/c4-{split}.{index:05d}-of-{total:05d}.json.gz"
-    path = hf_hub_download(
+    path = os.path.realpath(hf_hub_download(
         repo_id="allenai/c4", filename=name, repo_type="dataset",
         local_dir=str(out_dir.parent.parent / "c4-hub"),
-    )
-    # Flatten into one directory, which is the layout datasets.py's c4_local
-    # loader globs for. Symlink rather than copy: hf_hub_download already has the
-    # bytes in its cache and C4 shards are ~350 MB each.
-    link = out_dir / Path(name).name
-    if not link.exists():
-        link.symlink_to(path)
-    print(f"[{index + 1}/{count}] {link.name}")
+    ))
+    # Flattened into one directory, which is the layout datasets.py's c4_local loader
+    # globs for.
+    #
+    # A HARD LINK, not a symlink. Both are free -- hf_hub_download already has the bytes
+    # and the cache is on the same filesystem -- but a symlink does not survive being
+    # copied between sites, and that failure is silent in the worst way:
+    #
+    #   `rsync -a` implies `-l`, so copying a staged directory from one site to the other
+    #   transfers the *link*, still pointing at the source site's absolute c4-hub path.
+    #   On the destination it dangles. `ls` lists a dangling symlink exactly like a real
+    #   file, so the directory looks correctly staged, and the run only fails minutes
+    #   later inside HuggingFace's loader with a FileNotFoundError buried in a
+    #   multi-rank traceback. Observed on Snellius after rsyncing LUMI's copy across.
+    #
+    # A hard link is a real directory entry, so rsync copies the bytes and the
+    # destination is self-contained. Falls back to a copy across filesystems.
+    target = out_dir / Path(name).name
+    # A previous run's dangling symlink still occupies the path, and `exists()` is False
+    # for one -- so the old `if not link.exists(): link.symlink_to(...)` raised
+    # FileExistsError and re-staging could not repair a broken link.
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    try:
+        os.link(path, target)
+        how = "hardlink"
+    except OSError:
+        shutil.copy2(path, target)
+        how = "copy"
+    print(f"[{index + 1}/{count}] {target.name} ({how})")
 PY
 
 echo
