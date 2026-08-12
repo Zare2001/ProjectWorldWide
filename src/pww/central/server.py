@@ -302,6 +302,9 @@ def build_metric_aggregators(
                 cid = str(m.get(proto.CLUSTER, "?"))
                 wb_metrics[f"cluster/{cid}/batch_size"] = n // 2048
                 wb_metrics[f"cluster/{cid}/batch_tokens"] = n
+                if "tokens_per_s" in m:
+                    ranks = 8 if "lumi" in cid.lower() else (4 if "snellius" in cid.lower() else 1)
+                    wb_metrics[f"cluster/{cid}/tps_per_rank"] = float(m["tokens_per_s"]) / ranks
                 for k in ("tokens_per_s", "mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "power_watts", "grad_norm", "drift_ratio"):
                     if k in m:
                         wb_metrics[f"cluster/{cid}/{k}"] = float(m[k])
