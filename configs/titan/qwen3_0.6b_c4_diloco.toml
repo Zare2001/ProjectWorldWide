@@ -94,7 +94,7 @@ keep_latest_k = 2
 # Generous relative to a single-site run: the outer step gathers a full parameter
 # set and pushes it over the WAN, so a rank can legitimately sit in a collective
 # for far longer than any intra-node operation would take.
-train_timeout_seconds = 300
+train_timeout_seconds = 1800
 
 [validation]
 enable = true

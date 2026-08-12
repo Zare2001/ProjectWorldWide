@@ -1,0 +1,78 @@
+# Qwen3 0.6B on C4, DARL-leased, Snellius/Lumi single-node 1k-step central comparison run.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-central-1k"
+description = "Qwen3 0.6B C4 central 1k-step comparison run (DARL-leased, single-node)"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 100
+decay_ratio = 0.8
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+steps = 1000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+interval = 100
+last_save_model_only = false
+keep_latest_k = 2
+
+[comm]
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 100
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+url = ""
+site = ""
+inner_steps = 100
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = false
+server_address = ""
+transport = "inline"
+wire_dtype = "bfloat16"
