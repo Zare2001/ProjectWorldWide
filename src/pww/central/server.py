@@ -284,6 +284,8 @@ def build_metric_aggregators(
                                ", ".join(f"{v:.3e}" for v in lrs))
 
         if wandb_run is not None:
+            steps_this_round = max((int(m.get(proto.STEPS, 100)) for _, m in metrics), default=100)
+            global_step = state["merge_round"] * steps_this_round
             wb_metrics = {
                 "round": state["merge_round"],
                 "train/loss": avg_loss,
@@ -313,7 +315,7 @@ def build_metric_aggregators(
                     if k in m:
                         wb_metrics[f"cluster/{cid}/{k}"] = float(m[k])
             try:
-                wandb_run.log(wb_metrics)
+                wandb_run.log(wb_metrics, step=global_step)
             except Exception as exc:
                 logger.warning("WandB log fit failed: %s", exc)
 
@@ -383,6 +385,7 @@ def build_metric_aggregators(
                 res = {"accuracy": pooled}
 
         if wandb_run is not None and res:
+            global_step = state["merge_round"] * 100
             wb_eval = {}
             if "perplexity" in res:
                 wb_eval["eval/loss"] = res["eval_loss"]
@@ -392,7 +395,7 @@ def build_metric_aggregators(
             elif "accuracy" in res:
                 wb_eval["eval/accuracy"] = res["accuracy"]
             try:
-                wandb_run.log(wb_eval)
+                wandb_run.log(wb_eval, step=global_step)
             except Exception as exc:
                 logger.warning("WandB log eval failed: %s", exc)
 
