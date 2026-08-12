@@ -22,3 +22,5 @@ logs/
 # scratch, but a run launched from the repo root without an override lands here,
 # and one Qwen3 0.6B checkpoint shard is several GB.
 /outputs
+wandb/
+.wandb/

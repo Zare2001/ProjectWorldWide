@@ -12,6 +12,11 @@ fi
 
 export PWW_SITE="${PWW_SITE:-central}"
 source "${PWW_ROOT}/env.sh"
+export PYTHONNOUSERSITE=0
+USER_SITE="$(python3 -m site --user-site 2>/dev/null || true)"
+if [[ -d "${USER_SITE}" ]]; then
+    export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
+fi
 
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
@@ -80,28 +85,38 @@ echo "========================================================="
 # 0. Setup Environment: uv -> venv -> lightweight venv fallback
 PYTHON_BIN="python3"
 
-if ! "${VENV_DIR}/bin/python3" -c "import flwr, torch" 2>/dev/null; then
-    echo "Installing Flower & PyTorch into ${VENV_DIR}..."
+if ! "${VENV_DIR}/bin/python3" -c "import flwr, torch, wandb" 2>/dev/null; then
+    echo "Installing Flower, PyTorch & WandB into ${VENV_DIR}..."
     if command -v uv >/dev/null 2>&1; then
         echo "Using uv..."
-        uv pip install --system "${FLOWER_REPO}" torch --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || true
+        uv pip install --system "${FLOWER_REPO}" torch wandb --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || true
     elif python3 -m venv "${VENV_DIR}" >/dev/null 2>&1 && [[ -x "${VENV_DIR}/bin/pip" ]]; then
         echo "Using python3 venv..."
-        "${VENV_DIR}/bin/pip" install "${FLOWER_REPO}" torch --extra-index-url https://download.pytorch.org/whl/cpu
+        "${VENV_DIR}/bin/pip" install "${FLOWER_REPO}" torch wandb --extra-index-url https://download.pytorch.org/whl/cpu
         PYTHON_BIN="${VENV_DIR}/bin/python3"
     else
-        echo "Creating lightweight venv and installing Flower & PyTorch into ${VENV_DIR}..."
+        echo "Creating lightweight venv and installing Flower, PyTorch & WandB into ${VENV_DIR}..."
         python3 -m venv --without-pip "${VENV_DIR}" >/dev/null 2>&1 || true
         PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
         SITE_PKGS="${VENV_DIR}/lib/python${PY_VER}/site-packages"
         mkdir -p "${SITE_PKGS}"
-        python3 -m pip install --target="${SITE_PKGS}" --break-system-packages "${FLOWER_REPO}" torch --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
-        python3 -m pip install --target="${SITE_PKGS}" "${FLOWER_REPO}" torch --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
-        pip install --target="${SITE_PKGS}" "${FLOWER_REPO}" torch --extra-index-url https://download.pytorch.org/whl/cpu
+        python3 -m pip install --target="${SITE_PKGS}" --break-system-packages "${FLOWER_REPO}" torch wandb --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
+        python3 -m pip install --target="${SITE_PKGS}" "${FLOWER_REPO}" torch wandb --extra-index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
+        pip install --target="${SITE_PKGS}" "${FLOWER_REPO}" torch wandb --extra-index-url https://download.pytorch.org/whl/cpu
         PYTHON_BIN="${VENV_DIR}/bin/python3"
+    fi
+    PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    SITE_PKGS="${VENV_DIR}/lib/python${PY_VER}/site-packages"
+    if [[ -d "${SITE_PKGS}" ]]; then
+        export PYTHONPATH="${SITE_PKGS}:${PYTHONPATH:-}"
     fi
 elif [[ -x "${VENV_DIR}/bin/python3" ]]; then
     PYTHON_BIN="${VENV_DIR}/bin/python3"
+    PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    SITE_PKGS="${VENV_DIR}/lib/python${PY_VER}/site-packages"
+    if [[ -d "${SITE_PKGS}" ]]; then
+        export PYTHONPATH="${SITE_PKGS}:${PYTHONPATH:-}"
+    fi
 fi
 
 # NUM_SAMPLES read from a manifest instead of retyped.
