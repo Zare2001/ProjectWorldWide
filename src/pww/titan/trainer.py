@@ -223,6 +223,9 @@ class FederatedTrainer:
                 p_watts = self._read_power_watts()
                 if p_watts is not None:
                     extra_metrics["power_watts"] = p_watts
+                cum_tok = int(self._cluster_total(getattr(trainer, "ntokens_seen", 0)))
+                if cum_tok > 0:
+                    extra_metrics["train/cum_tokens"] = cum_tok
                 if math.isfinite(global_avg_loss):
                     extra_metrics["train/loss"] = float(global_avg_loss)
                     extra_metrics["train/perplexity"] = float(math.exp(min(20.0, global_avg_loss)))

@@ -214,6 +214,10 @@ def build_metric_aggregators(
                 name=name,
                 config=config_dict or {},
             )
+            try:
+                wandb.define_metric("*", step_metric="train/cum_tokens")
+            except Exception:
+                pass
             logger.info("WandB logging enabled for central aggregator (%s/%s)", project, name)
         except Exception as exc:
             logger.warning("Failed to initialize WandB for central aggregator: %s", exc)
