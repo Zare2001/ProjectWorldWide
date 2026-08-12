@@ -112,13 +112,26 @@ class FederatedTrainer:
         original_log_validation = processor.log_validation
 
         def capturing_log_validation(loss, step, *args, **kwargs):
-            self._validation_loss = float(loss)
+            val_loss = float(loss)
+            self._validation_loss = val_loss
             # Read here because `log_validation` zeroes the counter on its way out, and
             # relative to a baseline taken in validate() because training also
             # accumulates into it between its own log intervals.
             self._validation_tokens = max(
                 0, processor.ntokens_since_last_log - self._validation_baseline
             )
+            if math.isfinite(val_loss):
+                ppl = math.exp(min(20.0, val_loss))
+                logger_inst = getattr(processor, "logger", None)
+                if logger_inst is not None:
+                    try:
+                        logger_inst.log({
+                            "eval/loss": val_loss,
+                            "eval/perplexity": ppl,
+                            "validation_metrics/perplexity": ppl,
+                        }, step)
+                    except Exception:
+                        pass
             return original_log_validation(loss, step, *args, **kwargs)
 
         processor.log_validation = capturing_log_validation
