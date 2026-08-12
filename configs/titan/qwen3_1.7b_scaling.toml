@@ -48,7 +48,7 @@ eps = 1e-8
 
 [lr_scheduler]
 warmup_steps = 500
-decay_ratio = 0.8
+decay_ratio = 0.1
 decay_type = "cosine"
 min_lr_factor = 0.1
 

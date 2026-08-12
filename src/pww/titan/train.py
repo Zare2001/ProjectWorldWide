@@ -102,6 +102,17 @@ def main(argv: list[str] | None = None) -> int:
 
     trainer = Trainer(job_config)
 
+    # Tag WandB run with the Slurm job ID (if running under Slurm).
+    slurm_job_id = os.environ.get("SLURM_JOBID", "")
+    if slurm_job_id and dist.get_rank() == 0:
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.config.update({"slurm_job_id": slurm_job_id}, allow_val_change=True)
+        except Exception:
+            pass
+
     if not flower_cfg.enable:
         logger.info("flower.enable is false -- running torchtitan's own train loop")
 

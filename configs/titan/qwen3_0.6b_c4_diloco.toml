@@ -51,7 +51,7 @@ eps = 1e-8
 # train_llm_flower.py which had no schedule at all and rebuilt AdamW from scratch
 # every phase.
 warmup_steps = 200
-decay_ratio = 0.8
+decay_ratio = 0.1
 decay_type = "cosine"
 min_lr_factor = 0.1
 
