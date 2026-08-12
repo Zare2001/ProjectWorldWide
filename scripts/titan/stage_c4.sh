@@ -77,5 +77,18 @@ for index in range(count):
 PY
 
 echo
-echo "Staged. Tokenise it with:"
-echo "  PWW_C4_DIR=${OUT_DIR} scripts/titan/tokenize_c4.sh --dataset c4_local --seq-len 2048"
+if [[ "${SPLIT}" == "validation" ]]; then
+    # Do NOT tokenise this: the validator consumes raw text through the c4_local
+    # loader, and run_train.sh selects it automatically from this conventional path.
+    if [[ "${OUT_DIR}" == "${PWW_DATA_DIR}/c4-validation" ]]; then
+        echo "Staged. run_train.sh will use it automatically (validation: c4_local)."
+    else
+        echo "Staged. run_train.sh auto-detects \$PWW_DATA_DIR/c4-validation; for this"
+        echo "location pass PWW_VAL_DATA=${OUT_DIR} at submit time instead."
+    fi
+    echo "Confirm both sites staged identical bytes:"
+    echo "  sha256sum ${OUT_DIR}/c4-validation.*.json.gz"
+else
+    echo "Staged. Tokenise it with:"
+    echo "  PWW_C4_DIR=${OUT_DIR} scripts/titan/tokenize_c4.sh --dataset c4_local --seq-len 2048"
+fi

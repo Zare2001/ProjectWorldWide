@@ -1313,6 +1313,73 @@ if HAS_FLWR:
         assert strategy.global_step == 200, f"expected max(H)=200, got {strategy.global_step}"
         assert metrics.get("global_step") == 200
 
+    @check("inline transport advances global_step even with a --state-dir attached")
+    def _():
+        """The configuration every real run uses, and the one no test covered.
+
+        `scripts/central_node/start_central_services.sh` passes --state-dir for inline
+        transport too, because durable state is what lets the aggregator restart and hold
+        membership. But `merge_round`/`global_step` read `GlobalState`'s counters, which
+        only the *blob* merge advances -- so with a state dir attached, an inline run
+        broadcast `pww_global_step = 0` on every round forever.
+
+        Downstream that is not cosmetic. `align_to_global_step` is authoritative in both
+        directions, so each site was rewound to step 0 at every outer round: the LR
+        schedule restarted its warmup H steps at a time, `trainer.step` never approached
+        `training.steps`, and the job could not reach its own stopping condition. Observed
+        on a real 1k run as an LR sawtooth of period 100 and a run that would not end.
+
+        The check that would have caught it is one argument different from the test above.
+        """
+        import tempfile
+
+        import torch
+
+        from pww.central.globalstate import GlobalState
+        from pww.central.strategy import FedMom
+
+        weights = np.full((8,), 0.5, dtype=np.float16)
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy = FedMom(
+                transport=proto.TRANSPORT_INLINE,
+                initial_parameters=ndarrays_to_parameters([weights.copy()]),
+                server_learning_rate=1.0, server_momentum=0.0,
+                # The one difference from the test above, and what production does.
+                state=GlobalState(tmp, storage_dtype=torch.float32),
+            )
+            assert strategy.global_step == 0
+            assert strategy.merge_round == 0
+
+            for expected_round, expected_step in ((1, 100), (2, 200), (3, 237)):
+                steps = 100 if expected_round < 3 else 37
+                strategy.configure_fit(
+                    expected_round, ndarrays_to_parameters([weights.copy()]),
+                    _FakeManager(2),
+                )
+                strategy.aggregate_fit(
+                    expected_round,
+                    [
+                        (None, _fit_res({proto.CLUSTER: "lumi", proto.STEPS: steps},
+                                        steps * 16_384,
+                                        arrays=[np.full((8,), 0.6, dtype=np.float16)])),
+                        (None, _fit_res({proto.CLUSTER: "snellius", proto.STEPS: steps},
+                                        steps * 8_192,
+                                        arrays=[np.full((8,), 0.4, dtype=np.float16)])),
+                    ],
+                    [],
+                )
+                assert strategy.global_step == expected_step, (
+                    f"round {expected_round}: global_step is {strategy.global_step}, "
+                    f"expected {expected_step}. A stuck 0 rewinds every site's LR "
+                    f"schedule to warmup at every round."
+                )
+                assert strategy.merge_round == expected_round, strategy.merge_round
+
+            # And it is what actually goes on the wire to the clients.
+            config = strategy._round_config(4)
+            assert config[proto.GLOBAL_STEP] == 237, config
+            assert config[proto.ROUND] == 3, config
+
     @check("uint16 (bfloat16) wire dtype is preserved across inline aggregation rounds")
     def _():
         from flwr.common import ndarrays_to_parameters

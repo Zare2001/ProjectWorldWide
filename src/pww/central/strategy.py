@@ -239,19 +239,47 @@ if HAS_FLWR:
             Deliberately not Flower's `server_round`, which advances even when every
             cluster was killed at walltime and nothing was merged. Deltas are stamped
             against this.
+
+            Transport-aware, and it has to be: see `global_step` for what reading the
+            wrong counter cost.
             """
-            return self.state.round if self.state is not None else self._inline_round
+            if self.transport == proto.TRANSPORT_BLOB:
+                return self.state.round if self.state is not None else self._inline_round
+            return self._inline_round
 
         @property
         def global_step(self) -> int:
             """Server-authoritative optimiser step counter.
 
             With per-site H (different inner_steps on each cluster), a client can no
-            longer compute ``global_step = round * H`` locally.  The server tracks the
-            largest number of steps any contributing cluster took, and
-            broadcasts this so every site's LR schedule stays aligned.
+            longer compute ``global_step = round * H`` locally. The server tracks the
+            largest number of steps any contributing cluster took, and broadcasts this so
+            every site's LR schedule stays aligned.
+
+            Which counter that is depends on the **transport**, not on whether a state
+            directory exists. `GlobalState.round`/`.global_step` are advanced only by the
+            blob merge (`globalstate.merge`); the inline merge advances
+            `_inline_round`/`_inline_global_step` and persists them in its own npz
+            checkpoint (`_checkpoint`/`load_checkpoint`).
+
+            This used to be `self.state.global_step if self.state is not None`, and
+            `start_central_services.sh` passes --state-dir for inline transport too
+            ("durable state is useful even inline" -- it is, for membership and restart).
+            So on every real inline run `state` was not None, this returned GlobalState's
+            untouched 0, and the server broadcast `pww_global_step = 0` every round.
+            Since `align_to_global_step` is authoritative in both directions, each site
+            was then rewound to step 0 at every outer round: the LR schedule restarted
+            its warmup 100 steps at a time, `trainer.step` never approached
+            `training.steps`, and the run could not terminate. Observed as an LR sawtooth
+            with period H and a job that ran past its step budget.
+
+            `_has_global` immediately below already keys off the transport for exactly
+            this reason; these two did not.
             """
-            return self.state.global_step if self.state is not None else self._inline_global_step
+            if self.transport == proto.TRANSPORT_BLOB:
+                return (self.state.global_step if self.state is not None
+                        else self._inline_global_step)
+            return self._inline_global_step
 
         @property
         def _has_global(self) -> bool:
