@@ -1,9 +1,43 @@
-# Qwen3 0.6B on C4, DARL-leased, Snellius single-node central comparison run.
+# Qwen3 0.6B on C4, DARL-leased, single-node central baseline for the DiLoCo run.
 #
-# Standalone comparison baseline for the cross-site DiLoCo run.
-# Uses the exact same DARL dataset sequence (space_seed = 42, block_size = 1024)
-# via dataset = "pww_tokens", but with flower.enable = false so training runs as a
-# continuous single-node job without outer aggregation rounds.
+# Every hyperparameter below is deliberately identical to
+# configs/titan/qwen3_0.6b_c4_diloco.toml -- optimiser, LR schedule, local_batch_size,
+# seq_len, steps, max_norm, dtype, activation checkpointing, checkpoint interval,
+# validation cadence, and the DARL block space (space_seed = 42, block_size = 1024).
+# The single difference is flower.enable = false, so training runs as one continuous
+# job with no outer aggregation. If you change a number here, change it there too.
+#
+# WHAT THIS BASELINE IS, AND IS NOT
+# ---------------------------------
+# `steps` matches the DiLoCo run, so this is a **step-matched** baseline. It is not
+# token-matched, and it cannot be by default, because the federation trains every site
+# concurrently. Per global optimiser step:
+#
+#     tokens/step = local_batch_size x seq_len x (data-parallel ranks)
+#
+#     this baseline on Snellius (4 H100s)      8 x 2048 x  4 =  65,536
+#     this baseline on LUMI     (8 GCDs)       8 x 2048 x  8 = 131,072
+#     the DiLoCo run, both sites               8 x 2048 x 12 = 196,608
+#
+# So at 20,000 steps the DiLoCo run has seen ~3.9B tokens against this baseline's ~1.3B
+# on Snellius or ~2.6B on LUMI. Read that on the `train/cum_tokens` axis in WandB, which
+# is bound as the default x-axis precisely so the difference cannot be missed, and treat
+# the step axis as a statement about optimisation rather than about work done.
+#
+# For the compute-matched comparison -- same steps AND same tokens, which is the
+# baseline DiLoCo's own paper reports against -- raise the baseline's global batch to the
+# federation's with gradient accumulation. It needs no config change:
+#
+#     PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
+#         scripts/snellius/job_titan_central.sh          # 3 x 65,536 = 196,608
+#
+# Snellius is the site to run it on: 196,608 / 65,536 is exactly 3, while LUMI's
+# 196,608 / 131,072 = 1.5 is not an integer multiple. Recompute the factor if either
+# site's rank count changes -- run_train.sh prints the global batch it derived.
+#
+# Both comparisons are worth having and they answer different questions. The
+# step-matched one asks what a single replica achieves in the same number of steps; the
+# compute-matched one asks what federating cost for the same amount of work.
 
 [job]
 dump_folder = "./outputs/qwen3-0.6b-c4-central"
@@ -56,7 +90,13 @@ mode = "selective"
 
 [checkpoint]
 enable = true
-interval = 500
+# 100, matching the DiLoCo run's interval rather than the 500 this used to carry. Two
+# reasons, and neither is tidiness. Checkpointing is not free, so a baseline that writes
+# a fifth as often reports a throughput the DiLoCo run cannot reach for reasons that have
+# nothing to do with federating. And under the default 'checkpoint' commit policy a DARL
+# lease is only committed once the work is durable, so the interval is also how often
+# this run tells the coordinator what it consumed.
+interval = 100
 last_save_model_only = false
 keep_latest_k = 2
 
@@ -65,9 +105,22 @@ train_timeout_seconds = 1800
 
 [validation]
 enable = true
+# The bundled fixture, which OVERLAPS the training files (it is the head of
+# en/c4-train.00000) -- kept only so the config runs standalone. run_train.sh switches
+# to the real held-out split (c4_local) automatically when $PWW_DATA_DIR/c4-validation
+# is staged; see its validation block. The same staged file(s) must be used for this
+# baseline and the DiLoCo run, or the eval curves score different text.
 dataset = "c4_test"
 dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
-freq = 500
+# 100, so the held-out curve has the same resolution as the DiLoCo run's. There, the
+# central node evaluates once per Flower round -- every darl.inner_steps = 100 steps --
+# and it is not a configurable frequency. At the 500 this used to carry, the two eval
+# series had one point of the baseline for every five of the DiLoCo run, which makes the
+# comparison chart read as noise where it is really sampling.
+freq = 100
+# Overridden by scripts/titan/run_train.sh, which computes it from PWW_VAL_WINDOWS so
+# the *window total* is identical at every site regardless of rank count. See the same
+# block in the diloco config for why a fixed step count is not comparable.
 steps = 20
 
 [fault_tolerance]
@@ -77,13 +130,20 @@ enable = false
 # url/site are supplied by run_train.sh (or job_titan_central.sh).
 url = ""
 site = ""
+# No outer step happens in this run, so this is *only* the lease size: DARL asks for
+# enough blocks to cover inner_steps optimiser steps at this batch geometry. Kept at 100
+# to match the DiLoCo run so both request leases of the same shape and put the same load
+# on the coordinator. It has no effect on the optimisation.
 inner_steps = 100
 # 1024 windows = ~2M tokens per leasable block at seq_len 2048.
 block_size = 1024
 blocks_per_phase = 0
 epochs = 1
-# Must match the distributed run's space_seed so the central run sees the exact
-# same block-permuted sequence of training data.
+# Must match the distributed run's space_seed so the central run draws from the exact
+# same block-permuted index space. Same seed and same window count means the same
+# permutation, so the two runs consume the same corpus in the same pseudo-random order --
+# what differs is that the DiLoCo run splits that order across two sites, which is the
+# thing being measured.
 space_seed = 42
 
 [flower]
@@ -91,4 +151,6 @@ space_seed = 42
 enable = false
 server_address = ""
 transport = "inline"
-wire_dtype = "float16"
+# Inert here (nothing crosses a wire), and kept equal to the DiLoCo config so the two
+# files diff to exactly one line.
+wire_dtype = "bfloat16"

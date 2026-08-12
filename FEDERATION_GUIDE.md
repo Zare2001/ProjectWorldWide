@@ -584,20 +584,41 @@ round 138 merged from 2 cluster(s) in 41.3s (peak ~2.1 GiB, lr=0.7, momentum=0.9
 
 ### What the held-out number does and does not measure
 
-`[validation]` points at torchtitan's bundled `c4_test` fixture — 2,000 C4 documents, ~543
-windows at `seq_len 2048` — not at a held-out slice of the run's own corpus. Two
-consequences worth keeping straight:
+`run_train.sh` picks the validation data, in this order: a staged copy of **C4's real
+validation split** at `$PWW_DATA_DIR/c4-validation` (used automatically via the offline
+`c4_local` loader — stage it once per site with
+`scripts/titan/stage_c4.sh --split validation --files 1 --out $PWW_DATA_DIR/c4-validation`),
+falling back to torchtitan's bundled `c4_test` fixture with a warning. Three things worth
+keeping straight:
 
+- **The fixture is not held out, which is why the staged split exists.** An earlier
+  version of this section called the fixture's disjointness from the training slice
+  "plausible but unverified"; it has since been verified **false** — the fixture is the
+  head of `en/c4-train.00000`, the first file `tokenize_c4.sh` consumes, so its windows
+  are training windows. And the bias is not even uniform: the chance an eval window has
+  been trained on scales with how much of the corpus a run consumes, so a fixture eval
+  favours the DiLoCo arm (~70% of the corpus at 20k steps) over the step-matched baseline
+  (~23%). C4's validation split is disjoint from train by construction. A run that fell
+  back to the fixture says so in its log; do not read a central-vs-DiLoCo `eval/loss`
+  comparison off such a run.
 - **It is comparable across sites, and that is its main job.** Every cluster evaluates the
   *same* global weights, so a disagreement is a bug rather than variance. `run_train.sh`
   fixes the window *total* (`PWW_VAL_WINDOWS`, default 512) rather than `validation.steps`,
   because windows scored = `steps x local_batch_size x nproc` — a fixed step count makes an
-  8-rank site score twice as many windows as a 4-rank one, and against a 543-window fixture
-  that is 1.2 vs 2.4 passes and two numbers that cannot be compared.
-- **It is not a publishable C4 perplexity.** 512 windows is ~1.05M tokens, so a few percent
-  of round-to-round wobble is sampling noise, and the fixture's disjointness from any
-  particular `--max-files` slice of C4 is plausible but unverified. Judge progress from the
-  training loss; use the held-out figure for the cross-site comparison.
+  8-rank site score twice as many windows as a 4-rank one. The validation iterator is
+  stateful, so successive evals walk forward through the split in lockstep at every site —
+  same windows, same union, comparable number — **provided every site staged the same
+  file(s)**; `sha256sum` them. One honest caveat: a site that restarts mid-run rewinds its
+  own validation stream to the beginning while the others continue, so its next few evals
+  score different windows than theirs. Different 512-window slices of C4 differ by a few
+  hundredths of a nat, far under the 1-nat spread warning, so the check stays meaningful —
+  but a small spread after a requeue is expected, not a bug.
+- **It is still not a publishable C4 perplexity.** 512 windows is ~1.05M tokens per eval,
+  so a few percent of round-to-round wobble is sampling noise (raise `PWW_VAL_WINDOWS` to
+  2048 if the curve matters; ~1-2% training-time overhead at freq 100), and perplexity
+  under a 131k tokenizer is not on the same scale as any published number under a
+  different one. Judge progress from the training loss; use the held-out figure for the
+  cross-site check and the central-vs-DiLoCo comparison.
 
 A **training** perplexity is also reported now, next to the training loss. That one is exact
 rather than approximate: `exp()` of a token-weighted mean loss is the perplexity of the union
@@ -626,8 +647,12 @@ logging. Both leave the process here, and `num_examples` **is the FedMom merge w
 so a per-rank count would silently collapse token weighting back into uniform `1/k`
 averaging whenever two sites share a per-rank geometry. LUMI's 8 GCDs and Snellius's 4
 report the same rank-0 count at the same `local_batch_size` and `seq_len`, while LUMI
-trained twice the tokens. `FederatedTrainer._cluster_total` all-reduces them over the dp
-mesh once per phase.
+trained twice the tokens. `titan/wandb_metrics.py::cluster_sum` all-reduces them over the dp
+mesh once per phase, and lives there rather than in the trainer because the WandB token axis
+needs the same number — two copies would be two chances for the merge weight and the chart
+to disagree. On the metrics path it is only a fallback: torchtitan's own `train_step` already
+`dist_sum`s the token count into `extra_metrics["n_tokens_seen"]`, which is what the axis
+reads.
 
 DARL coverage:
 
@@ -638,6 +663,64 @@ curl -sS -H "X-DARL-Token: $(cat runs/darl/token)" \
 
 `unassigned` + `leased` + `committed` + `quarantined` must equal the block count at
 all times; the coordinator asserts this internally.
+
+### WandB: what is logged, and which axis to read
+
+Three processes log to one project and are meant to be read on one chart:
+`central-<site>` (the single-node baseline), `diloco-<site>` (one participant), and
+`central-aggregator` (the federated run as a whole). The conventions live in
+`src/pww/wandb_utils.py` so all three cannot drift apart.
+
+**Two axes, and the default is tokens.**
+
+| axis | meaning |
+|---|---|
+| `train/cum_tokens` | cumulative tokens trained on. **The default x-axis.** Per *run*: a site's own tokens on `diloco-<site>`, the federation total on `central-aggregator` |
+| `train/step` | global optimiser steps |
+
+Tokens is the default because equal steps is not equal work: a two-site federation at 8 + 4
+ranks trains three times the tokens per step a 4-rank baseline does, so a per-step chart
+alone makes the federated run look better than it is. Read tokens for the honest comparison
+and steps for the optimisation behaviour.
+
+**There is no local-versus-global step ambiguity, by construction.** A site's `H` inner
+steps are a *slice* of the global count, never a separate clock. Every site is realigned to
+the server-authoritative `pww_global_step` before each phase
+(`FederatedTrainer.align_to_global_step`), and that counter advances by `max(steps)` over the
+contributing clusters — so step 1500 means 1500 optimiser steps in every one of the three
+runs, with the DiLoCo one having crossed 15 outer rounds to get there. `darl.inner_steps` is
+not an axis anywhere, and the aggregator now accumulates the same counter rather than
+reconstructing it as `merge_round × H`.
+
+That realignment is authoritative in *both* directions, which is where WandB needed a guard.
+When a contribution is dropped — non-finite weights, a delta refused by the generation
+check, a round with no quorum — the global step does not advance while the site's own counter
+already did, so the next round pulls it back and it re-logs steps it has already logged.
+WandB **silently discards** a log call whose step is below the current one, so a repeated
+round used to appear as a hole in every chart for that site.
+`wandb_utils.MonotonicStep` advances the index artificially instead, and the true position
+travels as `train/step`: nothing is dropped, and both axes still plot correctly. A
+`wandb step went from N to M` warning in a site log is that guard firing, and it means a
+round was not merged — look for the reason, not for the chart.
+
+**Keys.** The `train/*` and `eval/*` sets are identical between a baseline and a DiLoCo run,
+because one installer produces both (`pww/titan/wandb_metrics.py::install_metric_hooks`):
+
+| key | on |
+|---|---|
+| `train/loss`, `train/perplexity` | all three. On the aggregator, token-weighted across participants |
+| `train/cum_tokens`, `train/step`, `train/lr`, `train/grad_norm` | all three |
+| `eval/loss`, `eval/perplexity` | all three. Pooled through the loss on the aggregator — see above |
+| `train/drift_ratio_avg`, `train/drift_ratio_max` | aggregator only. Read the **max** |
+| `train/global_batch_size` (sequences), `train/global_batch_tokens` | aggregator. Per *step*, from the `seq_len` the clusters report |
+| `train/round_seconds`, `throughput/tokens_per_s_combined` | aggregator |
+| `cluster/<id>/{tokens_per_s,tps_per_rank,dp_degree,mfu_pct,tflops_per_rank,peak_memory_gib,power_watts,grad_norm,drift_ratio}` | aggregator, per participant. Never averaged across sites — an MFU against an MI250X GCD and against an H100 are ratios to different peak FLOPs |
+| `loss_metrics/*`, `throughput(tps)`, `mfu(%)`, `memory/*` | torchtitan's own, on the site runs only |
+
+**Compare a baseline against `central-aggregator`, not against a `diloco-<site>` run.** A
+site reports only its own share of the tokens, so overlaying `diloco-snellius` on
+`central-snellius` by tokens makes the federated run look like it reached a loss on a third
+of the data it actually used.
 
 ---
 

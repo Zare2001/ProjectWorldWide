@@ -1409,6 +1409,136 @@ def _():
     assert torch.equal(state["w"], decoded["w"])
 
 
+@check("the aggregator's wandb step accumulates max(H), matching the strategy's counter")
+def _():
+    """The metrics callback and the strategy must agree on where the run is.
+
+    These are two separate counters over the same rounds: `PWWFedMom` accumulates
+    `max(steps)` and broadcasts it as `pww_global_step`, and the metrics callback needs the
+    same number so its points land on the same x-axis as the sites' own charts.
+
+    The callback used to *reconstruct* it instead -- `merge_round * steps_this_round` for
+    training, `merge_round * 100` for evaluation. Both are right only while every round
+    takes the same number of steps and that number is 100. A run whose last round ends
+    early on an exhausted dataloader breaks the first; any `darl.inner_steps` other than
+    100 breaks the second; and the two disagree with each other, so one round's training
+    and held-out points could land on different x values.
+    """
+    from pww.central.server import build_metric_aggregators
+
+    aggregate_fit, _eval = build_metric_aggregators()
+
+    def round_of(steps):
+        """One round, both sites, at LUMI's 8 ranks and Snellius's 4."""
+        return [
+            (steps * 8 * ranks * 2048, {
+                proto.LOSS: 5.0, proto.CLUSTER: cid, proto.STEPS: steps,
+                proto.SEQ_LEN: 2048, proto.DP_DEGREE: ranks,
+            })
+            for cid, ranks in (("lumi", 8), ("snellius", 4))
+        ]
+
+    # Two full rounds, then a short final one -- an exhausted dataloader, or walltime.
+    steps_taken = (100, 100, 37)
+    for i, steps in enumerate(steps_taken, 1):
+        out = aggregate_fit(round_of(steps))
+        assert out["global_step"] == sum(steps_taken[:i]), (i, out)
+
+    assert out["global_step"] == 237, out
+    # What the two old formulas would have said for this run, kept as the regression:
+    # neither is 237, and they do not even agree with each other.
+    assert 3 * 37 == 111 and 3 * 100 == 300
+
+    # A round with per-site H takes max(), the same increment the strategy applies.
+    out = aggregate_fit([
+        (200 * 8 * 8 * 2048, {proto.LOSS: 5.0, proto.CLUSTER: "lumi", proto.STEPS: 200,
+                              proto.SEQ_LEN: 2048, proto.DP_DEGREE: 8}),
+        (100 * 8 * 4 * 2048, {proto.LOSS: 5.0, proto.CLUSTER: "snellius", proto.STEPS: 100,
+                              proto.SEQ_LEN: 2048, proto.DP_DEGREE: 4}),
+    ])
+    assert out["global_step"] == 237 + 200, out
+
+    # A round that merged nothing must not advance it.
+    assert aggregate_fit([(0, {proto.LOSS: 0.0})]) == {}
+    out = aggregate_fit(round_of(1))
+    assert out["global_step"] == 237 + 200 + 1, out
+
+
+@check("a batch is per step, and its seq_len comes from the clusters not a literal")
+def _():
+    """`total // 2048` is the round's window count, not a batch.
+
+    At H=100 with 12 ranks at local_batch_size 8 the global batch is 96 sequences, and that
+    expression published 9,600 -- a hundred times too large, and simply wrong for any
+    seq_len that is not 2048, because the 2048 was a literal. Both fixes are needed: divide
+    by the steps as well, and take the sequence length from the clusters, which know it.
+
+    Asserted through a stand-in wandb run, because the numbers only exist in the logging
+    branch.
+    """
+    from pww.central.server import build_metric_aggregators
+
+    captured: dict = {}
+
+    class _Run:
+        def log(self, metrics, step=None):
+            captured.clear()
+            captured.update(metrics)
+            captured["__step"] = step
+
+    aggregate_fit, _eval = build_metric_aggregators()
+    # The wandb run lives in the closure and there is no wandb here, so reach it the way
+    # the module does: rebind the free variable. Fragile on purpose -- if the closure shape
+    # changes this check fails loudly rather than silently testing nothing.
+    cells = dict(zip(aggregate_fit.__code__.co_freevars, aggregate_fit.__closure__))
+    cells["wandb_run"].cell_contents = _Run()
+
+    steps, seq_len, local_batch = 100, 4096, 8
+    per_site = [("lumi", 8), ("snellius", 4)]
+    ranks_total = sum(r for _, r in per_site)
+    aggregate_fit([
+        (steps * local_batch * ranks * seq_len, {
+            proto.LOSS: 5.0, proto.CLUSTER: cid, proto.STEPS: steps,
+            proto.SEQ_LEN: seq_len, proto.DP_DEGREE: ranks,
+        })
+        for cid, ranks in per_site
+    ])
+
+    assert captured["train/global_batch_size"] == 96, captured["train/global_batch_size"]
+    assert captured["train/global_batch_tokens"] == 96 * seq_len, captured
+    assert captured["train/steps_this_round"] == steps
+    assert captured["train/step"] == captured["__step"] == steps
+    # Per cluster, from its own reported rank count rather than from its name.
+    assert captured["cluster/lumi/batch_size"] == 8 * 8
+    assert captured["cluster/snellius/batch_size"] == 8 * 4
+    assert captured["cluster/lumi/dp_degree"] == 8
+    # The old literal, for the record: 19,200 instead of 96.
+    total = steps * local_batch * ranks_total * seq_len
+    assert total // 2048 == 19_200
+
+
+@check("a rewound wandb step is bumped, not dropped, and a repeat is left alone")
+def _():
+    """`wandb.log(step=N)` silently discards the call when N is below the current step.
+
+    A cluster is realigned to the run's global step in *both* directions, so a round that
+    was not merged -- dropped contribution, no quorum -- pulls a site back to a step it has
+    already logged, and every chart for that site gets a hole where the repeat should be.
+
+    Equal steps must pass through untouched: two log calls at one step is the ordinary
+    case (the aggregator's training and held-out metrics for a round both belong at that
+    round's step) and wandb merges them.
+    """
+    from pww.wandb_utils import MonotonicStep
+
+    step = MonotonicStep()
+    assert [step(s) for s in (100, 100, 200)] == [100, 100, 200], "repeats pass through"
+    # Rewound to 100 after 200: bumped to 201, 202, ... so nothing is lost.
+    assert [step(s) for s in (100, 150, 200)] == [201, 202, 203]
+    # And it resumes tracking the truth as soon as the run overtakes the bumps.
+    assert step(400) == 400
+
+
 def main() -> int:
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     if not HAS_FLWR:

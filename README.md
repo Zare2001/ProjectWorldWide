@@ -210,6 +210,9 @@ scripts/
   download_data.sh        pre-fetch datasets -- LOGIN NODE ONLY
   task_wrapper.sh         per-rank entrypoint, site-agnostic
   darl_coordinator.sh     start/stop the lease coordinator -- LOGIN NODE ONLY
+  reset_run.sh            clear a run's site state so the next submission starts
+                          from step 0 -- checkpoints, blob staging, tb, and the
+                          baseline jobs' throwaway coordinator dirs. --dry-run first
   lumi/                   job_smoke, job_cifar_debug, job_cifar_1node,
                           job_cifar_multinode, job_cifar_diloco
   snellius/               setup_venv.sh (run first), job_smoke, job_cifar_debug,
@@ -253,6 +256,9 @@ containers/titan-lumi.def  ROCm image for it (LUMI's own is on torch 2.7.1)
 scripts/titan/           tokenizer download, C4 staging/tokenising, launcher
 src/pww/
   fedproto.py            the config/metric keys the two sides agree on
+  wandb_utils.py         the axis conventions all three run types share, and the
+                         guard against WandB discarding a rewound step. No
+                         torchtitan, so the central VM can import it
   tensorio.py            tensor file with a streaming writer, so a model can be
                          built or merged without ever holding it whole
   delta.py               out-of-band transport: streaming HTTP + per-tensor
@@ -271,6 +277,9 @@ src/pww/
     trainer.py           torchtitan Trainer, one inner phase at a time
     params.py            whole-state gather/scatter and the inline wire codec
     flower_client.py     the cross-site outer round, over either transport
+    wandb_metrics.py     the one metrics hook BOTH drivers install, so a baseline
+                         and a DiLoCo run cannot compute train/loss, the token
+                         axis or the held-out loss differently
     train.py             entrypoint (torchrun -m pww.titan.train)
 tests/
   test_titan.py          shards, DARL leasing, wire codec
@@ -1135,6 +1144,31 @@ Inside each HPC cluster, the inner training loop is managed by HuggingFace `Trai
   sbatch scripts/lumi/job_flower_diloco_llm.sh --config configs/llm_7b_diloco.yaml
   ```
 
+#### Step 3: The baseline it is measured against
+
+Needs no central VM — the job brings up its own throwaway DARL coordinator on the same
+`space_seed = 42` block space:
+
+```bash
+sbatch scripts/snellius/job_titan_central.sh                    # step-matched
+PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
+  scripts/snellius/job_titan_central.sh                         # compute-matched
+```
+
+#### Starting over
+
+Both the DiLoCo job and the baseline resume from their config's `dump_folder`; neither is
+stateless, and the baseline is the one that looks it. Clear both halves, or neither:
+
+```bash
+./scripts/reset_run.sh --dry-run              # what would go, and how big it is
+./scripts/reset_run.sh                        # site half: checkpoints, staging, tb
+./scripts/reset_run.sh --central              # + lease table and global model (on the VM)
+
+# and at submit time, so nothing written in between is picked up
+PWW_FRESH_RUN=1 sbatch --export=ALL,PWW_FRESH_RUN scripts/snellius/job_titan_central.sh
+```
+
 ---
 
 ### Monitoring & Evaluation Metrics
@@ -1170,9 +1204,57 @@ Log outputs report:
   than averaged. One poisoned contribution used to propagate into the global model and end
   the run while the log still said `merge complete` every round.
 * **The held-out figure is comparable across sites, not publishable.** It is measured on a
-  small bundled C4 fixture, with the window *total* fixed so rank count cannot change what
-  each site scores. Judge progress from the training loss; use the held-out number to
-  compare sites.
+  staged slice of C4's real validation split when one is present (`run_train.sh` selects it
+  automatically; see RUNBOOK Part 1 step 3), with the window *total* fixed so rank count
+  cannot change what each site scores. Without the staged split it falls back — with a
+  warning — to torchtitan's bundled fixture, which **overlaps the C4 training files** and
+  biases a central-vs-DiLoCo comparison toward whichever arm trained more of the corpus.
+  Judge progress from the training loss; use the held-out number to compare sites and arms.
+
+#### The central baseline, and reading a chart with both runs on it
+
+`scripts/{lumi,snellius}/job_titan_central.sh` runs the same config with the outer step
+switched off (`flower.enable = false`), on a throwaway DARL coordinator seeded from the same
+`space_seed = 42` block space — so the baseline draws from the identical permuted index space
+the federated run does. `configs/titan/qwen3_0.6b_c4_central.toml` is its DiLoCo counterpart
+with one line changed, and the two are meant to stay diffable.
+
+**Equal steps is not equal work, and this is the thing to get right.** Both configs set
+`steps = 20000`, so the baseline is *step-matched*. It is not token-matched, because the
+federation trains every site concurrently — per global optimiser step,
+`local_batch_size × seq_len × ranks`:
+
+| | ranks | tokens/step | at 20,000 steps |
+|---|---|---|---|
+| baseline, Snellius | 4 | 65,536 | ~1.31 B |
+| baseline, LUMI | 8 | 131,072 | ~2.62 B |
+| **DiLoCo, both sites** | **12** | **196,608** | **~3.93 B** |
+
+For the *compute-matched* baseline — same steps and same tokens, which is what DiLoCo's own
+paper reports against — raise the baseline's global batch with gradient accumulation:
+`PWW_GRAD_ACCUM=3` on Snellius, where `196,608 / 65,536` is exactly 3. Both comparisons are
+worth having and they answer different questions.
+
+**WandB.** Off unless `PWW_WANDB=1`, `ENABLE_WANDB=1` or `WANDB_PROJECT` is set. Three runs
+land in one project: `central-<site>`, `diloco-<site>` and `central-aggregator`. The default
+x-axis is `train/cum_tokens` rather than the step, for the reason in the table above, and
+`train/step` is logged alongside it. `train/*` and `eval/*` are produced by one shared
+installer so a baseline and a DiLoCo run cannot compute them differently.
+
+Two things that are easy to get wrong when reading these charts:
+
+* **Compare a baseline against `central-aggregator`, not against a `diloco-<site>` run.** The
+  aggregator's loss is token-weighted across every participant and its `train/cum_tokens` is
+  the federation total; a site reports only its own share, so overlaying `diloco-snellius` on
+  `central-snellius` by tokens makes the federated run look like it reached a loss on a third
+  of the data it used.
+* **There is no local-versus-global step ambiguity.** A site's `H` inner steps are a slice of
+  the global count, not a separate clock: every site is realigned to the server-authoritative
+  `pww_global_step` before each phase, and step 1500 means 1500 optimiser steps in all three
+  runs. A `wandb step went from N to M` warning means a round was **not merged** and that
+  site was pulled back — the guard keeps the data rather than letting WandB discard it.
+
+Full key reference and axis semantics: [FEDERATION_GUIDE.md](FEDERATION_GUIDE.md) §5.
 
 Three pieces of the metric arithmetic are non-obvious enough to be worth knowing, and
 each is pinned by a test because all three produce plausible numbers when wrong:

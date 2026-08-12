@@ -119,10 +119,47 @@ export PWW_CONTAINER="$PWW_SCRATCH/containers/pww-titan.sif"   # LUMI only
 ./scripts/titan/tokenize_c4.sh --dataset c4_test --seq-len 2048        # fixture, seconds
 ./scripts/titan/tokenize_c4.sh --dataset c4 --seq-len 2048 --max-files 32   # real, ~5B tokens
 
-# optional: keep the raw text so re-tokenising does not re-download
+# 3. The held-out validation split. One small file, seconds, NOT optional for a real run.
+./scripts/titan/stage_c4.sh --split validation --files 1 --out "$PWW_DATA_DIR/c4-validation"
+
+# optional: keep the raw training text so re-tokenising does not re-download
 ./scripts/titan/stage_c4.sh --files 32
 ./scripts/titan/tokenize_c4.sh --dataset c4_local --seq-len 2048
 ```
+
+**Why step 3 exists:** the bundled `c4_test` fixture the configs default to is **not held
+out** — it is the head of `en/c4-train.00000`, the first file step 2 tokenises, so its
+windows are also training windows. Worse than a uniformly optimistic eval: the chance an
+eval window was trained on grows with how much of the corpus a run consumes, so a fixture
+eval favours the DiLoCo arm (which consumes ~70% of the corpus at 20k steps) over the
+step-matched baseline (~23%). C4's validation split is disjoint from train by
+construction. Once `$PWW_DATA_DIR/c4-validation` exists, `run_train.sh` uses it
+automatically (`validation  : c4_local at ...` in the job log); with nothing staged it
+falls back to the fixture and prints a warning.
+
+**Both sites must stage the same file.** The eval walks the same window sequence in
+lockstep at every site — that is what makes the cross-site spread check meaningful — and
+that requires identical input bytes. `--files 1` gives file `00000-of-00008` everywhere;
+confirm with:
+
+```bash
+sha256sum "$PWW_DATA_DIR"/c4-validation/c4-validation.00000-of-00008.json.gz   # match across sites
+```
+
+**Once, not per run.** It is a file on scratch: every subsequent run — the 1k rehearsal,
+the 20k run, anything after — picks it up automatically. Stage it **before the 1k pair**,
+not just before the 20k run: the rehearsal exists to exercise the exact configuration the
+real run will use, and gate check 3 ([Part 3b](#gate-the-1k-pair-must-pass-before-the-20k-submission))
+compares held-out losses that only mean something if the 1k pair evaluated on this split.
+Staging it only for the 20k run means the `c4_local` path runs for the first time in hour
+1 of a 72-hour job — the exact kind of gap the rehearsal is meant to close.
+
+**Snellius purge caveat.** `/scratch-shared` deletes files after ~14 days of inactivity.
+A running job reads the file every eval, which keeps it alive; a long gap between runs can
+silently remove it, and the next job then falls back to the fixture (with a warning in its
+log, but a warning nobody reads is a fixture eval nobody meant to run). The stage command
+is idempotent and takes seconds — re-run it whenever the runs have been idle for a while,
+same as the tokenised corpus itself.
 
 **Write down two numbers the last command prints.** Both are needed later and a mismatch
 is a startup failure, not a silent problem:
@@ -336,6 +373,54 @@ three are not:
 `checkpoint.interval` equals `darl.inner_steps`, so a checkpoint is written every round — a
 job that failed after one round has already left one behind.
 
+**The central baseline resumes exactly the same way**, and this is the easy one to forget.
+`scripts/{lumi,snellius}/job_titan_central.sh` has no Flower server and spawns a throwaway
+coordinator that is always `--fresh`, which makes it *look* stateless. It is not:
+torchtitan's checkpointer does not know or care whether Flower is involved, so
+`configs/titan/qwen3_0.6b_c4_central*.toml` resume from `./outputs/qwen3-0.6b-c4-central*`
+like anything else. A baseline resubmitted without `PWW_FRESH_RUN=1` continues the previous
+one at its old LR-schedule position while reading a block space that just went back to
+epoch 0 — a plausible curve of a run that is neither the old one nor a new one.
+
+```bash
+PWW_FRESH_RUN=1 sbatch --export=ALL,PWW_FRESH_RUN scripts/snellius/job_titan_central.sh
+```
+
+### `scripts/reset_run.sh` — clearing the site half up front
+
+`PWW_FRESH_RUN=1` renames one generation aside (`checkpoint.superseded`) so a mistaken
+reset is recoverable. When the intent is to actually reclaim the space, or to see what is
+there before deciding, use the front end:
+
+```bash
+./scripts/reset_run.sh --dry-run     # list every path and its size, delete nothing
+./scripts/reset_run.sh               # confirm, then delete
+./scripts/reset_run.sh --yes         # no prompt
+./scripts/reset_run.sh --config configs/titan/qwen3_0.6b_c4_diloco_1k.toml
+./scripts/reset_run.sh --central     # ALSO the lease table + global model (on the VM)
+```
+
+With no `--config` it covers **every** shipped titan config, central and DiLoCo alike —
+resetting one side of a comparison and not the other is its own kind of wrong answer. What
+it clears, per config's `dump_folder`:
+
+| | |
+|---|---|
+| `checkpoint`, `checkpoint.superseded` | model, optimiser moments, LR position, dataloader state |
+| `blob-staging` | one full model per staged blob; harmless to correctness, expensive in quota |
+| `tb` | tensorboard event files, one directory per launch |
+| `outputs/darl_local_central_*` | throwaway coordinator state dirs, one per baseline job |
+
+It deliberately does **not** touch the tokenised corpus (resetting it means re-tokenising
+C4), `logs/`, or `wandb/` — a finished run's record is the only copy of it. Pass
+`PWW_FRESH_RUN=1` at submit time as well, so a checkpoint written between the reset and the
+job starting cannot be picked up, and give the new run a new `WANDB_RUN_NAME` or it overlays
+the old one under the same name.
+
+Since this reset, the baseline job scripts also delete their own
+`outputs/darl_local_central_<jobid>` on exit unless the coordinator log mentions an error,
+so they stop accumulating one directory per run.
+
 ### It never decides this for you
 
 Nothing infers that a run is dead, and nothing should — resume is the default and is always
@@ -485,6 +570,176 @@ destroys progress. Accumulation fills the same time at the same drift. Full reas
 
 Sites may be queued for hours; that is fine and needs no coordination. The server holds
 the run and merges whoever is present.
+
+---
+
+## Part 3b — the central baseline, and making it a fair one
+
+The baseline is the same config with the outer step switched off. It needs no central VM:
+the job spawns its own throwaway DARL coordinator on `127.0.0.1`, seeded from the corpus
+manifest with `space_seed = 42`, so it draws from the identical block-permuted index space
+the DiLoCo run does.
+
+```bash
+# Snellius, 4 H100s
+sbatch scripts/snellius/job_titan_central.sh
+# LUMI, 8 GCDs
+sbatch -A "$PWW_ACCOUNT" scripts/lumi/job_titan_central.sh
+# the 1k short run, for validating the pair inside one queue slot
+CONFIG=configs/titan/qwen3_0.6b_c4_central_1k.toml sbatch scripts/snellius/job_titan_central.sh
+```
+
+It deliberately does **not** lease from the shared coordinator. If it did, it would compete
+with a live DiLoCo run for blocks: each would train on part of the corpus and neither would
+be the run it claims to be.
+
+`configs/titan/qwen3_0.6b_c4_central.toml` is `qwen3_0.6b_c4_diloco.toml` with one line
+changed (`flower.enable = false`) plus `validation.freq = 100`, which exists because
+`validation.freq` is *ignored* on the DiLoCo path — the central node evaluates once per
+Flower round there, i.e. every `darl.inner_steps` steps, and 100 reproduces that cadence.
+Diff the two before trusting any chart with both on it:
+
+```bash
+diff <(grep -vE '^\s*#|^\s*$' configs/titan/qwen3_0.6b_c4_central.toml) \
+     <(grep -vE '^\s*#|^\s*$' configs/titan/qwen3_0.6b_c4_diloco.toml)
+```
+
+### Equal steps is not equal work
+
+`steps = 20000` in both, so the baseline is **step-matched**. It is not token-matched, and
+by default it cannot be, because the federation trains every site at once. Per global
+optimiser step, `local_batch_size × seq_len × data-parallel ranks`:
+
+| | ranks | tokens/step | at 20,000 steps |
+|---|---|---|---|
+| baseline, Snellius | 4 | 65,536 | ~1.31 B |
+| baseline, LUMI | 8 | 131,072 | ~2.62 B |
+| **DiLoCo, both sites** | **12** | **196,608** | **~3.93 B** |
+
+So the two baselines are not even the same baseline as each other, and the federated run
+has seen three times the Snellius baseline's tokens at the same step number. This is why
+WandB's default x-axis here is `train/cum_tokens` and not the step.
+
+For the **compute-matched** comparison — same steps *and* same tokens, which is the baseline
+DiLoCo's own paper reports against — raise the baseline's global batch to the federation's
+with gradient accumulation. No config change:
+
+```bash
+PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
+  scripts/snellius/job_titan_central.sh          # 3 × 65,536 = 196,608
+```
+
+Snellius is the site for it: `196,608 / 65,536` is exactly 3, while LUMI's
+`196,608 / 131,072 = 1.5` is not an integer multiple. `run_train.sh` prints the global batch
+it derived — check that line rather than assuming the factor, and recompute it if either
+site's rank count changes.
+
+Both comparisons are worth having. Step-matched asks what one replica achieves in the same
+number of steps; compute-matched asks what federating cost for the same amount of work.
+
+### Turning WandB on
+
+Off unless asked for, at every site and on the central VM. Any of `PWW_WANDB=1`,
+`ENABLE_WANDB=1`, or simply setting `WANDB_PROJECT` switches it on:
+
+```bash
+# central VM -- start this BEFORE the sites so round 1 is captured
+ENABLE_WANDB=1 WANDB_PROJECT=pww-diloco-1k \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+  ./scripts/central_node/start_central_services.sh
+
+# each site
+PWW_WANDB=1 WANDB_PROJECT=pww-diloco-1k WANDB_API_KEY="$WANDB_API_KEY" \
+DARL_TOKEN="$DARL_TOKEN" \
+  sbatch --export=ALL,PWW_WANDB,WANDB_PROJECT,WANDB_API_KEY,DARL_TOKEN \
+    scripts/snellius/job_titan_diloco.sh
+```
+
+Run names are derived so a chart is readable without cross-referencing run ids:
+
+| run | what it is |
+|---|---|
+| `central-<site>` | the single-node baseline |
+| `diloco-<site>` | **one participant** of the federated run — its own tokens only |
+| `central-aggregator` | the federated run **as a whole** |
+
+**Compare a baseline against `central-aggregator`, not against a `diloco-<site>` run.** The
+aggregator's `train/loss` is the token-weighted loss across every participant and its
+`train/cum_tokens` is the federation total; a site reports only its own share, so overlaying
+`diloco-snellius` on `central-snellius` by tokens makes the federated run look like it
+reached a loss on a third of the data it actually used.
+
+If you set `WANDB_ENTITY`, `run_train.sh` now also exports `WANDB_TEAM` (and vice versa) —
+torchtitan's logger reads the latter and the aggregator the former, so setting only one used
+to put the sites and the server in different entities, where they cannot share a chart at
+all.
+
+### Gate: the 1k pair must pass before the 20k submission
+
+The `*_1k.toml` configs exist to buy this check cheaply: 10 outer rounds, one queue slot,
+every moving part of the full run exercised. Submit the 1k DiLoCo pair (both sites) and the
+1k baseline, and hold the 72-hour submission until **all four** of these pass. Each is a
+grep against `runs/central/flower.log` on the central VM, so no dashboard is required.
+
+Prerequisite: the held-out validation split is staged at **both** sites (Part 1 step 3) —
+it is a one-time stage that every later run reuses, and check 3 below is meaningless
+without it. A 1k pair run on the fixture rehearses a different eval path than the 20k run
+will use.
+
+**1. No non-finite contribution from either site.** This is the open blocker from a
+previous run — one site's weights came back non-finite in the embedding tensor, which is
+also the first tensor a scatter or vocab-padding bug at 8 ranks would hit. Its contribution
+is dropped rather than merged, so the run *survives* it, but that site's compute is wasted
+and the "comparison" is then one site training alone:
+
+```bash
+grep -iE "non-finite|excluded .* held-out" runs/central/flower.log   # must print NOTHING
+grep -iE "NON-FINITE" logs/pww-*-titan-*.out                         # per site: nothing
+```
+
+If it fires, the site log's `step N: loss became NON-FINITE` line says which step — step 1
+points at the weights the site was handed (the scatter path), a later step points at
+optimisation. Do not submit the 20k run around it.
+
+**2. Both sites merging, every round.** `merge round` advancing with 2 clusters and
+nonzero tokens from each:
+
+```bash
+grep "cluster(s)" runs/central/flower.log | tail -5    # expect "2 cluster(s) [lumi, snellius]"
+```
+
+**3. Held-out spread quiet.** The two sites evaluate the same global weights on the same
+staged validation windows, so their held-out losses must agree — the server warns above a
+1-nat spread:
+
+```bash
+grep "held-out loss spread" runs/central/flower.log    # must print NOTHING
+```
+
+Also confirm both site logs printed `validation  : c4_local at ...` — if either fell back
+to the fixture, the spread check compares different data and means nothing.
+
+**4. Drift falling.** From a random init the opening rounds are legitimately large (1.69
+then 0.93 measured); what matters is the trend across the 10 rounds:
+
+```bash
+grep -o "drift [0-9.]* (max [0-9.]*)" runs/central/flower.log
+```
+
+Read the max. Falling toward ~0.3 or below by round 10 is healthy; flat near 1 means the
+outer average is destroying local progress and H or the outer momentum needs attention
+before any 72-hour commitment ([FEDERATION_GUIDE § 3](FEDERATION_GUIDE.md)).
+
+Then reset before the real run — the 1k pair leaves checkpoints, a spent lease table and a
+seeded global model behind, all of which the 20k run must not inherit:
+
+```bash
+./scripts/reset_run.sh --yes                 # each site
+# central VM:
+./scripts/central_node/stop_central_services.sh
+PWW_FRESH_RUN=1 ENABLE_WANDB=1 NUM_ROUNDS=400 WANDB_PROJECT=<20k project> \
+  ./scripts/central_node/start_central_services.sh
+```
 
 ---
 

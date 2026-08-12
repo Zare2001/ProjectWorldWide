@@ -78,6 +78,21 @@ EXHAUSTED = "exhausted"
 STEPS = "steps"
 LOSS = "loss"
 
+SEQ_LEN = "seq_len"
+"""Sequence length this cluster trained at, so the central node can convert a token
+count into a batch of *sequences* without hardcoding one.
+
+It divided by a literal 2048, which silently reports a wrong batch size for any other
+seq_len and is one of the numbers a fair central-vs-DiLoCo comparison rests on."""
+
+DP_DEGREE = "dp_degree"
+"""Data-parallel ranks in this cluster.
+
+The central node used to infer it from the cluster id -- 8 for anything containing
+'lumi', 4 for 'snellius', 1 otherwise -- which is wrong for a partial allocation, a
+third site, or a `--replica`-suffixed id, and is what per-rank throughput is divided
+by."""
+
 TRANSPORT_INLINE = "inline"
 TRANSPORT_BLOB = "blob"
 TRANSPORTS = (TRANSPORT_INLINE, TRANSPORT_BLOB)

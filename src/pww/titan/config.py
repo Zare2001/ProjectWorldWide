@@ -126,11 +126,20 @@ class Flower:
     wire_dtype: str = "float16"
     """Dtype parameters are serialised in, for the inline transport only.
 
-    float16 halves WAN traffic and is exact for weights of normal magnitude, but its
-    range is much smaller than bfloat16's. Measured: fp16's smallest subnormal is
-    5.96e-08, so 3e-08 rounds up to it and anything at or below 2e-08 goes to zero --
-    about 1 element in 819,200 of a randn tensor moves. That costs nothing in practice
-    and is pinned by a test.
+    Both 16-bit options halve WAN traffic against float32 and are exact for weights of
+    normal magnitude. They differ in range, not precision, and the shipped configs all
+    set **bfloat16** -- it is what `training.dtype` already is, so the round trip
+    introduces no dtype the model was not already living in, and it cannot flush a small
+    weight to zero. float16's smallest subnormal is 5.96e-08, so 3e-08 rounds up to it
+    and anything at or below 2e-08 goes to zero: about 1 element in 819,200 of a randn
+    tensor moves. That is harmless in practice and is pinned by a test, which is why this
+    default is still float16 -- but prefer bfloat16 in a config, and note that the
+    aggregator also falls back to bfloat16 when it has not yet seen what a client sent
+    (`strategy._on_wire`).
+
+    bfloat16 crosses the wire as uint16 bit patterns, because numpy has no bfloat16, so
+    the decode is a reinterpretation rather than a cast -- see `strategy._from_wire` for
+    what happens when that is got wrong.
 
     float32 is *not* simply the same thing at twice the bytes: it halves the parameter
     ceiling above, and at 2.6 GiB even the 0.6B flavor no longer fits in a gRPC

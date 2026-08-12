@@ -143,7 +143,16 @@ echo "rendezvous  : ${RDZV_ENDPOINT}"
 # With checkpoint.interval == darl.inner_steps a checkpoint is written every round, so
 # even a job that failed after one round leaves one behind.
 #
+# Applies to the DiLoCo job and the central baseline alike. The baseline resumes from its
+# own dump folder exactly the same way -- torchtitan's checkpointer does not know or care
+# whether a Flower server is involved -- so a baseline resubmitted without this silently
+# continues the previous one at its old LR position, on a coordinator whose block space
+# was just reset to epoch 0. That produces a plausible-looking curve of a run that is
+# neither the old one nor a new one.
+#
 # Renamed, not deleted, keeping one generation -- the same policy the coordinator uses.
+# PWW_FRESH_DELETE=1 removes outright instead, for when scratch quota is the constraint;
+# scripts/reset_run.sh is the interactive front end for that.
 if [[ "${PWW_FRESH_RUN:-0}" == "1" ]]; then
     fresh_dump="${DUMP:-}"
     if [[ -z "${fresh_dump}" ]]; then
@@ -157,10 +166,23 @@ if [[ "${PWW_FRESH_RUN:-0}" == "1" ]]; then
         fresh_ckpt="${fresh_dump}/checkpoint"
         if [[ -d "${fresh_ckpt}" ]]; then
             rm -rf "${fresh_ckpt}.superseded"
-            mv "${fresh_ckpt}" "${fresh_ckpt}.superseded"
-            echo "PWW_FRESH_RUN=1: moved ${fresh_ckpt} aside to .superseded"
+            if [[ "${PWW_FRESH_DELETE:-0}" == "1" ]]; then
+                rm -rf "${fresh_ckpt}"
+                echo "PWW_FRESH_RUN=1 PWW_FRESH_DELETE=1: deleted ${fresh_ckpt}"
+            else
+                mv "${fresh_ckpt}" "${fresh_ckpt}.superseded"
+                echo "PWW_FRESH_RUN=1: moved ${fresh_ckpt} aside to .superseded"
+            fi
         else
             echo "PWW_FRESH_RUN=1: no checkpoint at ${fresh_ckpt}, nothing to clear"
+        fi
+        # Staged blobs from the previous run. Named by (run, round, cluster), so a new
+        # run at round 1 does not read them -- but they are one full model each and they
+        # accumulate silently, which is how a site's scratch quota goes at 3 a.m.
+        if [[ -d "${fresh_dump}/blob-staging" ]]; then
+            staged="$(find "${fresh_dump}/blob-staging" -type f | wc -l)"
+            rm -rf "${fresh_dump}/blob-staging"
+            echo "PWW_FRESH_RUN=1: removed ${staged} staged blob file(s) from the previous run"
         fi
     else
         echo "WARNING: PWW_FRESH_RUN=1 but no dump_folder found in ${CONFIG}; this site" \
@@ -172,17 +194,6 @@ overrides=()
 [[ -n "${TOKENIZER}" ]] && overrides+=(--model.hf_assets_path "${TOKENIZER}")
 [[ -n "${SHARDS}" ]] && overrides+=(--training.dataset_path "${SHARDS}")
 [[ -n "${DUMP}" ]] && overrides+=(--job.dump_folder "${DUMP}")
-
-if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ "${PWW_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
-    overrides+=(--metrics.enable_wandb)
-fi
-
-for var in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_MODE WANDB_BASE_URL; do
-    if [[ -n "${!var:-}" ]]; then
-        export "SINGULARITYENV_${var}=${!var}"
-        export "APPTAINERENV_${var}=${!var}"
-    fi
-done
 
 # --- gradient accumulation: let a fast site fill the round instead of idling -----
 #
@@ -235,7 +246,7 @@ elif [[ ! "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "WARNING: PWW_GRAD_ACCUM=${GRAD_ACCUM} is not a positive integer; ignoring" >&2
 fi
 
-# --- validation, made identical across sites --------------------------------
+# --- validation, made identical across sites AND actually held out ----------
 #
 # The held-out loss is the only cross-site check there is: every cluster evaluates the
 # *same* global weights, so a disagreement is a bug rather than variance. That only holds
@@ -253,11 +264,48 @@ fi
 #                 differently. Observed as 1,310,720 vs 2,621,440 eval tokens.
 #
 # Fixing the window TOTAL instead of the step count makes coverage identical: the loader
-# shards round-robin, so taking the first k windows on each of n ranks covers windows
-# 0..(n*k - 1) for any n. Same union, same mean, comparable number.
-VAL_DATA="${PWW_VAL_DATA:-${PWW_ROOT}/third_party/torchtitan/tests/assets/c4_test}"
+# shards round-robin and the dataset iterator is stateful, so every site walks the same
+# window sequence in lockstep -- eval N scores the same union of windows at every site
+# for any rank count. Same union, same mean, comparable number.
+#
+# WHICH data: the bundled c4_test fixture is NOT held out from a real C4 run. Its first
+# document ("Beginners BBQ Class Taking Place in Missoula!") is the first document of
+# en/c4-train.00000 -- the head of the very first file tokenize_c4.sh consumes -- so the
+# fixture's windows are also training windows. Worse than a uniformly optimistic eval:
+# the chance an eval window has been *trained on* grows with how much of the corpus a run
+# consumes, so a fixture eval favours whichever arm of a central-vs-DiLoCo comparison
+# trained more data. A staged copy of C4's real validation split (disjoint from train by
+# construction) is therefore preferred whenever it is present, via the offline c4_local
+# loader. Stage it once per site, login node -- both sites must stage the SAME file(s):
+#
+#   scripts/titan/stage_c4.sh --split validation --files 1 --out $PWW_DATA_DIR/c4-validation
+#
+# The fixture remains the fallback so smoke tests and standalone runs work with nothing
+# staged -- but it warns, because a comparison read off it is quietly biased.
+VAL_DATA="${PWW_VAL_DATA:-}"
+VAL_DATASET="${PWW_VAL_DATASET:-}"
+if [[ -z "${VAL_DATA}" && -d "${PWW_DATA_DIR:-/nonexistent}/c4-validation" ]]; then
+    VAL_DATA="${PWW_DATA_DIR}/c4-validation"
+fi
+if [[ -z "${VAL_DATA}" ]]; then
+    VAL_DATA="${PWW_ROOT}/third_party/torchtitan/tests/assets/c4_test"
+fi
+if [[ -z "${VAL_DATASET}" ]] && compgen -G "${VAL_DATA}/c4-validation.*.json*" > /dev/null; then
+    VAL_DATASET="c4_local"
+fi
 if [[ -d "${VAL_DATA}" ]]; then
     overrides+=(--validation.dataset_path "${VAL_DATA}")
+    if [[ -n "${VAL_DATASET}" ]]; then
+        overrides+=(--validation.dataset "${VAL_DATASET}")
+        echo "validation  : ${VAL_DATASET} at ${VAL_DATA} (held-out C4 validation split)"
+    else
+        echo "WARNING: evaluating on ${VAL_DATA}, which for the bundled c4_test fixture" \
+             "OVERLAPS the C4 training files -- eval/loss will favour whichever run" \
+             "trained more of the corpus. For a real comparison, stage the held-out" \
+             "split once per site (login node):" >&2
+        echo "  scripts/titan/stage_c4.sh --split validation --files 1 --out" \
+             "\$PWW_DATA_DIR/c4-validation" >&2
+    fi
 else
     echo "WARNING: no validation data at ${VAL_DATA}; leaving validation.dataset_path as" \
          "configured, which is relative and depends on the working directory" >&2
@@ -317,22 +365,51 @@ if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flo
     overrides+=(--flower.server_address "${CENTRAL}:${FLOWER_PORT}")
 fi
 
+# --- WandB ------------------------------------------------------------------
+#
+# One block, and it used to be two: an earlier one appended --metrics.enable_wandb and
+# mirrored the environment into the container forms *before* WANDB_PROJECT had been
+# defaulted, so the flag went on the command line twice and the container inherited an
+# empty project on any run that did not set one itself.
+#
+# The run name is derived rather than required, because the names are what makes a chart
+# readable and "run-20260812_154653-s7qqxpfs" is not:
+#
+#     central-<site>    the single-node baseline (flower.enable = false)
+#     diloco-<site>     one participating cluster of the federated run
+#     central-aggregator  the FedMom server -- set by start_central_services.sh
+#
+# The aggregator is the run to compare a baseline against, not either site: its
+# train/loss is the token-weighted loss across all participants and its train/cum_tokens
+# is the federation total, whereas a site reports only its own share.
 if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ "${PWW_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
     overrides+=(--metrics.enable_wandb)
     export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
     if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
         if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flower\]/,/^\[/p' "${CONFIG}"); then
-            export WANDB_RUN_NAME="diloco-${SITE}"
+            export WANDB_RUN_NAME="diloco-${SITE}${REPLICA:+-${REPLICA}}"
         else
-            export WANDB_RUN_NAME="central-${SITE}"
+            export WANDB_RUN_NAME="central-${SITE}${REPLICA:+-${REPLICA}}"
         fi
     fi
-    export SINGULARITYENV_WANDB_PROJECT="${WANDB_PROJECT}"
-    export SINGULARITYENV_WANDB_RUN_NAME="${WANDB_RUN_NAME}"
-    export SINGULARITYENV_WANDB_API_KEY="${WANDB_API_KEY:-}"
-    export APPTAINERENV_WANDB_PROJECT="${WANDB_PROJECT}"
-    export APPTAINERENV_WANDB_RUN_NAME="${WANDB_RUN_NAME}"
-    export APPTAINERENV_WANDB_API_KEY="${WANDB_API_KEY:-}"
+    # torchtitan's WandBLogger reads the entity from WANDB_TEAM; pww.central.server
+    # reads WANDB_ENTITY. Setting only one of them therefore puts the sites and the
+    # aggregator in *different* entities, where they cannot appear on one chart at all.
+    if [[ -n "${WANDB_ENTITY:-}" && -z "${WANDB_TEAM:-}" ]]; then
+        export WANDB_TEAM="${WANDB_ENTITY}"
+    elif [[ -n "${WANDB_TEAM:-}" && -z "${WANDB_ENTITY:-}" ]]; then
+        export WANDB_ENTITY="${WANDB_TEAM}"
+    fi
+    echo "wandb       : ${WANDB_PROJECT} / ${WANDB_RUN_NAME}${WANDB_ENTITY:+ (${WANDB_ENTITY})}"
+    # Mirrored into both container prefixes, because env.sh's PWW_LAUNCH may be a
+    # singularity/apptainer exec and a plain export does not survive it.
+    for var in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_MODE \
+               WANDB_BASE_URL WANDB_TEAM; do
+        if [[ -n "${!var:-}" ]]; then
+            export "SINGULARITYENV_${var}=${!var}"
+            export "APPTAINERENV_${var}=${!var}"
+        fi
+    done
 fi
 
 echo "=============================================================="

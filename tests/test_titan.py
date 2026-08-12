@@ -866,6 +866,87 @@ def _():
         )
 
 
+@check("the central baseline and the DiLoCo path log the same metric keys")
+def _():
+    """A baseline is only a baseline if the numbers being compared were computed alike.
+
+    They were not. The two drivers in `titan/train.py` each grew their own metrics hook and
+    disagreed on the three things a central-vs-DiLoCo chart rests on:
+
+      cum_tokens   the DiLoCo path all-reduced over the dp mesh; the central path multiplied
+                   rank 0's count by the world size, which overcounts by the TP degree
+      eval/*       the DiLoCo path published `eval/loss` and `eval/perplexity`; the central
+                   path published neither, so the perplexity chart had no baseline line
+      the step     both log at the global optimiser step, but nothing kept it monotonic
+
+    So this asserts the two produce an *identical* key set from one shared installer, using
+    stand-ins for the trainer -- the point is the hook's contract, not torchtitan.
+    """
+    from pww.titan.wandb_metrics import install_metric_hooks
+
+    class _Backend:
+        def __init__(self):
+            self.rows = []
+
+        def log(self, metrics, step):
+            self.rows.append((step, dict(metrics)))
+
+    class _Proc:
+        def __init__(self):
+            self.logger = _Backend()
+            self.ntokens_since_last_log = 0
+
+        def log(self, step, avg, mx, gn, extra_metrics=None):
+            self.logger.log(dict(extra_metrics or {}), step)
+
+        def log_validation(self, loss, step):
+            self.logger.log({"validation_metrics/loss": loss}, step)
+
+    class _Trainer:
+        def __init__(self):
+            self.metrics_processor = _Proc()
+            self.ntokens_seen = 0
+
+    def drive(**hook_kwargs):
+        trainer = _Trainer()
+        install_metric_hooks(trainer, **hook_kwargs)
+        proc = trainer.metrics_processor
+        # Three advancing steps, a rewind to 200 (a round that was not merged), then on.
+        for step, cum in ((100, 6_553_600), (200, 13_107_200), (300, 19_660_800),
+                          (200, 19_660_800), (300, 26_214_400), (400, 32_768_000)):
+            proc.log(step, 5.0, 5.2, 1.0,
+                     extra_metrics={"n_tokens_seen": cum, "lr": 3e-4})
+            if step % 200 == 0:
+                proc.log_validation(5.1, step)
+        return proc.logger.rows
+
+    diloco = drive(cluster_total=lambda v: v * 4, read_power_watts=lambda: 250.0)
+    central = drive()
+
+    def pww_keys(rows):
+        return {k for _, m in rows for k in m if k.startswith(("train/", "eval/"))}
+
+    assert pww_keys(diloco) == pww_keys(central), (
+        "the two drivers publish different keys, so their charts cannot be overlaid: "
+        f"only in diloco {pww_keys(diloco) - pww_keys(central)}, "
+        f"only in central {pww_keys(central) - pww_keys(diloco)}"
+    )
+    for required in ("train/loss", "train/perplexity", "train/cum_tokens", "train/step",
+                     "eval/loss", "eval/perplexity"):
+        assert required in pww_keys(central), f"{required} missing from the baseline"
+
+    # The token axis is torchtitan's own dist_summed figure, not a rank count guess.
+    first = next(m for _, m in central if "train/cum_tokens" in m)
+    assert first["train/cum_tokens"] == 6_553_600, first
+
+    # Steps never go backwards, so wandb drops nothing, and the true step is recoverable
+    # from the payload even where the index was bumped.
+    steps = [s for s, _ in central]
+    assert steps == sorted(steps), steps
+    rewound = [m for _, m in central if m.get("train/step") == 200]
+    assert len(rewound) >= 2, "the repeated round should survive, not be discarded"
+
+
 def main() -> int:
     print(__doc__.strip().splitlines()[0])
     print()

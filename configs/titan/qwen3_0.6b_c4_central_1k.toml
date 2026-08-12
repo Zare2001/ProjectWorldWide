@@ -1,4 +1,19 @@
-# Qwen3 0.6B on C4, DARL-leased, Snellius/Lumi single-node 1k-step central comparison run.
+# Qwen3 0.6B on C4, DARL-leased, single-node 1k-step central baseline.
+#
+# The short-run pair of configs/titan/qwen3_0.6b_c4_central.toml: 1,000 steps instead of
+# 20,000 and a 100-step warmup instead of 200, for shaking out a full central-plus-two-
+# sites setup inside one queue slot. Identical to
+# configs/titan/qwen3_0.6b_c4_diloco_1k.toml except for flower.enable.
+#
+# 1,000 steps at darl.inner_steps = 100 is 10 outer rounds, so the aggregator's
+# num-rounds only has to be >= 10; configs/central_aggregator_titan.yaml's 200 is a
+# harmless upper bound.
+#
+# Step-matched, not token-matched -- the same caveat as the 20k config, and the same fix.
+# Per optimiser step this baseline trains local_batch_size x seq_len x ranks tokens
+# (65,536 on 4 H100s, 131,072 on 8 GCDs) against the two-site federation's 196,608. Plot
+# on `train/cum_tokens`, WandB's default x-axis here, and use PWW_GRAD_ACCUM=3 on
+# Snellius for the compute-matched run. Full arithmetic in the 20k config's header.
 
 [job]
 dump_folder = "./outputs/qwen3-0.6b-c4-central-1k"
@@ -54,6 +69,9 @@ train_timeout_seconds = 1800
 
 [validation]
 enable = true
+# The bundled fixture overlaps the C4 training files; run_train.sh upgrades this to the
+# real held-out split (c4_local) when $PWW_DATA_DIR/c4-validation is staged. See the 20k
+# config for the full note.
 dataset = "c4_test"
 dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
 freq = 100

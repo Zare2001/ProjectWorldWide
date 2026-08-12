@@ -36,6 +36,7 @@ from typing import Any
 import torch
 
 from ..logging_utils import get_logger
+from .wandb_metrics import cluster_sum, install_metric_hooks
 
 logger = get_logger("pww.titan.trainer")
 
@@ -105,6 +106,11 @@ class FederatedTrainer:
         # `Validator.validate` returns None and reports through the metrics
         # processor, so the only way to get the held-out loss back out is to
         # intercept where it is logged.
+        #
+        # Capture only. Publishing `eval/loss` and `eval/perplexity` is
+        # `wandb_metrics.install_metric_hooks`'s job, because the plain torchtitan
+        # path never builds a FederatedTrainer and so would otherwise have no
+        # held-out series to compare this one against.
         self._validation_loss = float("nan")
         self._validation_tokens = 0
         self._validation_baseline = 0
@@ -112,26 +118,13 @@ class FederatedTrainer:
         original_log_validation = processor.log_validation
 
         def capturing_log_validation(loss, step, *args, **kwargs):
-            val_loss = float(loss)
-            self._validation_loss = val_loss
+            self._validation_loss = float(loss)
             # Read here because `log_validation` zeroes the counter on its way out, and
             # relative to a baseline taken in validate() because training also
             # accumulates into it between its own log intervals.
             self._validation_tokens = max(
                 0, processor.ntokens_since_last_log - self._validation_baseline
             )
-            if math.isfinite(val_loss):
-                ppl = math.exp(min(20.0, val_loss))
-                logger_inst = getattr(processor, "logger", None)
-                if logger_inst is not None:
-                    try:
-                        logger_inst.log({
-                            "eval/loss": val_loss,
-                            "eval/perplexity": ppl,
-                            "validation_metrics/perplexity": ppl,
-                        }, step)
-                    except Exception:
-                        pass
             return original_log_validation(loss, step, *args, **kwargs)
 
         processor.log_validation = capturing_log_validation
@@ -161,23 +154,11 @@ class FederatedTrainer:
         do -- rank 0 through the Flower client, the rest through
         `flower_client.run_worker_loop`.
 
-        float64 rather than float32 on purpose: a round at 8 ranks x 8 batch x 2048
-        seq_len x 100 steps is ~13M tokens, already near float32's 2**24 exact-integer
-        ceiling.
+        The reduction itself lives in `wandb_metrics.cluster_sum`, because the token
+        axis on the metrics side needs exactly the same number and a second copy of it
+        is a second chance for the two to disagree.
         """
-        parallel_dims = getattr(self.trainer, "parallel_dims", None)
-        if parallel_dims is None or not getattr(parallel_dims, "dp_cp_enabled", False):
-            return float(value)
-
-        from torchtitan.distributed import utils as dist_utils
-
-        tensor = torch.tensor(float(value), dtype=torch.float64,
-                              device=self.trainer.device)
-        return float(dist_utils.dist_sum(
-            tensor,
-            parallel_dims.world_mesh["dp_cp"],
-            getattr(getattr(self.trainer, "ft_manager", None), "loss_sync_pg", None),
-        ))
+        return cluster_sum(self.trainer, value)
 
     # --- lifecycle --------------------------------------------------------
 
@@ -222,25 +203,14 @@ class FederatedTrainer:
         self._data_iterator = trainer.batch_generator(trainer.dataloader)
         self._started = True
 
-        proc = getattr(trainer, "metrics_processor", None)
-        if proc is not None and not hasattr(proc, "_pww_hooked"):
-            orig_log = proc.log
-            def _log_wrapper(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
-                proc.last_grad_norm = grad_norm
-                if extra_metrics is None:
-                    extra_metrics = {}
-                p_watts = self._read_power_watts()
-                if p_watts is not None:
-                    extra_metrics["power_watts"] = p_watts
-                cum_tok = int(self._cluster_total(getattr(trainer, "ntokens_seen", 0)))
-                if cum_tok > 0:
-                    extra_metrics["train/cum_tokens"] = cum_tok
-                if math.isfinite(global_avg_loss):
-                    extra_metrics["train/loss"] = float(global_avg_loss)
-                    extra_metrics["train/perplexity"] = float(math.exp(min(20.0, global_avg_loss)))
-                return orig_log(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=extra_metrics)
-            proc.log = _log_wrapper
-            proc._pww_hooked = True
+        # Identical to what the plain torchtitan path installs, on purpose: a baseline
+        # and a DiLoCo run are only comparable if `train/loss`, `train/cum_tokens` and
+        # `eval/loss` were computed by the same code. See wandb_metrics.
+        install_metric_hooks(
+            trainer,
+            cluster_total=self._cluster_total,
+            read_power_watts=self._read_power_watts,
+        )
 
         logger.info("federated trainer ready at step %d", trainer.step)
 
@@ -413,14 +383,15 @@ class FederatedTrainer:
         return self.trainer.step
 
     def _log_step(self, step: int, steps_done: int) -> None:
-        """Per-step loss, which torchtitan would log and this path skipped entirely.
+        """Per-step loss on stdout, and the first non-finite step of a phase.
 
-        torchtitan's own logging lives inside `Trainer.train()`, and this class drives
-        `train_step` directly to interleave DiLoCo phases -- so `metrics_processor.log`
-        was never reached and a run produced **zero** per-step loss lines. `log_freq`
-        looked honoured and was not.
+        Not a substitute for torchtitan's own metrics line: `Trainer.train_step` calls
+        `metrics_processor.log` itself whenever `should_log(step)`, so this path does
+        get the upstream per-step logging and everything hooked onto it -- which is why
+        `train/loss` and `train/cum_tokens` reach wandb from here at all. What this adds
+        is the non-finite report below.
 
-        That absence is expensive at exactly the wrong moment. When a site starts
+        That report matters at exactly the wrong moment. When a site starts
         returning non-finite weights, the question is whether the loss went bad
         gradually over the phase or on the first step, and those have different causes:
         gradual points at the learning rate or the outer step, immediate points at the
@@ -562,6 +533,15 @@ class FederatedTrainer:
             except Exception:                                         # noqa: BLE001
                 pass
         return None
+
+    def dp_degree(self) -> int:
+        """Data-parallel ranks in this cluster. Reported to the central node.
+
+        Public because the Flower client sends it in the round's metrics: the server
+        used to infer a site's rank count from its cluster id, which is wrong for a
+        partial allocation, a third site, or a `--replica`-suffixed id.
+        """
+        return self._dp_degree()
 
     def _dp_degree(self) -> int:
         """Data-parallel ranks in this cluster, or 1 if not sharded."""

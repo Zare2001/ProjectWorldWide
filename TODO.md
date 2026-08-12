@@ -116,15 +116,19 @@ and returns non-finite weights, so something in this list runs without being rig
       through `ShardedTokenCorpus`. The coordinator's block-space digest
       (`20f69387b3d4ba09`, 2,692 blocks) was derived independently on both sides and
       matched — which is the check that actually gates registration.
-- [ ] **validation is still the `c4_test` fixture, and that is the remaining gap.**
-      Training is real C4; the held-out number is 512 windows (~1.05M tokens) of
-      torchtitan's 2,000-document test asset. `run_train.sh` now fixes the window *total*
-      via `PWW_VAL_WINDOWS` so the sites score identical data and the figure is comparable
-      between them — but it is not a publishable C4 perplexity, and the fixture's
-      disjointness from a specific `--max-files` slice is plausible rather than verified.
-      A reportable number needs a held-out tail carved out of the run's own shards and
-      excluded from the DARL block space, which changes `num_samples` and the digest and so
-      is a `PWW_FRESH_RUN=1` change.
+- [x] **validation on a real held-out split.** The fixture's disjointness, previously
+      "plausible rather than verified", was verified **false**: `c4_test` is the head of
+      `en/c4-train.00000`, inside any `--max-files` training slice — and the bias is
+      non-uniform, favouring the arm that consumes more of the corpus (DiLoCo ~70% vs the
+      step-matched baseline ~23% at 20k steps). Resolved without touching the block space:
+      `run_train.sh` automatically evaluates on a staged copy of C4's *validation* split
+      (`stage_c4.sh --split validation --files 1 --out $PWW_DATA_DIR/c4-validation`,
+      offline `c4_local` loader), falling back to the fixture with a warning. The
+      per-site staging is the remaining manual step; the sha256 of the staged file must
+      match across sites (RUNBOOK Part 1 step 3). The alternative — a held-out tail carved
+      from the run's own shards, excluded from the DARL space — remains open only if the
+      validation split's distribution shift from the train slice ever matters; it changes
+      `num_samples` and the digest and so is a `PWW_FRESH_RUN=1` change.
 - [ ] measure the tokenisation pass: it is offline and one-off, but it is also the
       only step whose cost scales with the corpus rather than the run
 

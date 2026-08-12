@@ -19,9 +19,23 @@
 # It uses DARL dataset leasing (pww_tokens) with space_seed = 42 so that training
 # processes tokens in the exact same pseudo-random block-permuted sequence as the DiLoCo run.
 #
-# If CENTRAL_IP is set and reachable, it leases from the central coordinator.
-# Otherwise (or if LOCAL_DARL=1), it automatically spawns a temporary local DARL coordinator
-# on 127.0.0.1 during the job.
+# The coordinator is ALWAYS a throwaway one on 127.0.0.1, spawned here and killed with the
+# job. It deliberately does not use the shared central coordinator: this baseline must
+# consume the whole block space by itself, and leasing from the shared table would make it
+# compete with a live DiLoCo run for blocks -- each would train on part of the corpus and
+# neither would be the run it claims to be. (An earlier version of this comment said
+# CENTRAL_IP was honoured when reachable. It never was, and it should not be.)
+#
+# A fresh start, which for this job means BOTH halves:
+#
+#     PWW_FRESH_RUN=1 sbatch --export=ALL,PWW_FRESH_RUN scripts/snellius/job_titan_central.sh
+#
+# The coordinator below is always --fresh, because it is new every job. The *checkpoint*
+# is not: torchtitan resumes from the config's dump folder whether or not Flower is
+# involved, so without PWW_FRESH_RUN a resubmitted baseline continues the previous run at
+# its old LR-schedule position while reading a block space that just went back to epoch 0.
+# scripts/reset_run.sh clears it up front; PWW_FRESH_RUN also handles a checkpoint written
+# between the reset and the job starting.
 
 set -euo pipefail
 
@@ -128,6 +142,19 @@ cleanup() {
     if [[ -n "${LOCAL_DARL_PID:-}" ]] && kill -0 "${LOCAL_DARL_PID}" 2>/dev/null; then
         echo "stopping local DARL coordinator (PID ${LOCAL_DARL_PID})..."
         kill -TERM "${LOCAL_DARL_PID}" 2>/dev/null || true
+        # Give it a moment to write its final snapshot before the state dir is judged.
+        sleep 1
+    fi
+    # This job's own state dir is keyed by Slurm job id and is never reused, so leaving it
+    # behind accumulates one directory per baseline run for nothing. The log is the only
+    # part worth keeping, and only when it says something: a coordinator that started
+    # cleanly has nothing in it that the job output does not already have.
+    if [[ -d "${LOCAL_STATE_DIR:-}" ]]; then
+        if grep -qiE 'error|traceback' "${LOCAL_STATE_DIR}/coordinator.log" 2>/dev/null; then
+            echo "kept ${LOCAL_STATE_DIR} -- its coordinator.log reports an error"
+        else
+            rm -rf "${LOCAL_STATE_DIR}"
+        fi
     fi
 }
 trap cleanup TERM INT EXIT

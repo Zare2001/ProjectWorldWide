@@ -12,6 +12,11 @@
 #                                                    one site's output to the other)
 #   3. scripts/central_node/start_central_services.sh   (on the central VM)
 #
+# The baseline this is measured against is configs/titan/qwen3_0.6b_c4_central.toml,
+# which is this file with flower.enable = false and nothing else changed. Its header
+# has the token arithmetic for a step-matched versus a compute-matched comparison; read
+# it before reading any chart that has both runs on it.
+#
 # Model shape is torchtitan's own built-in "0.6B" Qwen3 flavor -- this repo does
 # not hand-roll a model. See third_party/torchtitan/torchtitan/models/qwen3/__init__.py
 # for the flavor table. vocab_size and eos_id are overridden at build time from
@@ -99,8 +104,16 @@ train_timeout_seconds = 1800
 [validation]
 enable = true
 # Not pww_tokens: the shards are the training partition, and validating on them
-# would report training loss. c4_test is the bundled offline fixture, which is
-# held out from a real C4 run by construction.
+# would report training loss.
+#
+# c4_test is the bundled offline fixture, and it is NOT held out from a real C4 run --
+# an earlier version of this comment claimed it was "by construction", and that was
+# wrong. Verified: the fixture is the head of en/c4-train.00000, the first file
+# tokenize_c4.sh consumes, so its windows are also training windows. It stays as the
+# default only so this config runs standalone with nothing staged. run_train.sh
+# upgrades validation to the REAL held-out split (dataset c4_local) automatically when
+# $PWW_DATA_DIR/c4-validation is staged -- see the validation block there -- and warns
+# loudly when it has to fall back to this fixture.
 dataset = "c4_test"
 # Both values below are OVERRIDDEN by scripts/titan/run_train.sh, and have to be:
 #
@@ -116,6 +129,11 @@ dataset = "c4_test"
 # Left here as the single-site defaults, so `python3 -m pww.titan.train` without the
 # launcher still validates on something.
 dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+# IGNORED on this path, and left only so the config is runnable without Flower. With
+# flower.enable = true the central node drives evaluation: one Flower `evaluate` per
+# round, i.e. once every darl.inner_steps = 100 optimiser steps, and there is no
+# frequency to set. The step-matched baseline sets validation.freq = 100 to produce the
+# same cadence -- see configs/titan/qwen3_0.6b_c4_central.toml.
 freq = 500
 steps = 20
 

@@ -39,6 +39,8 @@ import sys
 import torch.distributed as dist
 
 from ..logging_utils import get_logger, setup_logging
+from ..wandb_utils import bind_axes
+from .wandb_metrics import install_metric_hooks
 
 logger = get_logger("pww.titan.train")
 
@@ -53,6 +55,65 @@ def _parse_config(argv: list[str]):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise SystemExit(f"configuration error: {message}")
+
+
+def _commit_darl_on_checkpoint(trainer) -> None:
+    """Commit DARL leases after a checkpoint, on the plain torchtitan path.
+
+    Under the default `checkpoint` commit policy the dataloader deliberately does not
+    commit anything itself -- the commit is gated on the work being durably in a
+    checkpoint, so that {weights, committed blocks} fail together. `FederatedTrainer`
+    does that gating in `run_inner_phase`, and torchtitan's own `train()` has no
+    equivalent, so the central baseline committed **nothing for the whole run**.
+
+    What that cost: the coordinator's committed map stayed empty, so its coverage
+    counter and `epoch_complete` signal never advanced, every lease the run ever took
+    stayed outstanding and heartbeated, and a baseline asked to cover a full epoch would
+    have looped on `drain` instead of finishing. Silent throughout -- the run trains
+    correctly, it simply never tells the coordinator what it consumed, so the one figure
+    that says "the baseline saw the same data as the DiLoCo run" was unavailable.
+
+    Wrapping `save` rather than polling: the commit has to land *after* the write and
+    only when there actually was one. `CheckpointManager.save` returns None and no-ops
+    between intervals, so the decision is read from `_should_save` first -- exactly as
+    `FederatedTrainer._will_checkpoint` does, and losing that private method degrades
+    the same safe way, to committing every call.
+    """
+    dataloader = getattr(trainer, "dataloader", None)
+    checkpointer = getattr(trainer, "checkpointer", None)
+    commit = getattr(dataloader, "commit", None)
+    if commit is None or checkpointer is None:
+        return
+
+    original_save = checkpointer.save
+
+    def _save_then_commit(curr_step: int, last_step: bool = False, **kwargs):
+        should_save = getattr(checkpointer, "_should_save", None)
+        if should_save is None:
+            logger.warning(
+                "CheckpointManager has no _should_save; committing DARL leases on every "
+                "save call, which is the 'consumption' policy in practice"
+            )
+            wrote = True
+        else:
+            try:
+                wrote = bool(should_save(curr_step, last_step))
+            except TypeError:
+                wrote = bool(should_save(curr_step))
+        result = original_save(curr_step, last_step=last_step, **kwargs)
+        if wrote:
+            try:
+                blocks = commit()
+                if blocks:
+                    logger.info("darl: committed %d block(s) through step %d",
+                                blocks, curr_step)
+            except Exception as exc:                                  # noqa: BLE001
+                # A refused commit must not kill a run whose checkpoint is already on
+                # disk; the spans expire on their TTL instead.
+                logger.warning("darl commit failed: %s", exc)
+        return result
+
+    checkpointer.save = _save_then_commit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,50 +163,42 @@ def main(argv: list[str] | None = None) -> int:
 
     trainer = Trainer(job_config)
 
-    # Tag WandB run with the Slurm job ID (if running under Slurm).
-    slurm_job_id = os.environ.get("SLURM_JOBID", "")
-    if slurm_job_id and dist.get_rank() == 0:
-        try:
-            import wandb
+    # WandB bookkeeping that applies to both drivers. `Trainer.__init__` builds the
+    # metrics processor, which is what calls `wandb.init`, so `wandb.run` exists by here
+    # on whichever rank logs.
+    #
+    # Gated on `wandb.run` rather than on rank 0, because the logging rank is not always
+    # rank 0: under a pipeline-parallel schedule torchtitan puts it on the first rank of
+    # the last stage (`metrics._get_metrics_rank`). Checking the run object asks the
+    # question that actually matters and needs no process group.
+    try:
+        import wandb
 
-            if wandb.run is not None:
-                wandb.config.update({"slurm_job_id": slurm_job_id}, allow_val_change=True)
-        except Exception:
-            pass
+        if wandb.run is not None:
+            # Binds the default x-axis to train/cum_tokens, the same as the central
+            # aggregator does, so a chart built across runs is not comparing one run's
+            # tokens against another's steps.
+            bind_axes(wandb)
+            slurm_job_id = os.environ.get("SLURM_JOBID", "")
+            if slurm_job_id:
+                wandb.config.update({"slurm_job_id": slurm_job_id},
+                                    allow_val_change=True)
+    except Exception:                                                 # noqa: BLE001
+        pass
 
     if not flower_cfg.enable:
         logger.info("flower.enable is false -- running torchtitan's own train loop")
 
-        # Hook the metrics processor so central runs log under the same
-        # WandB keys (train/loss, train/perplexity, train/cum_tokens) as
-        # DiLoCo runs, enabling direct chart comparison.
-        import math
+        # The same hooks the DiLoCo driver installs, from the same module. A baseline
+        # is only a baseline if `train/loss`, `train/cum_tokens` and `eval/loss` mean
+        # the same thing here as they do there -- and until this shared call existed
+        # they did not: this path multiplied a per-rank token count by the world size
+        # (wrong under tensor parallelism) and published no held-out series at all, so
+        # the perplexity chart had a DiLoCo line and no baseline to compare it to.
+        install_metric_hooks(trainer)
 
-        proc = getattr(trainer, "metrics_processor", None)
-        if proc is not None:
-            orig_log = proc.log
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-            def _central_log_wrapper(
-                step, global_avg_loss, global_max_loss, grad_norm,
-                extra_metrics=None,
-            ):
-                if extra_metrics is None:
-                    extra_metrics = {}
-                cum_tok = int(getattr(trainer, "ntokens_seen", 0) * world_size)
-                if cum_tok > 0:
-                    extra_metrics["train/cum_tokens"] = cum_tok
-                if math.isfinite(global_avg_loss):
-                    extra_metrics["train/loss"] = float(global_avg_loss)
-                    extra_metrics["train/perplexity"] = float(
-                        math.exp(min(20.0, global_avg_loss))
-                    )
-                return orig_log(
-                    step, global_avg_loss, global_max_loss, grad_norm,
-                    extra_metrics=extra_metrics,
-                )
-
-            proc.log = _central_log_wrapper
+        if uses_darl:
+            _commit_darl_on_checkpoint(trainer)
 
         try:
             trainer.train()

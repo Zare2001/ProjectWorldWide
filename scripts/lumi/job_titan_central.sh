@@ -20,7 +20,24 @@
 # It uses DARL dataset leasing (pww_tokens) with space_seed = 42 so that training
 # processes tokens in the exact same pseudo-random block-permuted sequence as the DiLoCo run.
 #
-# Automatically spawns a temporary local DARL coordinator on 127.0.0.1 during the job.
+# The coordinator is always a throwaway one on 127.0.0.1, spawned here and killed with the
+# job -- never the shared central one, because this baseline must consume the whole block
+# space by itself rather than competing with a live DiLoCo run for blocks.
+#
+# NOTE on rank count: 8 GCDs here against Snellius's 4, so at local_batch_size 8 this
+# baseline trains 131,072 tokens per step and the Snellius one 65,536. The two are
+# therefore not the same baseline, and neither is token-matched to the two-site federation's
+# 196,608 per step. Read charts on the train/cum_tokens axis; see the header of
+# configs/titan/qwen3_0.6b_c4_central.toml for the compute-matched alternative.
+#
+# A fresh start needs BOTH halves. The coordinator below is always --fresh (it is new every
+# job); the checkpoint is not, because torchtitan resumes from the config's dump folder
+# whether or not Flower is involved:
+#
+#     PWW_FRESH_RUN=1 sbatch --export=ALL,PWW_FRESH_RUN -A $PWW_ACCOUNT \
+#         scripts/lumi/job_titan_central.sh
+#
+# scripts/reset_run.sh clears the dump folder up front.
 
 set -euo pipefail
 
@@ -110,6 +127,16 @@ cleanup() {
     if [[ -n "${LOCAL_DARL_PID:-}" ]] && kill -0 "${LOCAL_DARL_PID}" 2>/dev/null; then
         echo "stopping local DARL coordinator (PID ${LOCAL_DARL_PID})..."
         kill -TERM "${LOCAL_DARL_PID}" 2>/dev/null || true
+        sleep 1
+    fi
+    # Keyed by Slurm job id and never reused, so leaving it behind accumulates one
+    # directory per baseline run. Kept only when its log has something to say.
+    if [[ -d "${LOCAL_STATE_DIR:-}" ]]; then
+        if grep -qiE 'error|traceback' "${LOCAL_STATE_DIR}/coordinator.log" 2>/dev/null; then
+            echo "kept ${LOCAL_STATE_DIR} -- its coordinator.log reports an error"
+        else
+            rm -rf "${LOCAL_STATE_DIR}"
+        fi
     fi
 }
 trap cleanup TERM INT EXIT

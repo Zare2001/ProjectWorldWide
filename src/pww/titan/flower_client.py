@@ -326,24 +326,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             tokens=int(result["tokens"]),
         )
 
-        metrics: dict[str, Any] = {
-            proto.LOSS: float(result["loss"]),
-            proto.STEPS: int(result["steps"]),
-            proto.TOKENS: int(result["tokens"]),
-            proto.EXHAUSTED: bool(result["exhausted"]),
-            proto.CLUSTER: self.cluster_id,
-            proto.BASE_ROUND: base_round,
-            "tokens_per_s": float(result["tokens_per_s"]),
-            "blocks_committed": int(result["blocks_committed"]),
-            "seconds": float(result["seconds"]),
-            # Hardware metrics, when the trainer could read them. Forwarded per cluster
-            # rather than aggregated: MFU against an MI250X GCD and against an H100 are
-            # not the same quantity, so a mean of the two would describe neither.
-            **{key: float(result[key]) for key in
-               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr", "grad_norm", "power_watts")
-               if key in result},
-            **{key: float(value) for key, value in drift.items()},
-        }
+        metrics = self._round_metrics(result, drift, base_round)
         if seeded:
             metrics[proto.UPLOADED_INIT] = "1"
 
@@ -403,24 +386,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         }
         drift = outer_agreement(delta, self._reference)
 
-        metrics: dict[str, Any] = {
-            proto.LOSS: float(result["loss"]),
-            proto.STEPS: int(result["steps"]),
-            proto.TOKENS: int(result["tokens"]),
-            proto.EXHAUSTED: bool(result["exhausted"]),
-            proto.CLUSTER: self.cluster_id,
-            proto.BASE_ROUND: int(config.get(proto.ROUND, 0)),
-            "tokens_per_s": float(result["tokens_per_s"]),
-            "blocks_committed": int(result["blocks_committed"]),
-            "seconds": float(result["seconds"]),
-            # Hardware metrics, when the trainer could read them. Forwarded per cluster
-            # rather than aggregated: MFU against an MI250X GCD and against an H100 are
-            # not the same quantity, so a mean of the two would describe neither.
-            **{key: float(result[key]) for key in
-               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr", "grad_norm", "power_watts")
-               if key in result},
-            **{key: float(value) for key, value in drift.items()},
-        }
+        metrics = self._round_metrics(result, drift, int(config.get(proto.ROUND, 0)))
         if result["exhausted"]:
             self.done = True
         if result["steps"] == 0:
@@ -432,6 +398,43 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
 
         self._log_round(result, drift["drift_ratio"], metrics[proto.BASE_ROUND])
         return self.codec.encode(local), int(result["tokens"]), metrics
+
+    def _round_metrics(
+        self, result: dict[str, Any], drift: dict[str, float], base_round: int
+    ) -> dict[str, Any]:
+        """What this cluster reports for one round, built in exactly one place.
+
+        The two transports used to assemble this dict independently, character for
+        character, which is how the blob path ended up without a metric the inline
+        path had. There is nothing transport-specific in it.
+
+        `seq_len` and `dp_degree` are here because the central node cannot derive
+        them and was guessing. It divided token counts by a literal 2048 to report a
+        batch size, and mapped a cluster id to a rank count with
+        `8 if "lumi" in cid else 4 if "snellius" in cid else 1` -- both correct only
+        for the two sites this repo happens to ship configs for, at one seq_len, with
+        no --replica suffix. A cluster knows its own geometry; it should say so.
+        """
+        return {
+            proto.LOSS: float(result["loss"]),
+            proto.STEPS: int(result["steps"]),
+            proto.TOKENS: int(result["tokens"]),
+            proto.EXHAUSTED: bool(result["exhausted"]),
+            proto.CLUSTER: self.cluster_id,
+            proto.BASE_ROUND: int(base_round),
+            proto.SEQ_LEN: int(self.federated.job_config.training.seq_len),
+            proto.DP_DEGREE: int(self.federated.dp_degree()),
+            "tokens_per_s": float(result["tokens_per_s"]),
+            "blocks_committed": int(result["blocks_committed"]),
+            "seconds": float(result["seconds"]),
+            # Hardware metrics, when the trainer could read them. Forwarded per cluster
+            # rather than aggregated: MFU against an MI250X GCD and against an H100 are
+            # not the same quantity, so a mean of the two would describe neither.
+            **{key: float(result[key]) for key in
+               ("mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "lr", "grad_norm", "power_watts")
+               if key in result},
+            **{key: float(value) for key, value in drift.items()},
+        }
 
     def _log_round(self, result: dict, drift: float, base_round: int) -> None:
         logger.info(
@@ -499,9 +502,15 @@ def broadcast_stop() -> None:
     then every other rank is already blocked in `run_worker_loop`'s broadcast. Without
     this they wait until Slurm kills the job, which buries the real error under a
     walltime timeout.
+
+    The tuple has to be the same arity `run_worker_loop` unpacks. It was one element
+    short of the `global_step` field, so the workers raised `ValueError: not enough
+    values to unpack` the moment this fired -- on the one path whose entire job is to
+    let them exit cleanly. A wedged rank 0 then produced a wedged job anyway, with the
+    unpack error burying the real cause.
     """
     if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.broadcast_object_list([(CMD_STOP, False, False, "", False)], src=0)
+        dist.broadcast_object_list([(CMD_STOP, False, False, "", False, -1)], src=0)
 
 
 def run_worker_loop(federated: FederatedTrainer) -> None:

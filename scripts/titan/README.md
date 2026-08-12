@@ -205,6 +205,10 @@ NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
 # per site
 sbatch scripts/snellius/job_titan_diloco.sh
 sbatch scripts/lumi/job_titan_diloco.sh
+
+# the baseline it is measured against -- no central VM, its own throwaway
+# coordinator on the same space_seed = 42 block space
+sbatch scripts/snellius/job_titan_central.sh
 ```
 
 Sites can be submitted in any order, and neither has to wait for the other: the
@@ -214,6 +218,19 @@ absorbs the second whenever it appears.
 Validate one site on its own first -- `configs/titan/qwen3_0.6b_smoke.toml` runs the
 whole local half (FSDP2, DARL leasing, checkpoint, commit ordering) with
 `flower.enable = false`, so it needs no central node and no WAN.
+
+**Starting over is an action, not the absence of one.** Every one of these resumes by
+default, which is what an HPC job killed at walltime needs -- including the baseline,
+which spawns a fresh coordinator every job and so looks stateless while its checkpoint
+is not. `scripts/reset_run.sh --dry-run` lists what a reset would clear;
+`PWW_FRESH_RUN=1` at submit time covers anything written between the reset and the job
+starting. See [RUNBOOK.md](../../RUNBOOK.md) "Starting a genuinely fresh run".
+
+**Reading the results.** The comparison is baseline versus the aggregator's own WandB run,
+not versus a single site's, and the honest x-axis is `train/cum_tokens` rather than the
+step -- equal steps is not equal work when the federation trains 12 ranks against the
+baseline's 4. [FEDERATION_GUIDE.md](../../FEDERATION_GUIDE.md) section 5 has the key
+reference; `configs/titan/qwen3_0.6b_c4_central.toml`'s header has the arithmetic.
 
 ## What is verified, and where
 

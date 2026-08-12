@@ -34,6 +34,7 @@ from pathlib import Path
 
 from ..config import apply_config_file
 from ..logging_utils import get_logger, setup_logging
+from ..wandb_utils import STEP_METRIC, MonotonicStep, bind_axes
 from .. import fedproto as proto
 
 logger = get_logger("pww.central.server")
@@ -198,9 +199,24 @@ def build_metric_aggregators(
         "total_tokens": 0,
         "site_tokens": {},
         "merge_round": 0,
+        # Optimiser steps the *run* has taken, accumulated the same way
+        # `strategy.PWWFedMom` accumulates its own authoritative counter: by the largest
+        # number of steps any contributing cluster took this round.
+        #
+        # It used to be reconstructed instead, as `merge_round * steps_this_round` for
+        # training and `merge_round * 100` for evaluation. Both are right only while
+        # every round takes exactly the same number of steps and that number is 100 --
+        # so the last round of a run, any round a site ended early on an exhausted
+        # dataloader, and any run with a different `darl.inner_steps` put the
+        # aggregator's points at a step the run was never at, on charts whose whole
+        # purpose is to sit alongside the sites' own. The two formulas also disagreed
+        # with each other, so `train/loss` and `eval/loss` for one round could land on
+        # different x values.
+        "global_step": 0,
     }
 
     wandb_run = None
+    wandb_step = MonotonicStep()
     if enable_wandb:
         try:
             import os
@@ -214,10 +230,7 @@ def build_metric_aggregators(
                 name=name,
                 config=config_dict or {},
             )
-            try:
-                wandb.define_metric("*", step_metric="train/cum_tokens")
-            except Exception:
-                pass
+            bind_axes(wandb)
             logger.info("WandB logging enabled for central aggregator (%s/%s)", project, name)
         except Exception as exc:
             logger.warning("Failed to initialize WandB for central aggregator: %s", exc)
@@ -232,13 +245,23 @@ def build_metric_aggregators(
         state["total_tokens"] += total
         state["merge_round"] += 1
         cum_tokens = state["total_tokens"]
+        # max(), not the mean or a constant: it is what the run actually advanced by,
+        # and it is the same increment `strategy.PWWFedMom` applies to the counter it
+        # broadcasts as `pww_global_step`. Anything else puts these points on a
+        # different axis from the sites' own.
+        steps_this_round = max((int(m.get(proto.STEPS, 0)) for _, m in metrics), default=0)
+        state["global_step"] += steps_this_round
+        global_step = state["global_step"]
 
         for n, m in metrics:
             cid = str(m.get(proto.CLUSTER, "?"))
             state["site_tokens"][cid] = state["site_tokens"].get(cid, 0) + n
 
         avg_loss = sum(n * m.get(proto.LOSS, 0.0) for n, m in metrics) / total
-        out = {"loss": avg_loss, "cum_tokens": cum_tokens}
+        # `global_step` is returned as well as logged: Flower keeps aggregated fit metrics
+        # in its history, so this is where the run's step counter is recoverable after the
+        # fact -- and it is what makes the accumulation testable without a wandb install.
+        out = {"loss": avg_loss, "cum_tokens": cum_tokens, "global_step": global_step}
         drifts = [float(m["drift_ratio"]) for _, m in metrics if "drift_ratio" in m]
         detail = ""
         if drifts:
@@ -284,17 +307,34 @@ def build_metric_aggregators(
                                ", ".join(f"{v:.3e}" for v in lrs))
 
         if wandb_run is not None:
-            steps_this_round = max((int(m.get(proto.STEPS, 100)) for _, m in metrics), default=100)
-            global_step = state["merge_round"] * steps_this_round
             wb_metrics = {
                 "round": state["merge_round"],
+                STEP_METRIC: global_step,
                 "train/loss": avg_loss,
                 "train/perplexity": out["perplexity"],
                 "train/cum_tokens": cum_tokens,
                 "train/tokens_this_round": total,
-                "train/global_batch_size": total // 2048,
-                "train/global_batch_tokens": total,
+                "train/steps_this_round": steps_this_round,
             }
+            # A *batch* is per optimiser step. This reported `total // 2048` -- the
+            # round's whole token count over a hardcoded seq_len -- so at H=100 it
+            # published 3,200 where the global batch was 32, and published nonsense
+            # outright for any seq_len that is not 2048. Divide by the steps as well,
+            # and take the sequence length from the clusters, which know it.
+            seq_lens = {int(m[proto.SEQ_LEN]) for _, m in metrics if proto.SEQ_LEN in m}
+            if len(seq_lens) > 1:
+                logger.warning(
+                    "  >> clusters report different seq_len %s -- a token count is still "
+                    "comparable but a batch measured in sequences is not",
+                    sorted(seq_lens),
+                )
+            if steps_this_round > 0:
+                tokens_per_step = total / steps_this_round
+                wb_metrics["train/global_batch_tokens"] = tokens_per_step
+                if len(seq_lens) == 1:
+                    wb_metrics["train/global_batch_size"] = (
+                        tokens_per_step / next(iter(seq_lens))
+                    )
             if "tokens_per_s" in out:
                 wb_metrics["throughput/tokens_per_s_combined"] = out["tokens_per_s"]
             if "round_seconds" in out:
@@ -306,16 +346,30 @@ def build_metric_aggregators(
                 wb_metrics["train/lr"] = out["lr"]
             for n, m in metrics:
                 cid = str(m.get(proto.CLUSTER, "?"))
-                wb_metrics[f"cluster/{cid}/batch_size"] = n // 2048
-                wb_metrics[f"cluster/{cid}/batch_tokens"] = n
-                if "tokens_per_s" in m:
-                    ranks = 8 if "lumi" in cid.lower() else (4 if "snellius" in cid.lower() else 1)
-                    wb_metrics[f"cluster/{cid}/tps_per_rank"] = float(m["tokens_per_s"]) / ranks
+                cluster_steps = int(m.get(proto.STEPS, 0))
+                wb_metrics[f"cluster/{cid}/tokens_this_round"] = n
+                if cluster_steps > 0:
+                    wb_metrics[f"cluster/{cid}/batch_tokens"] = n / cluster_steps
+                    if proto.SEQ_LEN in m:
+                        wb_metrics[f"cluster/{cid}/batch_size"] = (
+                            n / cluster_steps / int(m[proto.SEQ_LEN])
+                        )
+                # The cluster's own rank count, not one inferred from its name. The old
+                # `8 if "lumi" in cid else 4 if "snellius" in cid else 1` was wrong for a
+                # partial allocation, a third site, and any --replica-suffixed id -- and
+                # it divided a real throughput figure by it.
+                ranks = int(m.get(proto.DP_DEGREE, 0))
+                if ranks > 0:
+                    wb_metrics[f"cluster/{cid}/dp_degree"] = ranks
+                    if "tokens_per_s" in m:
+                        wb_metrics[f"cluster/{cid}/tps_per_rank"] = (
+                            float(m["tokens_per_s"]) / ranks
+                        )
                 for k in ("tokens_per_s", "mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "power_watts", "grad_norm", "drift_ratio"):
                     if k in m:
                         wb_metrics[f"cluster/{cid}/{k}"] = float(m[k])
             try:
-                wandb_run.log(wb_metrics, step=global_step)
+                wandb_run.log(wb_metrics, step=wandb_step(global_step))
             except Exception as exc:
                 logger.warning("WandB log fit failed: %s", exc)
 
@@ -385,8 +439,12 @@ def build_metric_aggregators(
                 res = {"accuracy": pooled}
 
         if wandb_run is not None and res:
-            global_step = state["merge_round"] * 100
-            wb_eval = {}
+            # The same counter the training half advanced, so a round's held-out point
+            # lands on the same x as its training point. This was `merge_round * 100`,
+            # a literal H, which put them on different axes as soon as either assumption
+            # broke.
+            global_step = state["global_step"]
+            wb_eval = {STEP_METRIC: global_step}
             if "perplexity" in res:
                 wb_eval["eval/loss"] = res["eval_loss"]
                 wb_eval["eval/perplexity"] = res["perplexity"]
@@ -395,7 +453,11 @@ def build_metric_aggregators(
             elif "accuracy" in res:
                 wb_eval["eval/accuracy"] = res["accuracy"]
             try:
-                wandb_run.log(wb_eval, step=global_step)
+                # Flower calls aggregate_evaluate after aggregate_fit for the same
+                # round, so this is normally the *same* step the training half just
+                # logged; wandb merges a repeat at an equal step, and MonotonicStep
+                # only intervenes if the counter ever went backwards.
+                wandb_run.log(wb_eval, step=wandb_step(global_step))
             except Exception as exc:
                 logger.warning("WandB log eval failed: %s", exc)
 

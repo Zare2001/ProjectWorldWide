@@ -67,7 +67,11 @@ def _reject_pww_tokens(path: str):
         f"streamable text dataset. It is read directly by "
         f"pww.titan.darl_dataloader, so it belongs in [training] where the DARL "
         f"dataloader is active -- not in [validation], which uses torchtitan's "
-        f"text dataloader. Set validation.dataset to c4_test or c4_validation."
+        f"text dataloader. Set validation.dataset to 'c4_local' pointed at a staged "
+        f"copy of C4's validation split (scripts/titan/stage_c4.sh --split validation; "
+        f"run_train.sh selects it automatically when staged), or 'c4_test' for the "
+        f"bundled fixture -- noting that the fixture overlaps the C4 training files. "
+        f"'c4_validation' streams from the hub and does not work on compute nodes."
     )
 
 

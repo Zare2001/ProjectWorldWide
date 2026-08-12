@@ -1,4 +1,12 @@
 # Qwen3 0.6B on C4, DARL-leased, cross-site DiLoCo 1k-step run via Flower + FedMom.
+#
+# The short-run pair of configs/titan/qwen3_0.6b_c4_diloco.toml -- 1,000 steps, 10 outer
+# rounds at darl.inner_steps = 100 -- for validating a full central-plus-two-sites setup
+# inside one queue slot. See that file for why each setting is what it is.
+#
+# Its baseline is configs/titan/qwen3_0.6b_c4_central_1k.toml, which is this file with
+# flower.enable = false. Read that header before reading a chart with both runs on it:
+# equal steps is not equal tokens.
 
 [job]
 dump_folder = "./outputs/qwen3-0.6b-c4-diloco-1k"
@@ -54,6 +62,9 @@ train_timeout_seconds = 1800
 
 [validation]
 enable = true
+# The bundled fixture overlaps the C4 training files; run_train.sh upgrades this to the
+# real held-out split (c4_local) when $PWW_DATA_DIR/c4-validation is staged. See the 20k
+# config for the full note.
 dataset = "c4_test"
 dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
 freq = 100

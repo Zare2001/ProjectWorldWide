@@ -205,6 +205,46 @@ elif [[ "${DARL_FRESH}" == "1" ]]; then
          "PWW_FRESH_RUN=1 for a clean run, or pass this deliberately." >&2
 fi
 
+# A plausible-looking variable that this script has never read. Silently ignoring it is
+# the worst option available: it appears in a launch command next to DARL_FRESH=1, reads
+# as "and reset the model too", and the run then merges a brand-new epoch of data into
+# momentum accumulated against the previous one. Refuse instead, and name the real switch.
+if [[ -n "${FRESH_MODEL:-}" ]]; then
+    cat >&2 <<EOF
+ERROR: FRESH_MODEL is not a variable this script reads, and never has been. Setting it
+alongside DARL_FRESH=1 resets the lease table while KEEPING the global model and its
+momentum buffer -- which is the half-reset the PWW_FRESH_RUN switch exists to prevent.
+
+Use one switch for both stores:
+
+    PWW_FRESH_RUN=1 $0
+EOF
+    exit 2
+fi
+
+# Flower's round budget, overridable without editing the aggregator config.
+#
+# It bounds round *attempts*, not merges: a round in which every site was queued or killed
+# at walltime consumes a round number and advances nothing. So `training.steps /
+# darl.inner_steps` is the floor, not the answer -- at 20,000 steps and H=100 the config's
+# num-rounds: 200 has exactly zero margin, and a single unmerged round over a 72-hour
+# two-site run ends the server before the sites reach 20,000 steps. Too high costs nothing:
+# the clients disconnect when DARL runs dry or training.steps is reached.
+#
+#   NUM_ROUNDS=400 PWW_FRESH_RUN=1 ./scripts/central_node/start_central_services.sh
+#
+# An explicit CLI value beats the YAML, because apply_config_file folds the file in as
+# argparse *defaults*.
+NUM_ROUNDS_EXTRA=()
+if [[ -n "${NUM_ROUNDS:-}" ]]; then
+    if [[ ! "${NUM_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: NUM_ROUNDS=${NUM_ROUNDS} is not a positive integer" >&2
+        exit 2
+    fi
+    NUM_ROUNDS_EXTRA+=(--num-rounds "${NUM_ROUNDS}")
+    echo "num-rounds: ${NUM_ROUNDS} (overriding the aggregator config)"
+fi
+
 DARL_EXTRA=()
 if [[ "${DARL_FRESH}" == "1" ]]; then
     DARL_EXTRA+=(--fresh)
@@ -271,7 +311,8 @@ fi
 
 # 2. Start the blob store (blob transport only)
 SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
-              ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"})
+              ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"}
+              ${NUM_ROUNDS_EXTRA[@]+"${NUM_ROUNDS_EXTRA[@]}"})
 if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
     export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
     export WANDB_RUN_NAME="${WANDB_RUN_NAME:-central-aggregator}"
