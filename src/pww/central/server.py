@@ -286,8 +286,8 @@ def build_metric_aggregators(
                 "train/perplexity": out["perplexity"],
                 "train/cum_tokens": cum_tokens,
                 "train/tokens_this_round": total,
+                "train/global_batch_size": total // 2048,
                 "train/global_batch_tokens": total,
-                "train/global_batch_samples": total // 2048,
             }
             if "tokens_per_s" in out:
                 wb_metrics["throughput/tokens_per_s_combined"] = out["tokens_per_s"]
@@ -300,8 +300,8 @@ def build_metric_aggregators(
                 wb_metrics["train/lr"] = out["lr"]
             for n, m in metrics:
                 cid = str(m.get(proto.CLUSTER, "?"))
+                wb_metrics[f"cluster/{cid}/batch_size"] = n // 2048
                 wb_metrics[f"cluster/{cid}/batch_tokens"] = n
-                wb_metrics[f"cluster/{cid}/batch_samples"] = n // 2048
                 for k in ("tokens_per_s", "mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "power_watts", "grad_norm", "drift_ratio"):
                     if k in m:
                         wb_metrics[f"cluster/{cid}/{k}"] = float(m[k])
