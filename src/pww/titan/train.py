@@ -104,6 +104,38 @@ def main(argv: list[str] | None = None) -> int:
 
     if not flower_cfg.enable:
         logger.info("flower.enable is false -- running torchtitan's own train loop")
+
+        # Hook the metrics processor so central runs log under the same
+        # WandB keys (train/loss, train/perplexity, train/cum_tokens) as
+        # DiLoCo runs, enabling direct chart comparison.
+        import math
+
+        proc = getattr(trainer, "metrics_processor", None)
+        if proc is not None:
+            orig_log = proc.log
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            def _central_log_wrapper(
+                step, global_avg_loss, global_max_loss, grad_norm,
+                extra_metrics=None,
+            ):
+                if extra_metrics is None:
+                    extra_metrics = {}
+                cum_tok = int(getattr(trainer, "ntokens_seen", 0) * world_size)
+                if cum_tok > 0:
+                    extra_metrics["train/cum_tokens"] = cum_tok
+                if math.isfinite(global_avg_loss):
+                    extra_metrics["train/loss"] = float(global_avg_loss)
+                    extra_metrics["train/perplexity"] = float(
+                        math.exp(min(20.0, global_avg_loss))
+                    )
+                return orig_log(
+                    step, global_avg_loss, global_max_loss, grad_norm,
+                    extra_metrics=extra_metrics,
+                )
+
+            proc.log = _central_log_wrapper
+
         try:
             trainer.train()
         finally:
