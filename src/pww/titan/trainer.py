@@ -193,6 +193,15 @@ class FederatedTrainer:
         trainer = self.trainer
         trainer.checkpointer.load(step=self.job_config.checkpoint.load_step)
 
+        try:
+            from datetime import timedelta
+            from torchtitan.distributed.utils import set_pg_timeouts
+            timeout_sec = getattr(self.job_config.comm, "train_timeout_seconds", 1800)
+            if hasattr(trainer, "world_mesh") and trainer.world_mesh is not None:
+                set_pg_timeouts(timedelta(seconds=timeout_sec), trainer.world_mesh)
+        except Exception as exc:
+            logger.warning("Could not set process group timeouts: %s", exc)
+
         # Entered once for the whole federated run, not once per round: these
         # write trace files keyed by step, and re-entering them every round would
         # restart the profiler schedule on each one.
