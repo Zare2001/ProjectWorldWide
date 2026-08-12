@@ -257,6 +257,9 @@ fi
 # 2. Start the blob store (blob transport only)
 SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
               ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"})
+if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
+    SERVER_EXTRA+=(--enable-wandb)
+fi
 if [[ "${TRANSPORT}" == "blob" ]]; then
     mkdir -p "${BLOB_ROOT}" "${GLOBAL_STATE_DIR}"
     if [[ -f "${BLOB_PID_FILE}" ]] && kill -0 "$(cat "${BLOB_PID_FILE}")" 2>/dev/null; then

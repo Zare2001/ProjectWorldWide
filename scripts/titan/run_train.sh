@@ -55,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --dump) DUMP="$2"; shift 2 ;;
         --site) SITE_OVERRIDE="$2"; shift 2 ;;
         --replica) REPLICA="$2"; shift 2 ;;
+        --wandb) ENABLE_WANDB=1; shift ;;
         --) shift; break ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1 (use -- to pass flags to torchtitan)" >&2; exit 1 ;;
@@ -171,6 +172,17 @@ overrides=()
 [[ -n "${TOKENIZER}" ]] && overrides+=(--model.hf_assets_path "${TOKENIZER}")
 [[ -n "${SHARDS}" ]] && overrides+=(--training.dataset_path "${SHARDS}")
 [[ -n "${DUMP}" ]] && overrides+=(--job.dump_folder "${DUMP}")
+
+if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ "${PWW_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
+    overrides+=(--metrics.enable_wandb)
+fi
+
+for var in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_MODE WANDB_BASE_URL; do
+    if [[ -n "${!var:-}" ]]; then
+        export "SINGULARITYENV_${var}=${!var}"
+        export "APPTAINERENV_${var}=${!var}"
+    fi
+done
 
 # --- gradient accumulation: let a fast site fill the round instead of idling -----
 #
