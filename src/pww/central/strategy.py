@@ -609,14 +609,15 @@ if HAS_FLWR:
             the momentum state must not be round-tripped through float16 -- but nothing
             that size ever goes into a gRPC message.
             """
-            if self._wire_dtype is not None and self._wire_dtype != np.float32:
-                if self._wire_dtype == np.uint16:
+            wire_dtype = self._wire_dtype if self._wire_dtype is not None else np.uint16
+            if wire_dtype != np.float32:
+                if wire_dtype == np.uint16:
                     arrays = [
                         torch.from_numpy(layer).to(torch.bfloat16).view(torch.uint16).numpy()
                         for layer in arrays
                     ]
                 else:
-                    arrays = [layer.astype(self._wire_dtype) for layer in arrays]
+                    arrays = [layer.astype(wire_dtype) for layer in arrays]
             params = ndarrays_to_parameters(arrays)
             # gRPC's cap is hard: 2**31 - 1 bytes, and no setting raises it. Exceeding
             # it fails the *send*, which Flower reports as an ordinary round failure
