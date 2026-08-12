@@ -317,6 +317,24 @@ if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flo
     overrides+=(--flower.server_address "${CENTRAL}:${FLOWER_PORT}")
 fi
 
+if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ "${PWW_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
+    overrides+=(--metrics.enable_wandb)
+    export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
+    if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
+        if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flower\]/,/^\[/p' "${CONFIG}"); then
+            export WANDB_RUN_NAME="diloco-${SITE}"
+        else
+            export WANDB_RUN_NAME="central-${SITE}"
+        fi
+    fi
+    export SINGULARITYENV_WANDB_PROJECT="${WANDB_PROJECT}"
+    export SINGULARITYENV_WANDB_RUN_NAME="${WANDB_RUN_NAME}"
+    export SINGULARITYENV_WANDB_API_KEY="${WANDB_API_KEY:-}"
+    export APPTAINERENV_WANDB_PROJECT="${WANDB_PROJECT}"
+    export APPTAINERENV_WANDB_RUN_NAME="${WANDB_RUN_NAME}"
+    export APPTAINERENV_WANDB_API_KEY="${WANDB_API_KEY:-}"
+fi
+
 echo "=============================================================="
 pww_summary
 cat <<EOF

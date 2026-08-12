@@ -273,7 +273,9 @@ fi
 SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
               ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"})
 if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
-    SERVER_EXTRA+=(--enable-wandb)
+    export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
+    export WANDB_RUN_NAME="${WANDB_RUN_NAME:-central-aggregator}"
+    SERVER_EXTRA+=(--enable-wandb --wandb-project "${WANDB_PROJECT}" --wandb-run-name "${WANDB_RUN_NAME}")
 fi
 if [[ "${TRANSPORT}" == "blob" ]]; then
     mkdir -p "${BLOB_ROOT}" "${GLOBAL_STATE_DIR}"
