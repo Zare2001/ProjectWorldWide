@@ -513,6 +513,18 @@ class FederatedTrainer:
             return float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
         except Exception:                                             # noqa: BLE001
             try:
+                import subprocess
+                import torch
+                if torch.cuda.is_available():
+                    device_idx = torch.cuda.current_device()
+                    raw = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits", "-i", str(device_idx)],
+                        text=True, timeout=2.0
+                    )
+                    return float(raw.strip().splitlines()[0])
+            except Exception:                                         # noqa: BLE001
+                pass
+            try:
                 import glob
                 hwmon_paths = glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/power1_average")
                 if hwmon_paths:
