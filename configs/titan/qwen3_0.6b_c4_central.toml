@@ -24,16 +24,38 @@
 # is bound as the default x-axis precisely so the difference cannot be missed, and treat
 # the step axis as a statement about optimisation rather than about work done.
 #
-# For the compute-matched comparison -- same steps AND same tokens, which is the
-# baseline DiLoCo's own paper reports against -- raise the baseline's global batch to the
-# federation's with gradient accumulation. It needs no config change:
+# For the compute-matched comparison -- same steps AND same tokens per step, which is
+# the baseline DiLoCo's own paper reports against -- set the baseline's global batch to
+# the federation's 96 sequences. One variable, either site, no config change:
 #
-#     PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
-#         scripts/snellius/job_titan_central.sh          # 3 x 65,536 = 196,608
+#     PWW_GLOBAL_BATCH=96 sbatch --export=ALL,PWW_GLOBAL_BATCH \
+#         scripts/snellius/job_titan_central.sh    # 8 local x 4 ranks x 3 accum
+#     PWW_GLOBAL_BATCH=96 sbatch --export=ALL,PWW_GLOBAL_BATCH -A $PWW_ACCOUNT \
+#         scripts/lumi/job_titan_central.sh        # 6 local x 8 ranks x 2 accum
 #
-# Snellius is the site to run it on: 196,608 / 65,536 is exactly 3, while LUMI's
-# 196,608 / 131,072 = 1.5 is not an integer multiple. Recompute the factor if either
-# site's rank count changes -- run_train.sh prints the global batch it derived.
+# run_train.sh derives the microbatch/accumulation split itself and prints it --
+# lowering the microbatch where the target does not divide (LUMI's 64/step cannot
+# reach 96 by whole-multiplier accumulation alone). Accumulation is exact averaging,
+# so the split does not change the optimisation; the global batch is what the
+# optimiser sees. The run's name gains a -gb96 marker. PWW_GRAD_ACCUM remains for
+# "N x whatever this site does"; use one or the other, not both.
+#
+# The mechanism takes any target on any rank count; only the NUMBER is yours to
+# update when the federation changes. For k sites:
+#
+#     PWW_GLOBAL_BATCH = sum over sites of (dp_ranks x that site's local_batch_size)
+#
+#     Snellius + LUMI                     4x8 + 8x8       =  96
+#     ... + a third site with 4 GPUs      + 4x8           = 128
+#
+# Or skip the arithmetic: the aggregator logs the realized value per round as
+# train/global_batch_size, computed from what the clusters themselves report --
+# read one full-membership round off WandB and use that.
+#
+# Caveat on the word "matched": this matches the federation at k=2. Rounds where a
+# site was queued or crashed ran the federation at 64 or 32 sequences, and no baseline
+# setting can mirror membership churn after the fact -- the train/cum_tokens axis is
+# what absorbs it.
 #
 # Both comparisons are worth having and they answer different questions. The
 # step-matched one asks what a single replica achieves in the same number of steps; the

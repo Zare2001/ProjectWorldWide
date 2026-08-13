@@ -79,9 +79,13 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         self,
         federated: FederatedTrainer,
         initial_state: dict[str, torch.Tensor] | None = None,
+        control_group: Any | None = None,
     ) -> None:
         self.federated = federated
         self.trainer = federated.trainer
+        # The gloo group the command broadcasts ride on. See _broadcast for why this
+        # must not default to the NCCL process group.
+        self._control_group = control_group
         cfg = federated.job_config.flower
         self.wire_dtype = cfg.wire_dtype
         self.declared_transport = cfg.transport
@@ -485,17 +489,34 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         parameter list, or read a file the workers did not know about, the job would
         hang in a mismatched collective rather than fail. Only this small tuple crosses
         the process group -- never the weights.
+
+        Over the GLOO control group, never NCCL, and this is load-bearing. The workers
+        enter this broadcast the moment their phase ends and then wait for however long
+        the rest of the federation takes -- the fast site's wait at the round barrier is
+        the slow site's remaining phase plus the merge, which is unbounded by design.
+        A NCCL collective under the CUDA watchdog cannot wait like that: the default
+        process group's timeout is `comm.init_timeout_seconds` (300s), so a fast site
+        idling more than five minutes at the barrier was SIGABRTed by its own watchdog.
+        Observed on Snellius as `Watchdog caught collective operation timeout: BROADCAST,
+        NumelIn=1 ... 300027ms` in run_worker_loop -- rounds 2..25 each survived by
+        seconds, round 26 lost the race, and the whole job died mid-run. Commit 8d9a8e1
+        raised the mesh groups' timeouts to 1800s for exactly this symptom, but
+        broadcast_object_list without a group rides the DEFAULT group, which kept 300s.
+
+        gloo has no watchdog, carries this CPU-side tuple without touching a GPU, and
+        the group's own generous timeout still bounds a genuinely dead leader.
         """
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.broadcast_object_list(
-                [(command, has_parameters, gather_only, reference, write_full, global_step)], src=0
+                [(command, has_parameters, gather_only, reference, write_full, global_step)],
+                src=0, group=self._control_group,
             )
 
     def stop_workers(self) -> None:
         self._broadcast(CMD_STOP)
 
 
-def broadcast_stop() -> None:
+def broadcast_stop(control_group: Any | None = None) -> None:
     """Release the workers when rank 0 failed before it had a client to do it.
 
     `DiLoCoFlowerClient.__init__` and the transport ceiling check can both raise, and by
@@ -508,12 +529,19 @@ def broadcast_stop() -> None:
     values to unpack` the moment this fired -- on the one path whose entire job is to
     let them exit cleanly. A wedged rank 0 then produced a wedged job anyway, with the
     unpack error burying the real cause.
+
+    `control_group` must be the same group the workers are blocked on -- see
+    `DiLoCoFlowerClient._broadcast` for why that is the gloo group, not the default.
     """
     if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.broadcast_object_list([(CMD_STOP, False, False, "", False, -1)], src=0)
+        dist.broadcast_object_list(
+            [(CMD_STOP, False, False, "", False, -1)], src=0, group=control_group
+        )
 
 
-def run_worker_loop(federated: FederatedTrainer) -> None:
+def run_worker_loop(
+    federated: FederatedTrainer, control_group: Any | None = None
+) -> None:
     """What every rank but 0 does: mirror the leader's collectives, in the same order.
 
     The empty dict handed to `scatter_full_state` is the documented shape for a
@@ -524,7 +552,10 @@ def run_worker_loop(federated: FederatedTrainer) -> None:
     """
     while True:
         box: list[Any] = [None]
-        dist.broadcast_object_list(box, src=0)
+        # On the gloo control group: this wait spans the whole round barrier -- the slow
+        # site's remaining phase plus the merge -- and under NCCL the default group's
+        # 300s watchdog SIGABRTed the fast site mid-run. See _broadcast.
+        dist.broadcast_object_list(box, src=0, group=control_group)
         command, has_parameters, gather_only, reference, write_full, global_step = box[0]
 
         # Every rank owns an LR scheduler, so every rank has to be moved -- aligning only

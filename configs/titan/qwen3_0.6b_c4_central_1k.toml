@@ -12,8 +12,8 @@
 # Step-matched, not token-matched -- the same caveat as the 20k config, and the same fix.
 # Per optimiser step this baseline trains local_batch_size x seq_len x ranks tokens
 # (65,536 on 4 H100s, 131,072 on 8 GCDs) against the two-site federation's 196,608. Plot
-# on `train/cum_tokens`, WandB's default x-axis here, and use PWW_GRAD_ACCUM=3 on
-# Snellius for the compute-matched run. Full arithmetic in the 20k config's header.
+# on `train/cum_tokens`, WandB's default x-axis here, and use PWW_GLOBAL_BATCH=96 on
+# either site for the compute-matched run. Full arithmetic in the 20k config's header.
 
 [job]
 dump_folder = "./outputs/qwen3-0.6b-c4-central-1k"

@@ -620,19 +620,33 @@ So the two baselines are not even the same baseline as each other, and the feder
 has seen three times the Snellius baseline's tokens at the same step number. This is why
 WandB's default x-axis here is `train/cum_tokens` and not the step.
 
-For the **compute-matched** comparison — same steps *and* same tokens, which is the baseline
-DiLoCo's own paper reports against — raise the baseline's global batch to the federation's
-with gradient accumulation. No config change:
+For the **compute-matched** comparison — same steps *and* same tokens per step, which is the
+baseline DiLoCo's own paper reports against — set the baseline's global batch to the
+federation's 96 sequences. One variable, works on **both** sites, no config change:
 
 ```bash
-PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
-  scripts/snellius/job_titan_central.sh          # 3 × 65,536 = 196,608
+# Snellius:  8 local × 4 ranks × 3 accum = 96
+PWW_GLOBAL_BATCH=96 sbatch --export=ALL,PWW_GLOBAL_BATCH \
+  scripts/snellius/job_titan_central.sh
+
+# LUMI:      6 local × 8 ranks × 2 accum = 96
+PWW_GLOBAL_BATCH=96 sbatch --export=ALL,PWW_GLOBAL_BATCH -A "$PWW_ACCOUNT" \
+  scripts/lumi/job_titan_central.sh
 ```
 
-Snellius is the site for it: `196,608 / 65,536` is exactly 3, while LUMI's
-`196,608 / 131,072 = 1.5` is not an integer multiple. `run_train.sh` prints the global batch
-it derived — check that line rather than assuming the factor, and recompute it if either
-site's rank count changes.
+`run_train.sh` derives the microbatch/accumulation split itself and prints it, lowering the
+microbatch where the target does not divide — LUMI's 64/step cannot reach 96 by
+whole-multiplier accumulation, which is why the older `PWW_GRAD_ACCUM=3` recipe was
+Snellius-only. Accumulation is exact averaging, so the split does not change the
+optimisation; the global batch is what the optimiser sees. The run's derived WandB name
+gains a `-gb96` marker, and validation is untouched (`validation.local_batch_size` is its
+own field and does not follow the training microbatch).
+
+Two honest caveats. This matches the federation at **k=2**: rounds where a site was queued
+or crashed ran the federation at 64 or 32 sequences, and no baseline setting mirrors
+membership churn after the fact — `train/cum_tokens` absorbs it. And a matched baseline
+consumes ~3× the corpus of a plain Snellius baseline (1.92M windows, ~70%), the same as the
+DiLoCo run.
 
 Both comparisons are worth having. Step-matched asks what one replica achieves in the same
 number of steps; compute-matched asks what federating cost for the same amount of work.

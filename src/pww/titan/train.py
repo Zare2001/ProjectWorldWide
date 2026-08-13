@@ -216,6 +216,34 @@ def main(argv: list[str] | None = None) -> int:
     federated = FederatedTrainer(trainer, inner_steps=darl_cfg.inner_steps)
     rank = dist.get_rank() if dist.is_initialized() else 0
 
+    # The control-plane process group: the tiny command tuples rank 0 broadcasts to the
+    # workers, on GLOO rather than NCCL. The workers enter that broadcast the moment
+    # their phase ends and legitimately wait out the whole round barrier -- the slow
+    # site's remaining phase plus the merge -- and a NCCL collective cannot wait like
+    # that: the default group's CUDA watchdog runs at comm.init_timeout_seconds (300s),
+    # and a fast site idling longer at the barrier is SIGABRTed by its own watchdog.
+    # Observed killing Snellius at round 26 of the first 20k run, after 24 rounds that
+    # each survived by seconds. (Commit 8d9a8e1 raised the timeout for this exact
+    # symptom, but set_pg_timeouts touches the mesh groups and the command broadcast
+    # rode the default group.) gloo has no watchdog and carries CPU tuples without
+    # touching a GPU; its own timeout still bounds a genuinely dead leader, at 4x the
+    # round timeout so no legitimate barrier wait can reach it.
+    #
+    # Created on every rank, unconditionally before the rank-0/worker split:
+    # new_group is itself a collective.
+    control_pg = None
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        from datetime import timedelta
+
+        wait_budget = 4 * int(getattr(job_config.comm, "train_timeout_seconds", 1800) or 1800)
+        control_pg = dist.new_group(
+            backend="gloo", timeout=timedelta(seconds=wait_budget)
+        )
+        logger.info(
+            "control-plane broadcasts on gloo (timeout %ds); NCCL never waits at the "
+            "round barrier", wait_budget,
+        )
+
     try:
         # A collective; every rank, before anyone diverges.
         federated.start()
@@ -247,7 +275,8 @@ def main(argv: list[str] | None = None) -> int:
             # walltime instead of reporting the error.
             client = None
             try:
-                client = DiLoCoFlowerClient(federated, initial_state)
+                client = DiLoCoFlowerClient(federated, initial_state,
+                                            control_group=control_pg)
                 logger.info(
                     "connecting to Flower server at %s (H=%d inner steps per round)",
                     flower_cfg.server_address, darl_cfg.inner_steps,
@@ -263,9 +292,9 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     from .flower_client import broadcast_stop
 
-                    broadcast_stop()
+                    broadcast_stop(control_pg)
         else:
-            run_worker_loop(federated)
+            run_worker_loop(federated, control_group=control_pg)
     finally:
         federated.close()
         if dist.is_initialized():

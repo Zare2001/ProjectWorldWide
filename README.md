@@ -789,10 +789,28 @@ ranks corrupt it and die on SQLite errors. `task_wrapper.sh` gives each rank a
 node-local cache. The first few steps of any new shape are slow (seconds) while
 MIOpen autotunes kernels; this is normal and cached afterwards.
 
-**Partitions.** `dev-g` for a 3 h debug turnaround, `small-g` billed per-GPU with
-node sharing, `standard-g` billed per whole node (multi-node only). `small-g` is
-popular and frequently has zero idle nodes; check before waiting on a queue, and
-override the partition on any script rather than editing it:
+**Partitions**, and the choice is worth two minutes because `small-g` is a trap for a
+full-node job. Measured 2026-08-12:
+
+| | limit | nodes (alloc/idle/total) | allocation |
+|---|---|---|---|
+| `dev-g` | 3 h | 15 / 34 / 49 | shareable |
+| `small-g` | 72 h | 195 / **1** / 199 | shareable, billed per GCD |
+| `standard-g` | **48 h** | 2663 / 25 / 2728 | whole nodes, billed per node. **`MinNodes=1`** |
+
+`standard-g` is **not** multi-node only — an earlier version of this line said so, and it
+is what sends full-node jobs to the wrong queue. Since the titan job scripts ask for
+`--gpus-per-node=8 --cpus-per-task=56 --mem=480G`, i.e. an entire LUMI-G node, `small-g`'s
+node sharing is a benefit they never use — while `small-g` has ~200 nodes against
+`standard-g`'s ~2,700 and routinely shows **one** idle. Observed cost of that mistake: a
+10-hour queue wait for a job that `dev-g` would have started immediately.
+
+So: `dev-g` for anything under 3 h (the 1k rehearsal fits — LUMI runs ~3 s/step at 8 GCDs,
+so 1,000 steps is under an hour), `standard-g` for real runs up to 48 h, and `small-g` only
+when a job genuinely needs **more than 48 h** or genuinely wants a partial node.
+
+Check before waiting on a queue, and override the partition on any script rather than
+editing it:
 
 ```bash
 sinfo -p dev-g,small-g,standard-g -o "%.12P %.15l %.14F"   # A/Idle/Other/Total
@@ -1151,8 +1169,8 @@ Needs no central VM — the job brings up its own throwaway DARL coordinator on 
 
 ```bash
 sbatch scripts/snellius/job_titan_central.sh                    # step-matched
-PWW_GRAD_ACCUM=3 sbatch --export=ALL,PWW_GRAD_ACCUM \
-  scripts/snellius/job_titan_central.sh                         # compute-matched
+PWW_GLOBAL_BATCH=96 sbatch --export=ALL,PWW_GLOBAL_BATCH \
+  scripts/snellius/job_titan_central.sh                         # compute-matched (either site)
 ```
 
 #### Starting over
@@ -1230,10 +1248,11 @@ federation trains every site concurrently — per global optimiser step,
 | baseline, LUMI | 8 | 131,072 | ~2.62 B |
 | **DiLoCo, both sites** | **12** | **196,608** | **~3.93 B** |
 
-For the *compute-matched* baseline — same steps and same tokens, which is what DiLoCo's own
-paper reports against — raise the baseline's global batch with gradient accumulation:
-`PWW_GRAD_ACCUM=3` on Snellius, where `196,608 / 65,536` is exactly 3. Both comparisons are
-worth having and they answer different questions.
+For the *compute-matched* baseline — same steps and same tokens per step, which is what
+DiLoCo's own paper reports against — set `PWW_GLOBAL_BATCH=96` on **either** site:
+`run_train.sh` derives the microbatch/accumulation split itself (Snellius 8×4×3, LUMI
+6×8×2, both exactly 96) and marks the run name with `-gb96`. Both comparisons are worth
+having and they answer different questions.
 
 **WandB.** Off unless `PWW_WANDB=1`, `ENABLE_WANDB=1` or `WANDB_PROJECT` is set. Three runs
 land in one project: `central-<site>`, `diloco-<site>` and `central-aggregator`. The default

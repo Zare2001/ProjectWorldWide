@@ -246,6 +246,65 @@ elif [[ ! "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "WARNING: PWW_GRAD_ACCUM=${GRAD_ACCUM} is not a positive integer; ignoring" >&2
 fi
 
+# --- PWW_GLOBAL_BATCH: match a baseline's batch to the federation's ---------------
+#
+# The absolute counterpart of PWW_GRAD_ACCUM's multiplier, and the difference matters on
+# LUMI. The two-site federation optimises at 96 sequences per step (12 ranks x 8), and a
+# baseline is only compute-matched to it if it reaches the SAME 96. Snellius (4 ranks x 8
+# = 32/step) gets there with a x3 multiplier; LUMI (8 ranks x 8 = 64/step) would need
+# x1.5, which gradient accumulation cannot express. Reaching an absolute target sometimes
+# requires lowering the microbatch as well -- 96 on 8 ranks is 4 x 8 x accum 3, or
+# 6 x 8 x accum 2 -- and that is a decision this script can make and PWW_GRAD_ACCUM
+# cannot. Accumulation is exact averaging, so the microbatch size does not change the
+# optimisation; the global batch is what the optimiser sees.
+#
+#   PWW_GLOBAL_BATCH=96 sbatch ... job_titan_central.sh        # either site, same number
+#
+# The chosen microbatch is the LARGEST one <= the config's that divides the target on
+# this rank count: fewer accumulation steps and better utilisation, and validation is
+# unaffected either way -- validation.local_batch_size is its own field (torchtitan
+# default 8) and does not follow training.local_batch_size.
+#
+# Honest caveat, so the label is not oversold: this matches the federation's k=2
+# geometry. Rounds where a site was queued or crashed ran the federation at 32 or 64
+# sequences, and no baseline setting can mirror membership churn after the fact. The
+# train/cum_tokens axis absorbs exactly that.
+if [[ -n "${PWW_GLOBAL_BATCH:-}" ]]; then
+    if [[ "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]] && (( GRAD_ACCUM > 1 )); then
+        echo "ERROR: PWW_GLOBAL_BATCH and PWW_GRAD_ACCUM both set -- they are two ways" \
+             "to choose the same quantity. Use PWW_GLOBAL_BATCH alone." >&2
+        exit 1
+    fi
+    if [[ ! "${PWW_GLOBAL_BATCH}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: PWW_GLOBAL_BATCH=${PWW_GLOBAL_BATCH} is not a positive integer" >&2
+        exit 1
+    fi
+    gb_lbs="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}" \
+              | cut -d= -f2 | tr -d ' ')"
+    if [[ ! "${gb_lbs}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: PWW_GLOBAL_BATCH set but local_batch_size could not be read from" \
+             "${CONFIG}" >&2
+        exit 1
+    fi
+    if (( PWW_GLOBAL_BATCH % NPROC != 0 )); then
+        echo "ERROR: PWW_GLOBAL_BATCH=${PWW_GLOBAL_BATCH} is not divisible by this" \
+             "site's ${NPROC} ranks -- no microbatch can reach it exactly." >&2
+        exit 1
+    fi
+    gb_pick=0
+    for (( cand=gb_lbs; cand>=1; cand-- )); do
+        if (( PWW_GLOBAL_BATCH % (cand * NPROC) == 0 )); then gb_pick=${cand}; break; fi
+    done
+    gb_accum=$(( PWW_GLOBAL_BATCH / (gb_pick * NPROC) ))
+    overrides+=(--training.global_batch_size "${PWW_GLOBAL_BATCH}")
+    if (( gb_pick != gb_lbs )); then
+        overrides+=(--training.local_batch_size "${gb_pick}")
+    fi
+    echo "global batch: ${PWW_GLOBAL_BATCH} sequences/step =" \
+         "${gb_pick} local x ${NPROC} ranks x ${gb_accum} accumulation" \
+         "(config microbatch ${gb_lbs}$( (( gb_pick != gb_lbs )) && echo ", lowered to divide the target"))"
+fi
+
 # --- validation, made identical across sites AND actually held out ----------
 #
 # The held-out loss is the only cross-site check there is: every cluster evaluates the
@@ -344,8 +403,14 @@ fi
 
 VAL_WINDOWS="${PWW_VAL_WINDOWS:-512}"
 if [[ "${VAL_WINDOWS}" != "0" ]]; then
-    val_batch="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}" \
+    # validation.local_batch_size, NOT training's. The validator's dataloader has its
+    # own batch field (torchtitan default 8); this used to grep the [training] value,
+    # which was only correct because both happened to be 8 -- and PWW_GLOBAL_BATCH now
+    # lowers the training microbatch on purpose, which must not skew the eval geometry.
+    val_batch="$(sed -n '/^\[validation\]/,/^\[/p' "${CONFIG}" \
+                 | grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' \
                  | cut -d= -f2 | tr -d ' ')"
+    val_batch="${val_batch:-8}"
     if [[ "${val_batch}" =~ ^[1-9][0-9]*$ ]]; then
         per_step=$(( val_batch * NPROC ))
         val_steps=$(( VAL_WINDOWS / per_step ))
@@ -418,10 +483,21 @@ if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ "${PWW_WANDB:-0}" == "1" ]] || [[ -n 
     export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
     if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
         if grep -qE '^[[:space:]]*enable[[:space:]]*=[[:space:]]*true' <(sed -n '/^\[flower\]/,/^\[/p' "${CONFIG}"); then
-            export WANDB_RUN_NAME="diloco-${SITE}${REPLICA:+-${REPLICA}}"
+            wandb_base="diloco-${SITE}${REPLICA:+-${REPLICA}}"
         else
-            export WANDB_RUN_NAME="central-${SITE}${REPLICA:+-${REPLICA}}"
+            wandb_base="central-${SITE}${REPLICA:+-${REPLICA}}"
         fi
+        # A batch-matched baseline says so in its name (central-lumi-gb96-...), so the
+        # matched and plain baselines are distinguishable in the run list.
+        wandb_base="${wandb_base}${PWW_GLOBAL_BATCH:+-gb${PWW_GLOBAL_BATCH}}"
+        # The Slurm job id in the name, so a requeue or resubmit shows up as its own
+        # run instead of a second line under an identical name. Observed: a site that
+        # crashed mid-run and was resubmitted left two runs both called
+        # "diloco-snellius" in one project, distinguishable only by opening each
+        # run's config. With the id, the name also maps straight back to the job log
+        # (logs/pww-<site>-titan-<jobid>.out) and to `sacct -j <jobid>`.
+        # Absent outside an allocation, so a login-node run keeps the clean name.
+        export WANDB_RUN_NAME="${wandb_base}${SLURM_JOB_ID:+-${SLURM_JOB_ID}}"
     fi
     # torchtitan's WandBLogger reads the entity from WANDB_TEAM; pww.central.server
     # reads WANDB_ENTITY. Setting only one of them therefore puts the sites and the
