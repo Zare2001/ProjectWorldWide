@@ -407,9 +407,15 @@ if [[ "${VAL_WINDOWS}" != "0" ]]; then
     # own batch field (torchtitan default 8); this used to grep the [training] value,
     # which was only correct because both happened to be 8 -- and PWW_GLOBAL_BATCH now
     # lowers the training microbatch on purpose, which must not skew the eval geometry.
+    #
+    # The `|| true` is load-bearing under `set -euo pipefail`: no shipped config sets
+    # local_batch_size under [validation] (defaulting to 8 is the point), grep with no
+    # match exits 1, and a failing pipeline inside an assignment kills the whole script
+    # -- silently, before the summary banner. Both LUMI jobs of the first
+    # 96BatchSize submission died exactly here, seconds after starting.
     val_batch="$(sed -n '/^\[validation\]/,/^\[/p' "${CONFIG}" \
                  | grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' \
-                 | cut -d= -f2 | tr -d ' ')"
+                 | cut -d= -f2 | tr -d ' ' || true)"
     val_batch="${val_batch:-8}"
     if [[ "${val_batch}" =~ ^[1-9][0-9]*$ ]]; then
         per_step=$(( val_batch * NPROC ))
