@@ -64,7 +64,10 @@ mkdir -p "${STATE_DIR}"
 DARL_PID_FILE="${STATE_DIR}/darl.pid"
 FLOWER_PID_FILE="${STATE_DIR}/flower.pid"
 BLOB_PID_FILE="${STATE_DIR}/blob.pid"
-VENV_DIR="${STATE_DIR}/.venv"
+# Overridable so parallel stacks (each with its own PWW_OUTPUT_DIR) can share the one
+# venv that is already installed, instead of pip-installing torch+flwr 1.2 GiB per stack:
+#   VENV_DIR=/data/thomasistriplet/zpalanciya/runs/central/.venv
+VENV_DIR="${VENV_DIR:-${STATE_DIR}/.venv}"
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
 
 echo "========================================================="

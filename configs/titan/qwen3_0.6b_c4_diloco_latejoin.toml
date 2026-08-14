@@ -1,0 +1,150 @@
+# Qwen3 0.6B on C4 -- the LATE-JOIN arm of the 20k elasticity comparison.
+#
+# Identical to configs/titan/qwen3_0.6b_c4_diloco.toml (read that header first) except
+# for its own dump_folder and the membership schedule this arm exists to measure:
+#
+#   snellius   from round 1, alone for the first half. Solo rounds are DiLoCo with
+#              k=1 and take the full outer step (eta 1.0; see
+#              configs/central_aggregator_titan.yaml on --no-solo-full-step).
+#   lumi       submitted fresh (PWW_FRESH_RUN=1) when the aggregator reaches global
+#              step ~10,000 (round ~100). configure_fit hands it the current global
+#              weights before its first step, so it cannot contribute an update from a
+#              freshly-initialised model -- but its OWN LR schedule starts at local
+#              step 0, so it warms up (200 steps = 2 rounds) and then tracks the
+#              schedule ~10k steps behind snellius. That cold start is part of what
+#              this arm measures, not a defect to correct.
+#
+# Its central stack: DARL 29530 / Flower 29531, PWW_OUTPUT_DIR=<scratch>/runs-latejoin,
+# and NUM_ROUNDS=200 exactly -- the server must stop with snellius at round 200, or the
+# late joiner (local step ~10,000 of 20,000) would keep training solo rounds past the
+# point every other arm stops. Snellius spans the whole run, so every attempt merges
+# and the cap is exact.
+# See RUNBOOK.md "Parallel experiments" for the stack table and submission lines.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-diloco-latejoin"
+description = "Qwen3 0.6B C4 cross-site DiLoCo, late-join arm (lumi joins at ~10k)"
+# Adds the [darl] and [flower] sections to torchtitan's JobConfig.
+custom_config_module = "pww.titan.config"
+
+[experimental]
+# Registers the pww_qwen3 train spec and the pww dataset entries.
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+# Overridden by run_train.sh with the site's tokenizer directory.
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+eps = 1e-8
+
+[lr_scheduler]
+# Warmup matters more here than in a single-site run. Every outer round replaces
+# the local weights with the FedMom average, so an un-warmed high LR in the first
+# steps after a replacement amplifies the discontinuity instead of settling into
+# it. The schedule is over *global* steps and survives outer rounds, unlike
+# train_llm_flower.py which had no schedule at all and rebuilt AdamW from scratch
+# every phase.
+warmup_steps = 200
+decay_ratio = 0.1
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+# Total optimiser steps across the whole run, not per round. With
+# darl.inner_steps = 100 this is 200 outer rounds. The late joiner never reaches this
+# number -- it contributes ~100 rounds -- and must not: the run ends when the SERVER
+# closes at NUM_ROUNDS=200, and this per-site cap stays at 20000 so both sites share
+# one LR-schedule horizon.
+steps = 20000
+max_norm = 1.0
+# 'pww_tokens' selects the DARL-leased dataloader over pre-tokenised shards.
+# dataset_path is overridden by run_train.sh with the site's shard directory.
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+# 1 = pure FSDP2 over every rank in the job, which is what a 0.6B model wants:
+# it fits comfortably sharded and tensor parallelism would add collectives for
+# nothing. Raise tensor_parallel_degree only once a flavor stops fitting.
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+# 'selective' trades a little recompute for a lot of activation memory, and is
+# what makes the larger flavors fit at seq_len 2048 at all.
+mode = "selective"
+
+[checkpoint]
+enable = true
+# Saved after every outer aggregation round (H=100). DARL commits are triggered
+# immediately on every round alongside checkpoint creation.
+interval = 100
+last_save_model_only = false
+# Keep only the 2 latest checkpoints on disk, automatically deleting older ones.
+keep_latest_k = 2
+
+[comm]
+# Generous relative to a single-site run: the outer step gathers a full parameter
+# set and pushes it over the WAN, so a rank can legitimately sit in a collective
+# for far longer than any intra-node operation would take.
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+# Not pww_tokens: the shards are the training partition, and validating on them
+# would report training loss. See qwen3_0.6b_c4_diloco.toml for why the bundled
+# c4_test fixture is NOT held out and how run_train.sh upgrades this to the real
+# C4 validation split (dataset c4_local) whenever $PWW_DATA_DIR/c4-validation is
+# staged -- both values below are overridden by run_train.sh, and have to be.
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+# IGNORED with flower.enable = true: the central node drives evaluation, once per
+# round. Left only so the config is runnable without Flower.
+freq = 500
+steps = 20
+
+[fault_tolerance]
+# torchft is deliberately off: Flower + FedMom does the outer step here, so
+# torchft's own DiLoCo/lighthouse machinery would be a second, conflicting
+# implementation of the same thing. With this false, FTManager short-circuits and
+# torchft is never imported -- which is why it is not a dependency of this repo.
+enable = false
+
+[darl]
+# url/site are supplied per site by run_train.sh (pass PWW_DARL_PORT=29530 at sbatch
+# so they point at THIS experiment's coordinator, not the default stack's).
+url = ""
+site = ""
+# H. One lease covers exactly one phase, so there is zero coordinator traffic
+# while the GPUs are busy and a lease boundary lands where the ranks are already
+# synchronised for the outer step.
+inner_steps = 100
+# 1024 windows = ~2M tokens per leasable block at seq_len 2048.
+block_size = 1024
+# 0 = derive from inner_steps and the batch geometry (darl.space.blocks_for_phase).
+blocks_per_phase = 0
+epochs = 1
+# Must be identical on every site; BlockSpace.digest turns a mismatch into a
+# registration error rather than two clusters silently training the same tokens.
+space_seed = 42
+
+[flower]
+enable = true
+# server_address is supplied by run_train.sh (pass PWW_FLOWER_PORT=29531 at sbatch).
+server_address = ""
+# float16 halves WAN traffic and keeps a 0.6B parameter set (1.2 GiB) inside the
+# 2 GiB gRPC message cap. The central node keeps its momentum state and the
+# authoritative global weights in float32 regardless (see central/strategy.py).
+transport = "inline"
+wire_dtype = "bfloat16"

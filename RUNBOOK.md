@@ -757,6 +757,74 @@ PWW_FRESH_RUN=1 ENABLE_WANDB=1 NUM_ROUNDS=400 WANDB_PROJECT=<20k project> \
 
 ---
 
+## Part 3c — parallel experiments: several stacks on one VM
+
+One experiment = one full stack — its own DARL coordinator, its own Flower aggregator
+(and blob store, if blob transport), its own `PWW_OUTPUT_DIR`. Nothing is shared between
+stacks: not the lease table, not the global model, not the token. A 0.6B inline stack
+costs the VM ~5 GiB of steady RAM, ~16 GiB of disk (fp32 global + momentum + two
+ephemeral round checkpoints) and one CPU-burst per merge, so a 16-core/62G VM runs three
+comfortably — budget the disk before adding one.
+
+The elasticity comparison uses this layout:
+
+| arm      | config (sites)                    | DARL  | Flower | `PWW_OUTPUT_DIR` (VM)      | membership                          |
+|----------|-----------------------------------|-------|--------|----------------------------|-------------------------------------|
+| full     | `qwen3_0.6b_c4_diloco.toml`       | 29510 | 29511  | `<scratch>/runs`           | both sites, rounds 1–200            |
+| churn    | `..._diloco_churn.toml`           | 29520 | 29521  | `<scratch>/runs-churn`     | lumi leaves ~5k, rejoins ~15k       |
+| latejoin | `..._diloco_latejoin.toml`        | 29530 | 29531  | `<scratch>/runs-latejoin`  | snellius solo, lumi joins ~10k      |
+
+The membership choreography — what to scancel or submit when, and why the churn/latejoin
+servers take `NUM_ROUNDS=200` exactly while the full arm keeps 400 — is in each config's
+header. The firewall needs inbound TCP on every stack's ports (29510–29532 covers the
+table, blob reserves included).
+
+VM, per stack. `AGGREGATOR_CONFIG` and `NUM_SAMPLES`/`BLOCK_SIZE`/`SEED` are **not**
+optional for a new stack: a fresh `PWW_OUTPUT_DIR` has no `launch.env`/`space.env` to
+remember them, so the silent defaults would be the ResNet aggregator (min-clients 2,
+momentum 0.0) over a 50,000-window block space. `VENV_DIR` points every stack at the one
+venv that is already installed:
+
+```bash
+PWW_OUTPUT_DIR=<scratch>/runs-churn \
+DARL_PORT=29520 FLOWER_PORT=29521 BLOB_PORT=29522 \
+VENV_DIR=<scratch>/runs/central/.venv \
+PWW_FRESH_RUN=1 NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+AGGREGATOR_CONFIG=configs/central_aggregator_titan.yaml \
+NUM_ROUNDS=200 ENABLE_WANDB=1 WANDB_PROJECT=<project> \
+  ./scripts/central_node/start_central_services.sh
+```
+
+`stop_central_services.sh` and `status_central_services.sh` take the same
+`PWW_OUTPUT_DIR` + port variables; a bare stop only ever touches the default stack.
+
+Each stack generates its own token (`<PWW_OUTPUT_DIR>/darl/token`) — deliberate: a job
+submitted with the wrong port pair fails the token probe on the login node instead of
+silently joining the wrong experiment. The Flower port has **no** auth, so the one
+discipline the operator owes this layout is that `PWW_DARL_PORT`/`PWW_FLOWER_PORT`
+always move as a pair.
+
+Sites, per experiment, everything at sbatch and nothing edited:
+
+```bash
+sbatch --export=ALL,CONFIG=configs/titan/qwen3_0.6b_c4_diloco_churn.toml,PWW_DARL_PORT=29520,PWW_FLOWER_PORT=29521,DARL_TOKEN="<that stack's token>",PWW_FRESH_RUN=1,ENABLE_WANDB=1,WANDB_PROJECT=<project> \
+  --time=40:00:00 scripts/snellius/job_titan_diloco.sh
+```
+
+Concurrent jobs at one site need no `--replica` here: the per-experiment configs have
+distinct dump folders, and DARL cluster ids can only collide within a single
+coordinator, which parallel stacks never share. `--replica` remains the tool for two
+jobs of the SAME experiment at one site.
+
+Timing a leave or a join: watch the arm's aggregator — its wandb run or
+`grep -o 'global_step=[0-9]*' <PWW_OUTPUT_DIR>/central/flower.log | tail -1` on the VM —
+and fire the scancel/sbatch on the site when it crosses the mark. DARL's `/status`
+`committed` count is NOT a step proxy under churn: windows-per-step changes with
+membership. Submit joins ~500 steps early to absorb the queue wait; "around step N" is
+the honest resolution of this experiment on shared queues.
+
+---
+
 ## Part 4 — watch it
 
 ```bash
