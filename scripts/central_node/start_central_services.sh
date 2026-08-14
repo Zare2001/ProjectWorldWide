@@ -86,9 +86,18 @@ echo " State Dir:   ${STATE_DIR}"
 echo "========================================================="
 
 # 0. Setup Environment: uv -> venv -> lightweight venv fallback
+#
+# Every python below runs with -P, and it is load-bearing: this script is invoked from
+# the repo root, the repo root contains a `wandb/` DATA directory (the SDK's local run
+# files), and `python -m`/-c put the CWD on sys.path -- so a bare `import wandb` finds
+# that directory as an empty namespace package. The dependency check then "passes",
+# the daemon starts, and every wandb.init fails at runtime with
+# "module 'wandb' has no attribute 'init'" -- an aggregator that runs a whole campaign
+# while logging nothing. -P drops the CWD entry; the venv's own site-packages and
+# PYTHONPATH (src/) are unaffected.
 PYTHON_BIN="python3"
 
-if ! "${VENV_DIR}/bin/python3" -c "import flwr, torch, wandb" 2>/dev/null; then
+if ! "${VENV_DIR}/bin/python3" -P -c "import flwr, torch, wandb" 2>/dev/null; then
     echo "Installing Flower, PyTorch & WandB into ${VENV_DIR}..."
     if command -v uv >/dev/null 2>&1; then
         echo "Using uv..."
@@ -319,6 +328,9 @@ SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
 if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
     export WANDB_PROJECT="${WANDB_PROJECT:-pww-diloco-1k}"
     export WANDB_RUN_NAME="${WANDB_RUN_NAME:-central-aggregator}"
+    # Per-stack, not the CWD: parallel stacks otherwise interleave their run files in
+    # one repo-root wandb/ -- the very directory the -P comment above is about.
+    export WANDB_DIR="${WANDB_DIR:-${STATE_DIR}}"
     SERVER_EXTRA+=(--enable-wandb --wandb-project "${WANDB_PROJECT}" --wandb-run-name "${WANDB_RUN_NAME}")
 fi
 if [[ "${TRANSPORT}" == "blob" ]]; then
@@ -327,7 +339,7 @@ if [[ "${TRANSPORT}" == "blob" ]]; then
         echo "Blob store already running (PID $(cat "${BLOB_PID_FILE}"))."
     else
         echo "Starting blob store on port ${BLOB_PORT} (root ${BLOB_ROOT})..."
-        nohup "${PYTHON_BIN}" -m pww.central.blobstore \
+        nohup "${PYTHON_BIN}" -P -m pww.central.blobstore \
             --port "${BLOB_PORT}" \
             --root "${BLOB_ROOT}" \
             --token "${DARL_TOKEN:-}" > "${STATE_DIR}/blob.log" 2>&1 &
@@ -357,7 +369,7 @@ else
         exit 1
     fi
     echo "Starting Flower Aggregator Server on port ${FLOWER_PORT} (${AGGREGATOR_CONFIG})..."
-    nohup "${PYTHON_BIN}" -m pww.central.server \
+    nohup "${PYTHON_BIN}" -P -m pww.central.server \
         --config "${AGGREGATOR_CONFIG}" \
         --port "${FLOWER_PORT}" \
         "${SERVER_EXTRA[@]}" > "${STATE_DIR}/flower.log" 2>&1 &
