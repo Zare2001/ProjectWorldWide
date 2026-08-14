@@ -193,8 +193,9 @@ commands** — including first-time setup, which this omits.
 | single-site DiLoCo (no WAN) | [src/pww/diloco.py](src/pww/diloco.py) — same algorithm as a collective inside one allocation |
 
 Step-by-step commands are in **[RUNBOOK.md](RUNBOOK.md)**, the reference behind them in
-**[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**, and the torchtitan environment
-requirements in **[scripts/titan/README.md](scripts/titan/README.md)**.
+**[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**, the torchtitan environment
+requirements in **[scripts/titan/README.md](scripts/titan/README.md)**, and bringing a
+third machine into the federation in **[ADDING_A_CLUSTER.md](ADDING_A_CLUSTER.md)**.
 
 ## Layout
 

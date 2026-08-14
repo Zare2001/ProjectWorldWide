@@ -886,6 +886,10 @@ as a real directory. `ln -sfn` would put the link *inside* it — producing
 
 ### Adding a third site
 
+> The step-by-step version of this section, including the corpus/tokenizer sync contract
+> and how to build `scripts/<name>/`, is **[ADDING_A_CLUSTER.md](ADDING_A_CLUSTER.md)**.
+> What follows is the summary.
+
 There is no per-site deployment script to write, and no code to change. A site is
 one file, `sites/<name>.sh`, which must define:
 
@@ -945,9 +949,9 @@ python3 tests/test_federation.py
 
 | suite | checks | covers |
 |---|---|---|
-| `test_darl.py` | 45 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
-| `test_titan.py` | 21 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec including the bfloat16 bit-pattern hop, the scatter key set that must not include non-persistent buffers, config feasibility |
-| `test_federation.py` | 26 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)` |
+| `test_darl.py` | 47 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
+| `test_titan.py` | 22 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec including the bfloat16 bit-pattern hop, the scatter key set that must not include non-persistent buffers, config feasibility |
+| `test_federation.py` | 43 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)` |
 | `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
 | `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
 

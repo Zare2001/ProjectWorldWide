@@ -761,10 +761,35 @@ PWW_FRESH_RUN=1 ENABLE_WANDB=1 NUM_ROUNDS=400 WANDB_PROJECT=<20k project> \
 
 One experiment = one full stack — its own DARL coordinator, its own Flower aggregator
 (and blob store, if blob transport), its own `PWW_OUTPUT_DIR`. Nothing is shared between
-stacks: not the lease table, not the global model, not the token. A 0.6B inline stack
-costs the VM ~5 GiB of steady RAM, ~16 GiB of disk (fp32 global + momentum + two
-ephemeral round checkpoints) and one CPU-burst per merge, so a 16-core/62G VM runs three
-comfortably — budget the disk before adding one.
+stacks: not the lease table, not the global model, not the token.
+
+**Budget the RAM by the merge peak, not the steady state.** Measured at 0.6B inline
+(709.4M params, so one fp32 copy is 2.64 GiB):
+
+| per stack | 1 contributor | 2 contributors |
+|---|---|---|
+| steady resident — global + momentum | 5.3 GiB | 5.3 GiB |
+| **peak during `aggregate_fit`** | **~15 GiB** | **~19 GiB** |
+| disk at steady state | 31.7 GiB | 31.7 GiB |
+
+The peak is what matters and it is ~3.5x the steady figure: Flower holds every
+contributor's wire payload (bf16, so 1.32 GiB each), then `aggregate_fit` converts and
+scales one at a time in fp32, on top of the resident global and momentum plus an fp32
+accumulator. Three two-site stacks therefore want **~57 GiB of headroom**, not ~15.
+
+Sizing a VM by the steady number is not a theoretical risk: on a 32 GiB box three 0.6B
+stacks were SIGKILLed by the OOM killer twice in one afternoon, staggered minutes apart,
+each dying in or just after a checkpoint write — no traceback, because the kernel does
+not leave one. If your aggregators disappear silently with the last log line mid-round,
+suspect this before anything else.
+
+Disk is `keep_ephemeral 2 + keep_persistent 4` = **six** checkpoints x 5.29 GiB, not two
+— so ~31.7 GiB per stack once `persist_every=5` has filled the persistent slots, which
+happens by round 20. Three stacks is ~95 GiB. Check `df` at round 20, not round 5, or the
+early figure will reassure you at half the true steady state.
+
+CPU: one burst per merge, ~25 s of a ~170 s round. With several stacks on one box set
+`OMP_NUM_THREADS` per stack rather than letting each spawn one thread per core.
 
 The elasticity comparison uses this layout:
 
