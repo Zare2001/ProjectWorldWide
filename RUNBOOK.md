@@ -819,9 +819,31 @@ jobs of the SAME experiment at one site.
 Timing a leave or a join: watch the arm's aggregator — its wandb run or
 `grep -o 'global_step=[0-9]*' <PWW_OUTPUT_DIR>/central/flower.log | tail -1` on the VM —
 and fire the scancel/sbatch on the site when it crosses the mark. DARL's `/status`
-`committed` count is NOT a step proxy under churn: windows-per-step changes with
+`committed` count is NOT a general step proxy under churn: windows-per-step changes with
 membership. Submit joins ~500 steps early to absorb the queue wait; "around step N" is
 the honest resolution of this experiment on shared queues.
+
+Or let the login node do the watching: each event sits in a fixed-membership regime,
+where a committed-block threshold IS a step threshold, and `scripts/elastic_watch.sh`
+polls `/status` (curl + that stack's token, from anywhere) and fires a command once when
+it crosses. Its header carries the threshold table — 470 ≈ step 5,000 for the churn
+leave, 766 ≈ 14,500 for the rejoin, 297 ≈ 9,500 for the late join — and the arithmetic
+behind it. Launched on LUMI right after the initial submissions, all three events run
+unattended:
+
+```bash
+nohup scripts/elastic_watch.sh --url http://145.38.206.143:29520 --token "$TOK_CHURN" \
+  --at-committed 470 -- scancel -n pww-lumi-titan-churn > watch-churn-leave.log 2>&1 &
+nohup scripts/elastic_watch.sh --url http://145.38.206.143:29520 --token "$TOK_CHURN" \
+  --at-committed 766 -- sbatch <the churn leg-2 submission> > watch-churn-rejoin.log 2>&1 &
+nohup scripts/elastic_watch.sh --url http://145.38.206.143:29530 --token "$TOK_LATE" \
+  --at-committed 297 -- sbatch <the latejoin submission> > watch-latejoin.log 2>&1 &
+```
+
+The fired sbatch inherits the launching shell, so export `WANDB_API_KEY` (and set the
+`TOK_*` variables) before launching the watchers. If a login-node reap kills one, its
+log just stops: relaunch it — scancel is idempotent and a duplicate sbatch is visible
+in `squeue`, not silent corruption.
 
 ---
 
