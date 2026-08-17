@@ -45,6 +45,16 @@ qsr-warmup-steps: 300
 jensen-lo: 0.015
 jensen-hi: 0.06
 
+# Observe the gauge but do not move H for the first N two-site rounds. Those
+# rounds do not satisfy the gauge's premise: the replicas are not yet in one
+# linearly connected basin, and a site that just joined carries colder optimiser
+# moments than the incumbent. The first DCLT attempt read +0.4048 then +0.1286
+# there, took two 30% cuts, floored the multiplier at 0.5 -- and the very next
+# ordinary round read -0.0571, well inside the band. In band the multiplier now
+# also relaxes back toward 1.0, so a transient cut heals instead of pinning H at
+# the floor for the whole stable-LR phase.
+jensen-warmup-rounds: 5
+
 # Every 5th merge the evaluate phase scores the PLAIN average (theta_bar)
 # instead of the momentum-stepped global, logged as jensen/pure_* -- the
 # uncontaminated harvest measurement. The gap between jensen/pure_gap and the
