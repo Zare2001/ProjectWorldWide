@@ -152,6 +152,34 @@ squeue --me
 
 Do NOT cancel `pww-lumi-central` (the LUMI baseline) while clearing anything.
 
+**Auto-follow: submit LUMI the moment Snellius starts.** LUMI cannot see
+Snellius's queue, but the coordinator sees Snellius the instant its job
+registers — `scripts/follow_watch.sh` polls `/status` for that and fires once
+(elastic_watch.sh's sibling: membership instead of a block threshold). Run it
+on a LUMI login node INSTEAD of the manual sbatch above, from the shell where
+the token and key are exported — the sbatch arguments are expanded at launch,
+so check the log's first line echoes real values, not `$TOK_DCLT` literally:
+
+```bash
+cd ~/ProjectWorldWide
+export WANDB_API_KEY=<from the secrets file>
+export TOK_DCLT=<this stack's token>
+
+nohup scripts/follow_watch.sh \
+  --url http://145.38.206.143:29540 --token "$TOK_DCLT" --cluster snellius -- \
+  sbatch -A project_462000226 -p standard-g -J pww-lumi-titan-dclt --time=24:00:00 \
+    --export=ALL,CONFIG=configs/titan/qwen3_0.6b_c4_dclt.toml,PWW_DARL_PORT=29540,PWW_FLOWER_PORT=29541,DARL_TOKEN="$TOK_DCLT",WANDB_API_KEY="$WANDB_API_KEY",PWW_FRESH_RUN=1,PWW_FRESH_DELETE=1,ENABLE_WANDB=1,WANDB_PROJECT=pww-diloco-20k-elastic,WANDB_RUN_NAME=dclt-lumi \
+    scripts/lumi/job_titan_diloco.sh \
+  > watch-dclt-follow.log 2>&1 &
+
+tail -f watch-dclt-follow.log     # first line must show the expanded command
+```
+
+An unreachable coordinator (VM reboot, firewall port not yet open) is retried
+forever, so the watcher can be started BEFORE the ports are opened; a refused
+token is fatal. If a login node reaps it, relaunch — a duplicate sbatch shows
+up in squeue; scancel the extra one.
+
 ## 5. Checks per phase of the run
 
 **First round of each site (minutes after it starts):**
