@@ -16,9 +16,23 @@ BLOB_PID_FILE="${STATE_DIR}/blob.pid"
 # with one stack -- and with parallel stacks (RUNBOOK.md "Parallel experiments") it made
 # `PWW_OUTPUT_DIR=...runs-churn ./stop_central_services.sh` kill the default stack's
 # daemons on 29510-29512 as a side effect of stopping the churn one.
+#
+# Moving them to env vars was not enough: a stop invoked with PWW_OUTPUT_DIR but
+# WITHOUT the port variables still swept 29510-29512 through the fuser -k below --
+# observed killing the full arm's live aggregator mid-run while stopping the dclt
+# stack. So the stack's own launch.env (written by start_central_services.sh at
+# every successful launch) is the second source: explicit env wins, the recorded
+# launch is next, and the bare defaults are last -- correct only for the one stack
+# that actually runs on them.
+LAUNCH_FILE="${STATE_DIR}/launch.env"
+_recorded() { grep -oE "^$1=[0-9]+$" "${LAUNCH_FILE}" 2>/dev/null | cut -d= -f2; }
+DARL_PORT="${DARL_PORT:-$(_recorded DARL_PORT || true)}"
+FLOWER_PORT="${FLOWER_PORT:-$(_recorded FLOWER_PORT || true)}"
+BLOB_PORT="${BLOB_PORT:-$(_recorded BLOB_PORT || true)}"
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
 BLOB_PORT="${BLOB_PORT:-29512}"
+echo "Ports to free for this stack: darl=${DARL_PORT} flower=${FLOWER_PORT} blob=${BLOB_PORT} (state: ${STATE_DIR})"
 
 echo "Stopping DARL Lease Coordinator..."
 "${PWW_ROOT}/scripts/darl_coordinator.sh" stop || true

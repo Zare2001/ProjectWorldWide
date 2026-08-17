@@ -382,8 +382,14 @@ else
     fi
     echo "Flower server started (PID $(cat "${FLOWER_PID_FILE}"))."
     # Same rule as the geometry: only record a launch that survived its liveness check.
-    printf 'TRANSPORT=%s\nAGGREGATOR_CONFIG=%s\n' \
-        "${TRANSPORT}" "${AGGREGATOR_CONFIG}" > "${LAUNCH_FILE}"
+    # The ports are recorded so stop_central_services.sh can free THIS stack's
+    # ports without being told them again. Its fuser -k fallback otherwise runs
+    # on the DEFAULT 29510-29512 -- observed killing the full arm's live
+    # aggregator mid-run as a side effect of stopping the dclt stack, because
+    # the stop call carried PWW_OUTPUT_DIR but not the port variables.
+    printf 'TRANSPORT=%s\nAGGREGATOR_CONFIG=%s\nDARL_PORT=%s\nFLOWER_PORT=%s\nBLOB_PORT=%s\n' \
+        "${TRANSPORT}" "${AGGREGATOR_CONFIG}" \
+        "${DARL_PORT}" "${FLOWER_PORT}" "${BLOB_PORT}" > "${LAUNCH_FILE}"
 fi
 
 echo ""

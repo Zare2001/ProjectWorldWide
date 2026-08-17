@@ -1,0 +1,106 @@
+# Qwen3 0.6B on C4, single-node baseline with the DCLT arm's LOCAL RECIPE.
+#
+# The decider ablation for the DCLT claim. DCLT vs the plain gb96 baseline
+# confounds two things: the federation (averaging, QSR, Jensen control) and the
+# schedule (lr 4.5e-4, 50% decay). This run isolates the schedule: it is
+# configs/titan/qwen3_0.6b_c4_central.toml with EXACTLY the dclt optimiser and
+# LR sections and nothing else changed. Run it at PWW_GLOBAL_BATCH=96 on ONE
+# site, 20,000 steps, same tokens per step as the federation:
+#
+#   - if it diverges or loses to central-gb96, the hot recipe was only
+#     survivable under averaging, and the federated claim is airtight;
+#   - if it matches DCLT, the win was the schedule, not the federation --
+#     better to learn that from your own run than from a reviewer.
+#
+# The DCLT theory (temperature decoupling / tail suppression) predicts the
+# first outcome; a 1.5x lr bump at B=96 is mild enough that the second is a
+# live possibility. That uncertainty is precisely why this run exists.
+#
+#   PWW_GLOBAL_BATCH=96 CONFIG=configs/titan/qwen3_0.6b_c4_central_hot.toml \
+#     sbatch --export=ALL,PWW_GLOBAL_BATCH,CONFIG,... scripts/<site>/job_titan_central.sh
+#
+# Diffs against qwen3_0.6b_c4_central.toml: dump_folder, description,
+# [optimizer].lr, the [lr_scheduler] section. Everything else -- including the
+# token-arithmetic commentary that applies unchanged -- lives in that file;
+# read it first.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-central-hot"
+description = "Qwen3 0.6B C4 central baseline with the DCLT hot schedule (ablation)"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+# The DCLT arm's value, verbatim. If the probe (RUNBOOK_DCLT / the 1k lr
+# probe) moves the DCLT arm to 6e-4, move this too -- the ablation is only an
+# ablation while the two schedules are identical.
+lr = 4.5e-4
+eps = 1e-8
+
+[lr_scheduler]
+# The DCLT [lr_scheduler] section, verbatim.
+warmup_steps = 300
+decay_ratio = 0.5
+decay_type = "cosine"
+min_lr_factor = 0.05
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+steps = 20000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+interval = 100
+last_save_model_only = false
+keep_latest_k = 2
+
+[comm]
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 100
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+url = ""
+site = ""
+inner_steps = 100
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = false
+server_address = ""
+transport = "inline"
+wire_dtype = "bfloat16"

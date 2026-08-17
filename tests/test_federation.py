@@ -1523,6 +1523,53 @@ if HAS_FLWR:
             assert third.resume_from_checkpoint() == 8
             assert third._h_multiplier == 1.0, "old format leaves the defaults alone"
 
+    @check("every Nth evaluate scores the pure average, not the momentum-stepped global")
+    def _():
+        """The Jensen gauge's definition uses theta_bar; the model an ordinary
+        evaluate round scores is w_next -- theta_bar AFTER the Nesterov outer step.
+        Every pure_eval_every-th merge the evaluate phase must therefore receive the
+        plain average, marked in control, while the PUBLISHED global (what the next
+        fit round trains on) stays the momentum-stepped one."""
+        from pww.central.strategy import FedMom
+
+        weights = np.full((8,), 0.5, dtype=np.float16)
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters([weights.copy()]),
+            server_learning_rate=0.7, server_momentum=0.9,   # w_next != theta_bar
+            qsr_h0=100, pure_eval_every=1,
+        )
+        strategy.configure_fit(1, ndarrays_to_parameters([weights.copy()]), _FakeManager(2))
+        aggregated, _ = strategy.aggregate_fit(
+            1,
+            [(None, _fit_res({proto.CLUSTER: "lumi", proto.STEPS: 100}, 1_000_000,
+                             arrays=[np.full((8,), 0.7, dtype=np.float16)])),
+             (None, _fit_res({proto.CLUSTER: "snellius", proto.STEPS: 100}, 3_000_000,
+                             arrays=[np.full((8,), 0.3, dtype=np.float16)]))],
+            [],
+        )
+        # theta_bar = (0.7 + 3*0.3)/4 = 0.4; w_next = 0.5 - 0.7*(0.5-0.4), then the
+        # Nesterov term -- 0.367, so the two genuinely differ. (Equal weights would
+        # put theta_bar exactly at the incumbent and hide a broken substitution.)
+        instructions = strategy.configure_evaluate(
+            1, strategy._current_parameters(), _FakeManager(2))
+        pure = strategy._on_wire(strategy._last_fedavg)
+        published = strategy._current_parameters()
+        assert strategy.control.get("eval_variant") == "pure_avg"
+        assert instructions[0][1].parameters.tensors == pure.tensors, \
+            "evaluate must receive theta_bar on a pure round"
+        assert pure.tensors != published.tensors, \
+            "with momentum on, theta_bar must differ from the published global"
+
+        # Off-switch and cadence: pure_eval_every=0 never substitutes, and a
+        # non-multiple merge round does not either.
+        strategy.pure_eval_every = 0
+        strategy.configure_evaluate(2, strategy._current_parameters(), _FakeManager(2))
+        assert "eval_variant" not in strategy.control
+        strategy.pure_eval_every = 5     # merge_round is 1, not a multiple of 5
+        strategy.configure_evaluate(3, strategy._current_parameters(), _FakeManager(2))
+        assert "eval_variant" not in strategy.control
+
     @check("uint16 (bfloat16) wire dtype is preserved across inline aggregation rounds")
     def _():
         from flwr.common import ndarrays_to_parameters

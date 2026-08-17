@@ -72,10 +72,17 @@ full arm, which is the entire point of holding OuterOpt fixed.
 # 1. sites first -- a live job would re-register against the fresh coordinator
 squeue --me | grep dclt          # on each site; scancel only those job ids
 
-# 2. stop THIS stack's services (stack-scoped via PWW_OUTPUT_DIR)
+# 2. stop THIS stack's services. PWW_OUTPUT_DIR *and* the ports: the stop
+#    script frees its ports with fuser -k, and without the port variables that
+#    sweep runs on the DEFAULT 29510-29512 -- observed killing the full arm's
+#    live aggregator as a side effect of stopping this stack. The script now
+#    also reads the ports from the stack's own launch.env, so a bare
+#    PWW_OUTPUT_DIR call is safe again -- but pass them anyway: the one time it
+#    matters is the one time launch.env is missing.
 S=/data/thomasistriplet/zpalanciya
 cd /data/thomasistriplet/ProjectWorldWide
-PWW_OUTPUT_DIR=$S/runs-dclt ./scripts/central_node/stop_central_services.sh
+PWW_OUTPUT_DIR=$S/runs-dclt DARL_PORT=29540 FLOWER_PORT=29541 BLOB_PORT=29542 \
+  ./scripts/central_node/stop_central_services.sh
 
 # 3. only now delete the stack's state
 rm -rf $S/runs-dclt
