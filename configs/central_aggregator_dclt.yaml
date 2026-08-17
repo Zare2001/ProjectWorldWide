@@ -9,8 +9,13 @@
 # outer-optimiser algebra, elastic membership and the DARL provenance block.
 # The clusters run configs/titan/qwen3_0.6b_c4_dclt.toml.
 
-darl-port: 29510
-flower-port: 29511
+# The DCLT stack's OWN range -- 29510/29511 belong to the full arm's stack.
+# start_central_services.sh overrides both from the DARL_PORT/FLOWER_PORT env
+# (CLI > yaml), so these matter only when someone runs `python -m
+# pww.central.server --config <this file>` bare -- and that someone must not
+# land on the full arm's ports.
+darl-port: 29540
+flower-port: 29541
 
 # The outer optimiser is unchanged from the diloco arm on purpose: the DCLT
 # claim is about the LOCAL recipe and the sync schedule, and changing OuterOpt
@@ -39,6 +44,14 @@ qsr-warmup-steps: 300
 # endpoint has no dispersion to measure.
 jensen-lo: 0.015
 jensen-hi: 0.06
+
+# Every 5th merge the evaluate phase scores the PLAIN average (theta_bar)
+# instead of the momentum-stepped global, logged as jensen/pure_* -- the
+# uncontaminated harvest measurement. The gap between jensen/pure_gap and the
+# neighbouring jensen/gap points is the Nesterov outer step's contribution,
+# which late in a QSR run can otherwise mimic basin fracture (pseudo-gradients
+# grow like 1/eta). The published global model is untouched.
+pure-eval-every: 5
 
 # Attempts, not merges. The step budget is the clients' training.steps = 20,000;
 # at H in [100, 500] that is ~40..200 merges, and failed rounds burn numbers too.

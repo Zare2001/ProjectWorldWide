@@ -169,6 +169,7 @@ if HAS_FLWR:
             qsr_lr_max: float = 0.0,
             jensen_lo: float = 0.015,
             jensen_hi: float = 0.06,
+            pure_eval_every: int = 5,
             control: dict[str, Any] | None = None,
         ) -> None:
             super().__init__(
@@ -253,6 +254,21 @@ if HAS_FLWR:
             self._jensen_ema: float | None = None
             self._h_multiplier = 1.0
             self._last_local_eval: tuple[float, int] | None = None  # (mean, clusters)
+            # The gauge as defined is J = L(theta_bar) - mean L(theta_i), but the
+            # model the ordinary evaluate round scores is w_next -- theta_bar with the
+            # Nesterov outer step already applied -- so the measured J is harvest PLUS
+            # outer-step effect. Late in a QSR run that ambiguity matters: pseudo-
+            # gradients grow like 1/eta, and momentum overshoot can push J >= 0 with
+            # no basin fracture at all, making the controller cut H for the wrong
+            # reason. So every `pure_eval_every`-th merge, `configure_evaluate` ships
+            # the PLAIN token-weighted average (kept here from the merge) instead of
+            # w_next. Those rounds measure the true harvest; the difference between
+            # the two series estimates the momentum bias. Zero client changes -- the
+            # clients score whatever parameters arrive. Inline transport only: the
+            # blob path would need a second published blob per round. Costs one
+            # fp32 model copy in RAM (~2.4 GiB at 0.6B).
+            self.pure_eval_every = max(0, int(pure_eval_every))
+            self._last_fedavg: NDArrays | None = None
             # Shared with server.py's metric closures, which log these to wandb; the
             # strategy is the single writer of everything derived here.
             self.control = control if control is not None else {}
@@ -454,6 +470,20 @@ if HAS_FLWR:
         ) -> list[tuple[ClientProxy, EvaluateIns]]:
             if self.fraction_evaluate == 0.0 or not self._has_global:
                 return []
+            # Pure-average round: score theta_bar itself instead of the momentum-
+            # stepped w_next, so the Jensen gauge is uncontaminated. See __init__.
+            # The published global model is untouched -- this substitutes only what
+            # the evaluate phase measures. control["eval_variant"] tells the metric
+            # closure to log it as jensen/pure_* rather than as eval/loss, so the
+            # headline series never mixes the two models.
+            self.control.pop("eval_variant", None)
+            if (self.qsr_h0 > 0 and self.pure_eval_every > 0
+                    and self.transport != proto.TRANSPORT_BLOB
+                    and self._last_fedavg is not None
+                    and self.merge_round > 0
+                    and self.merge_round % self.pure_eval_every == 0):
+                parameters = self._on_wire(self._last_fedavg)
+                self.control["eval_variant"] = "pure_avg"
             config: dict[str, Scalar] = {
                 proto.TRANSPORT: self.transport,
                 proto.ROUND: self.merge_round,
@@ -570,16 +600,25 @@ if HAS_FLWR:
             self.control["jensen_gap"] = gap
             self.control["jensen_ema"] = self._jensen_ema
             self.control["h_multiplier"] = self._h_multiplier
+            # On a pure-average round the pooled loss is L(theta_bar) itself, so this
+            # gap is the uncontaminated harvest; on ordinary rounds it carries the
+            # Nesterov outer step too. Both feed the same controller (the pure rounds
+            # simply correct it every Nth), but they are logged as separate series so
+            # the difference -- the momentum bias -- is readable off the chart.
+            pure = self.control.get("eval_variant") == "pure_avg"
             log_fn = self.control.get("log")
             if callable(log_fn):
-                log_fn({"jensen/gap": gap, "jensen/gap_ema": self._jensen_ema,
-                        "jensen/h_multiplier": self._h_multiplier})
+                payload = {"jensen/gap": gap, "jensen/gap_ema": self._jensen_ema,
+                           "jensen/h_multiplier": self._h_multiplier}
+                if pure:
+                    payload["jensen/pure_gap"] = gap
+                log_fn(payload)
             log(INFO,
-                "Round %s Jensen gauge: merged %.4f vs endpoint mean %.4f -> gap %+.4f "
-                "(ema %+.4f)%s. Negative is the averaging harvest; >= 0 means the "
-                "replicas left a common basin.",
-                server_round, float(pooled), self._last_local_eval[0], gap,
-                self._jensen_ema,
+                "Round %s Jensen gauge%s: merged %.4f vs endpoint mean %.4f -> gap "
+                "%+.4f (ema %+.4f)%s. Negative is the averaging harvest; >= 0 means "
+                "the replicas left a common basin.",
+                server_round, " (PURE average, momentum excluded)" if pure else "",
+                float(pooled), self._last_local_eval[0], gap, self._jensen_ema,
                 (f"; H multiplier {before:.2f} -> {self._h_multiplier:.2f}"
                  if self._h_multiplier != before else ""))
 
@@ -1188,6 +1227,10 @@ if HAS_FLWR:
                     usable[0][1].metrics.get(proto.CLUSTER, "?"),
                     self.server_learning_rate,
                     100.0 * (1.0 - self.server_learning_rate))
+
+            # Kept for the pure-average evaluate rounds (see __init__): this is the
+            # theta_bar of the gauge's definition, before the outer step touches it.
+            self._last_fedavg = fedavg_result
 
             pseudo_gradient = [w - w_avg for w, w_avg in zip(w_t, fedavg_result)]
             v_next = [w - eta * pg for w, pg in zip(w_t, pseudo_gradient)]

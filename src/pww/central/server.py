@@ -199,6 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
              "the basin boundary and H is trimmed 15%%. Rough sizing: 0.5-2%% of the "
              "current held-out loss.",
     )
+    g.add_argument(
+        "--pure-eval-every", type=int, default=5,
+        help="Every Nth merge, the evaluate phase scores the PLAIN token-weighted "
+             "average (theta_bar) instead of the momentum-stepped global, so the "
+             "Jensen gauge is periodically measured uncontaminated by the outer step "
+             "-- late in a QSR run, Nesterov overshoot can otherwise mimic basin "
+             "fracture. Logged as jensen/pure_* instead of eval/loss; the published "
+             "global model is untouched. Inline transport + QSR only. 0 disables.",
+    )
 
     g = parser.add_argument_group("global-model checkpoints")
     g.add_argument(
@@ -468,6 +477,12 @@ def build_metric_aggregators(
                 len(dropped), ", ".join(f"{c}={v}" for c, v in dropped),
             )
 
+        # Set by the strategy when this round's evaluate scored the PLAIN average
+        # (theta_bar) instead of the momentum-stepped global. Those measurements go
+        # to jensen/pure_* below, never to eval/loss -- the headline series must be
+        # one model's curve, not a mixture of two.
+        pure = control.get("eval_variant") == "pure_avg"
+
         res = {}
         if losses:
             weight = sum(n for n, _, _ in losses)
@@ -477,9 +492,10 @@ def build_metric_aggregators(
                 f"{math.exp(min(20.0, v)):.2f}" for _, v, _ in losses
             )
             logger.info(
-                "  >> Perplexity %.2f  (held-out loss %.4f; per-cluster ppl [%s], "
+                "  >> Perplexity %.2f%s  (held-out loss %.4f; per-cluster ppl [%s], "
                 "%s eval tokens)",
-                pooled_ppl, pooled_loss, per_cluster, f"{weight:,}",
+                pooled_ppl, " [PURE average, momentum excluded]" if pure else "",
+                pooled_loss, per_cluster, f"{weight:,}",
             )
 
             if len(losses) > 1:
@@ -519,7 +535,10 @@ def build_metric_aggregators(
             # broke.
             global_step = state["global_step"]
             wb_eval = {STEP_METRIC: global_step}
-            if "perplexity" in res:
+            if "perplexity" in res and pure:
+                wb_eval["jensen/pure_loss"] = res["eval_loss"]
+                wb_eval["jensen/pure_perplexity"] = res["perplexity"]
+            elif "perplexity" in res:
                 wb_eval["eval/loss"] = res["eval_loss"]
                 wb_eval["eval/perplexity"] = res["perplexity"]
                 for n, v, c in losses:
@@ -684,6 +703,7 @@ def main() -> None:
         qsr_lr_max=args.qsr_lr_max,
         jensen_lo=args.jensen_lo,
         jensen_hi=args.jensen_hi,
+        pure_eval_every=args.pure_eval_every,
         control=control,
     )
 
