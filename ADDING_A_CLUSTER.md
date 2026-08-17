@@ -14,6 +14,41 @@ why the torch environment is a container in one place and a venv in another.
 
 ---
 
+## Before you start — two phases, and four things to ask for
+
+Everything here up to and including §6 runs **entirely on your own machine**. Only §7
+dials out. Keep that boundary: finish the checklist in §9 down to the reachability
+line, then contact whoever operates the federation before submitting a job that
+registers. Two reasons, and the second is not about you.
+
+**A federation in progress is an experiment.** The sites' membership is part of the
+measurement — token weighting, the merge count, which rounds had k=2 — so a third
+cluster appearing mid-run changes the result of a run someone is already halfway
+through. DARL will also hand you blocks from the live epoch, so the corpus coverage
+that experiment reports will include work your site did.
+
+⚠️ **The default ports (DARL 29510, Flower 29511) belong to whatever run is currently
+live.** The submit block in §7 uses them because that is the ordinary case for an
+established site. For a *first* join, ask for a dedicated stack instead — the central
+node runs several in parallel on separate ports, each with its own coordinator, token
+and state directory, so a misconfigured first attempt fails privately rather than
+perturbing a campaign. Override with `PWW_DARL_PORT` / `PWW_FLOWER_PORT`.
+
+So before §7, ask the operator for:
+
+1. the **DARL token** for the stack you should join (never in a repo or an email
+   thread — it authorises leasing, committing and releasing blocks),
+2. the **ports** of that stack, and confirmation it is a test stack rather than a
+   live campaign,
+3. the **reference `manifest.json`** from an existing site, so §6's parity check has
+   something to diff against, and
+4. **where to copy the shards and tokenizer from**, with whatever access that needs.
+
+Nothing in phases §1–§6 requires any of the four. Do that work first; the request
+above is then a short conversation rather than a blocked afternoon.
+
+---
+
 ## 0. What a "cluster" is here, and what is actually required
 
 A site is **one file** — `sites/<name>.sh` — plus a detection branch and a job script.
@@ -539,6 +574,8 @@ measured per-flavor table.
 
 ## 9. Checklist
 
+Local — needs nothing from the federation operator:
+
 ```
 [ ] siteinfo.sh run on a login node; values recorded
 [ ] sites/<name>.sh written; all nine definitions present
@@ -546,11 +583,22 @@ measured per-flavor table.
 [ ] source env.sh && pww_summary reports the new site correctly
 [ ] ./scripts/deploy.sh clean; runs/ and data/ are symlinks
 [ ] torch >= 2.9 environment built; test_darl.py and test_titan.py pass repeatedly
+[ ] tests run REPEATEDLY, not once -- the timing-dependent failures they catch
+    surfaced in roughly 1 run in 10 and 1 in 35
+[ ] a single-site run works: same config with flower.enable = false, which needs
+    neither flwr nor a central node (job_smoke.sh is the short version)
+[ ] job script written and its #SBATCH header adjusted
+```
+
+Then the boundary. Ask for the token, ports, reference manifest and corpus source
+(see "Before you start"), and only then:
+
+```
 [ ] tokenizer + shards present on scratch (copied, not regenerated)
 [ ] num_windows / seq_len / vocab_size / tokenizer.sha256 match an existing site
 [ ] Manifest.digest() matches an existing site
-[ ] /health reachable from a login node on the DARL port
-[ ] job script copied and its #SBATCH header adjusted
+[ ] /health reachable from a login node on the DARL port -- the stack you were
+    given, not necessarily the default 29510
 [ ] first job: space digest matches, site appears in the aggregator's cluster list
 ```
 
