@@ -200,6 +200,16 @@ def build_parser() -> argparse.ArgumentParser:
              "current held-out loss.",
     )
     g.add_argument(
+        "--jensen-warmup-rounds", type=int, default=5,
+        help="Measure and log the gauge but do NOT move H for this many two-site "
+             "rounds. The rounds right after a site joins do not satisfy the gauge's "
+             "premise -- the replicas are not yet in one linearly connected basin and "
+             "a newcomer's optimiser moments are cold -- so they read as fracture and "
+             "spend the controller's whole downward range on a transient. Observed on "
+             "the first DCLT run: +0.4048 then +0.1286, multiplier floored, and the "
+             "next ordinary round read -0.0571.",
+    )
+    g.add_argument(
         "--pure-eval-every", type=int, default=5,
         help="Every Nth merge, the evaluate phase scores the PLAIN token-weighted "
              "average (theta_bar) instead of the momentum-stepped global, so the "
@@ -703,6 +713,7 @@ def main() -> None:
         qsr_lr_max=args.qsr_lr_max,
         jensen_lo=args.jensen_lo,
         jensen_hi=args.jensen_hi,
+        jensen_warmup_rounds=args.jensen_warmup_rounds,
         pure_eval_every=args.pure_eval_every,
         control=control,
     )

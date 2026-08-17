@@ -169,6 +169,7 @@ if HAS_FLWR:
             qsr_lr_max: float = 0.0,
             jensen_lo: float = 0.015,
             jensen_hi: float = 0.06,
+            jensen_warmup_rounds: int = 5,
             pure_eval_every: int = 5,
             control: dict[str, Any] | None = None,
         ) -> None:
@@ -254,6 +255,19 @@ if HAS_FLWR:
             self._jensen_ema: float | None = None
             self._h_multiplier = 1.0
             self._last_local_eval: tuple[float, int] | None = None  # (mean, clusters)
+            # Observe-only for the first few measurable rounds, then act.
+            #
+            # The gauge asks whether the replicas' endpoints lie in one linearly
+            # connected basin, and in the rounds right after a site joins they
+            # provably do not: mode connectivity is established early in training but
+            # not at step 300 of a fresh init, and a newly joined site's optimiser
+            # moments are colder than the incumbent's. Measured on the first DCLT run:
+            # the first two two-site rounds read +0.4048 and +0.1286 -- read as
+            # fracture, two 30% cuts, multiplier floored at 0.5 -- and the very next
+            # ordinary round read -0.0571, comfortably inside the band. The controller
+            # had spent its whole downward range on a transient it should have sat out.
+            self.jensen_warmup_rounds = max(0, int(jensen_warmup_rounds))
+            self._gauge_rounds = 0
             # The gauge as defined is J = L(theta_bar) - mean L(theta_i), but the
             # model the ordinary evaluate round scores is w_next -- theta_bar with the
             # Nesterov outer step already applied -- so the measured J is harvest PLUS
@@ -589,13 +603,33 @@ if HAS_FLWR:
             gap = float(pooled) - self._last_local_eval[0]
             self._jensen_ema = (gap if self._jensen_ema is None
                                 else 0.5 * self._jensen_ema + 0.5 * gap)
+            self._gauge_rounds += 1
             before = self._h_multiplier
-            if self._jensen_ema >= 0.0:
+            warming = self._gauge_rounds <= self.jensen_warmup_rounds
+            if warming:
+                pass                       # measured and logged, deliberately not acted on
+            elif self._jensen_ema >= 0.0:
                 self._h_multiplier *= 0.7
             elif self._jensen_ema > -self.jensen_lo:
                 self._h_multiplier *= 1.15
             elif self._jensen_ema < -self.jensen_hi:
                 self._h_multiplier *= 0.85
+            else:
+                # In band: relax the correction back toward 1.0 (no correction).
+                #
+                # Without this the law is a ratchet. It cuts on fracture, raises only
+                # while J sits ABOVE -lo, and does nothing in band -- so a multiplier
+                # knocked down by one transient stays down for as long as the gauge is
+                # healthy, which is exactly when it should be recovering. On the first
+                # DCLT run that pinned H at the floor of 50 with J at -0.057, i.e. half
+                # the intended local computation for the whole stable-LR phase, and the
+                # arm would have run the opposite of its own thesis.
+                #
+                # The multiplier is a CORRECTION to the QSR schedule, so absent evidence
+                # it should decay to no-correction rather than persist. Rising H widens
+                # dispersion, which drives J toward -hi and hands the trim branch back
+                # control: the loop then has a setpoint instead of a floor.
+                self._h_multiplier += (1.0 - self._h_multiplier) * 0.10
             self._h_multiplier = min(2.0, max(0.5, self._h_multiplier))
             self.control["jensen_gap"] = gap
             self.control["jensen_ema"] = self._jensen_ema
@@ -619,7 +653,10 @@ if HAS_FLWR:
                 "the replicas left a common basin.",
                 server_round, " (PURE average, momentum excluded)" if pure else "",
                 float(pooled), self._last_local_eval[0], gap, self._jensen_ema,
-                (f"; H multiplier {before:.2f} -> {self._h_multiplier:.2f}"
+                (f"; observe-only, round {self._gauge_rounds} of "
+                 f"{self.jensen_warmup_rounds} -- the replicas are not yet in a "
+                 f"common basin and this reading is not steady-state" if warming
+                 else f"; H multiplier {before:.2f} -> {self._h_multiplier:.2f}"
                  if self._h_multiplier != before else ""))
 
         # --- global-model checkpoints ---------------------------------------
@@ -680,7 +717,8 @@ if HAS_FLWR:
             # survive the same crash the weights do.
             payload["qsr"] = np.array(
                 [self._lr_last, self._lr_ref, self._h_multiplier,
-                 float("nan") if self._jensen_ema is None else self._jensen_ema],
+                 float("nan") if self._jensen_ema is None else self._jensen_ema,
+                 float(self._gauge_rounds)],
                 dtype=np.float64)
             try:
                 # Uncompressed on purpose: these are float32 weights, which compress
@@ -791,6 +829,10 @@ if HAS_FLWR:
                     self._lr_ref = max(self._lr_ref, float(qsr[1]))
                     self._h_multiplier = float(qsr[2])
                     self._jensen_ema = None if math.isnan(float(qsr[3])) else float(qsr[3])
+                    # Added with the observe-only warm-up; checkpoints written before
+                    # it have four elements. Resuming as 0 would re-run the warm-up,
+                    # which is the safe direction -- it only delays the controller.
+                    self._gauge_rounds = int(qsr[4]) if len(qsr) > 4 else 0
             self._inline_round = merge_round
             logger.info("restored global model from %s at merge round %d "
                         "(global_step=%d)",

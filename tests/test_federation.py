@@ -1428,7 +1428,10 @@ if HAS_FLWR:
         guard that must always bite, powerless exactly where H is longest."""
         from pww.central.strategy import FedMom
 
-        strategy = FedMom(qsr_h0=100, qsr_max=500, qsr_warmup_steps=0)
+        # jensen_warmup_rounds=0: this check is about the cut law and its interaction
+        # with the cap, not about the observe-only opening (covered separately).
+        strategy = FedMom(qsr_h0=100, qsr_max=500, qsr_warmup_steps=0,
+                          jensen_warmup_rounds=0)
         strategy._inline_global_step = 16_000
         strategy._lr_ref, strategy._lr_last = 4.5e-4, 2.25e-5  # raw term: 40,000
         assert strategy._next_inner_steps() == 500
@@ -1468,24 +1471,27 @@ if HAS_FLWR:
                                      proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000))
                     for c, v in mean_pair]
 
-        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06,
+                          jensen_warmup_rounds=0)
         strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
         strategy._update_jensen(3.745, 1)               # gap -0.005: inside (-lo, 0)
         assert abs(strategy._h_multiplier - 1.15) < 1e-9
 
-        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06,
+                          jensen_warmup_rounds=0)
         strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
         strategy._update_jensen(3.65, 1)                # gap -0.10: below -hi
         assert abs(strategy._h_multiplier - 0.85) < 1e-9
 
-        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06,
+                          jensen_warmup_rounds=0)
         strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
         strategy._update_jensen(3.71, 1)                # gap -0.04: in the band
         assert strategy._h_multiplier == 1.0
 
         # A non-finite endpoint loss is filtered; the finite one still counts, but
         # a count of 1 is below the >= 2 the controller needs, so it cannot act.
-        strategy = FedMom(qsr_h0=100)
+        strategy = FedMom(qsr_h0=100, jensen_warmup_rounds=0)
         strategy._observe_fit_results(scored([("a", 3.75), ("b", float("nan"))]))
         assert strategy._last_local_eval == (3.75, 1), strategy._last_local_eval
         strategy._update_jensen(3.80, 1)
@@ -1522,6 +1528,50 @@ if HAS_FLWR:
             third = FedMom(qsr_h0=100, checkpoint_dir=tmp)
             assert third.resume_from_checkpoint() == 8
             assert third._h_multiplier == 1.0, "old format leaves the defaults alone"
+
+    @check("the controller sits out the first rounds and heals a transient cut")
+    def _():
+        """Replays the first DCLT run's opening, which is what motivated both rules.
+
+        The first two two-site rounds read +0.4048 and +0.1286 -- linear mode
+        connectivity is not established at step 300 of a fresh init, and the site that
+        just joined has colder optimiser moments -- so the controller took two 30% cuts
+        and floored the multiplier. The very next ordinary round read -0.0571, inside
+        the band, but the old law had no way back up: it raised only above -lo and did
+        nothing in band, so H stayed at the floor of 50 for the whole stable-LR phase.
+        """
+        from pww.central.strategy import FedMom
+
+        def scored(a, b):
+            return [(None, _fit_res({proto.CLUSTER: c,
+                                     proto.LOCAL_EVAL_LOSS: v,
+                                     proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000))
+                    for c, v in (("lumi", a), ("snellius", b))]
+
+        strategy = FedMom(qsr_h0=100, jensen_warmup_rounds=5)
+        # The two transient fracture readings from the real run.
+        for merged, endpoints in ((6.4235, 6.0187), (5.9613, 5.8327)):
+            strategy._observe_fit_results(scored(endpoints, endpoints))
+            strategy._update_jensen(merged, 1)
+        assert strategy._h_multiplier == 1.0, (
+            f"observe-only rounds must not move H, got {strategy._h_multiplier}")
+        assert strategy._jensen_ema is not None, "but they must still be measured"
+        assert strategy._next_inner_steps() == 100, "H stays at h0 through the warm-up"
+
+        # Past the warm-up, a real fracture still bites.
+        strategy.jensen_warmup_rounds = 0
+        strategy._observe_fit_results(scored(6.0, 6.0))
+        strategy._update_jensen(6.5, 3)
+        assert strategy._h_multiplier == 0.7, strategy._h_multiplier
+
+        # ...and once the gauge is healthy again, the correction relaxes back toward
+        # 1.0 instead of pinning H at whatever the transient left it.
+        for _ in range(20):
+            strategy._observe_fit_results(scored(5.5, 5.5))
+            strategy._update_jensen(5.5 - 0.03, 4)      # gap -0.03, inside the band
+        assert strategy._h_multiplier > 0.9, (
+            f"in-band rounds must heal the cut, got {strategy._h_multiplier}")
+        assert strategy._h_multiplier <= 1.0, "and must not overshoot past no-correction"
 
     @check("every Nth evaluate scores the pure average, not the momentum-stepped global")
     def _():
