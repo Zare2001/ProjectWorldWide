@@ -33,6 +33,10 @@ at two sites they are noise.
 
 ---
 
+Day-to-day operations — clean reset, startup checks, per-phase monitoring,
+recovery — live in **[RUNBOOK_DCLT.md](RUNBOOK_DCLT.md)**; this file is the
+what and the why.
+
 ## 1. Deploy — BOTH sites need the new code
 
 The client half (per-round H, endpoint eval, an 8-field control broadcast) is
