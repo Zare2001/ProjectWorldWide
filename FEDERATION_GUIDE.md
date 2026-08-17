@@ -951,7 +951,7 @@ python3 tests/test_federation.py
 |---|---|---|
 | `test_darl.py` | 47 | lease state machine with an injected clock; a real coordinator over a socket; exactly-once coverage under concurrent clusters; the prefetch/acquire race; incarnation, requeue and release scoping |
 | `test_titan.py` | 22 | the token shard format, the DARL dataloader's exactly-once coverage across ranks, the inline wire codec including the bfloat16 bit-pattern hop, the scatter key set that must not include non-persistent buffers, config feasibility |
-| `test_federation.py` | 43 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)` |
+| `test_federation.py` | 48 | blob store over real HTTP; 0/1/N live replicas; restart durability; stale-delta rejection; mismatched-model refusal; duplicated cluster ids; metric pooling; the outer step against `SGD(nesterov=True)`; the QSR per-round H schedule and Jensen-gauge controller (see DCLT_ARM.md) |
 | `test_local.py` | 28 | config parsing, checkpointing, the single-site pieces |
 | `test_diloco_gloo.py` | 14 | the DiLoCo collectives over multi-process gloo, two replica layouts |
 

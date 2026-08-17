@@ -59,6 +59,24 @@ With per-site H (different ``darl.inner_steps`` on each cluster), a client can n
 longer compute ``global_step = round * H`` locally because H varies across sites.
 The server tracks the largest number of steps any contributing cluster took, and broadcasts this so every site's LR schedule stays aligned."""
 
+INNER_STEPS = "pww_inner_steps"
+"""How many inner steps THIS round should take, decided by the server per round.
+
+Absent (or <= 0) means "use your own darl.inner_steps", which is every run before
+the QSR schedule existed. When present, the client sets it on its FederatedTrainer
+before the phase -- the DARL lease granularity stays whatever the config sized it
+to, which is fine because the dataloader is one continuous iterator across leases
+and commits are watermark-based, not lease-based (see darl_dataloader's module
+docstring and LeaseSession.commit_all)."""
+
+LOCAL_EVAL = "pww_local_eval"
+"""'1' asks the cluster to validate its OWN phase endpoint before returning it.
+
+This is the theta_i term of the Jensen gauge J = L(theta_bar) - mean_i L(theta_i):
+the ordinary evaluate round scores the *merged* model, so without this the server
+can see the harvest's minuend but never its subtrahend. Costs one extra validation
+pass per round per site."""
+
 # --- metrics: cluster -> central node --------------------------------------
 
 DELTA_BLOB = "pww_delta_blob"
@@ -77,6 +95,15 @@ TOKENS = "tokens"
 EXHAUSTED = "exhausted"
 STEPS = "steps"
 LOSS = "loss"
+
+LOCAL_EVAL_LOSS = "local_eval_loss"
+"""Held-out loss of this cluster's own phase endpoint (theta_i), measured just
+before the endpoint is returned. Only sent when the round's config asked for it
+with LOCAL_EVAL. Non-finite values are sent as-is; the server filters them."""
+
+LOCAL_EVAL_TOKENS = "local_eval_tokens"
+"""Tokens that loss was measured over -- the weight it carries in the cross-site
+mean, for the same reason evaluate()'s num_examples is a real token count."""
 
 SEQ_LEN = "seq_len"
 """Sequence length this cluster trained at, so the central node can convert a token

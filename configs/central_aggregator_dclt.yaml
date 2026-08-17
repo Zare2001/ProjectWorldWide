@@ -1,0 +1,59 @@
+# Central aggregator settings for the DCLT arm (QSR + Jensen-controlled H).
+#
+#   AGGREGATOR_CONFIG=configs/central_aggregator_dclt.yaml \
+#   NUM_SAMPLES=<windows> BLOCK_SIZE=1024 SEED=42 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# Everything not commented here means what it means in
+# configs/central_aggregator_titan.yaml -- that file is the reference for the
+# outer-optimiser algebra, elastic membership and the DARL provenance block.
+# The clusters run configs/titan/qwen3_0.6b_c4_dclt.toml.
+
+darl-port: 29510
+flower-port: 29511
+
+# The outer optimiser is unchanged from the diloco arm on purpose: the DCLT
+# claim is about the LOCAL recipe and the sync schedule, and changing OuterOpt
+# too would make the comparison unreadable.
+server-learning-rate: 0.7
+server-momentum: 0.9
+
+# --- QSR + Jensen dispersion control -----------------------------------------
+# The server sets every round's inner steps to
+#     H = clamp( qsr-h0 * (eta_max/eta)^2 * jensen_multiplier,  h0/2, qsr-max )
+# from the LR the clusters report each round -- it never duplicates their
+# schedule. Held at h0 until qsr-warmup-steps (match the toml's
+# lr_scheduler.warmup_steps). With the dclt toml's schedule (4.5e-4, cosine over
+# the last 50% to 0.05x) H sits at 100 for the first half and grows to the 500
+# cap over the decay: ~140 rounds instead of 200, less WAN traffic, and the
+# extra local steps land where they buy flatness instead of drift.
+qsr-h0: 100
+qsr-max: 500
+qsr-warmup-steps: 300
+
+# Keep the Jensen gauge J = L(merged) - mean L(endpoints) inside
+# [-jensen-hi, -jensen-lo] nats: below -hi trims H 15% (endpoints nearing the
+# basin edge), above -lo raises it 15% (dispersion under-used), J >= 0 cuts it
+# 30% (fracture: averaging is paying a barrier penalty). Sized at 0.5-2% of the
+# expected held-out loss (~3.5-4 nats). Solo rounds skip the controller -- one
+# endpoint has no dispersion to measure.
+jensen-lo: 0.015
+jensen-hi: 0.06
+
+# Attempts, not merges. The step budget is the clients' training.steps = 20,000;
+# at H in [100, 500] that is ~40..200 merges, and failed rounds burn numbers too.
+num-rounds: 400
+
+min-clients: 1
+
+# A 500-step phase is ~5x a 100-step one -- at the measured ~7 min per H=100
+# round that is ~35-40 min before the fast site sees results, and 1800 would
+# drop the slow site mid-round exactly at the end of the run where rounds are
+# longest. The client-side gloo barrier budget is 7200s (4x the toml's
+# comm.train_timeout_seconds), so this stays inside it.
+round-timeout: 5400.0
+
+# --- DARL (provenance; the startup script reads the environment) --------------
+num-samples: 0            # set NUM_SAMPLES to tokenize_c4.sh's window count
+block-size: 1024
+darl-state-dir: "./runs/darl"

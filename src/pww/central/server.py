@@ -158,6 +158,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(solo_full_step=True)
 
+    g = parser.add_argument_group("QSR + Jensen dispersion control")
+    g.add_argument(
+        "--qsr-h0", type=int, default=0,
+        help="Enable the Quadratic Synchronization Rule (arXiv:2310.14423) with this "
+             "H at eta_max -- normally the clusters' darl.inner_steps (100). The server "
+             "then sets every round's inner steps to h0*(eta_max/eta)^2, growing H as "
+             "the sites' LR decays, and asks each cluster to score its own phase "
+             "endpoint for the Jensen gauge. 0 (default) = fixed H, exactly the old "
+             "behaviour, and nothing new goes over the wire.",
+    )
+    g.add_argument(
+        "--qsr-max", type=int, default=500,
+        help="Cap on the per-round H. eta^-2 reaches four figures at the end of a "
+             "cosine decay, where one round would swallow a quarter of the step budget "
+             "and hand FedMom a pseudo-gradient that grows like 1/eta.",
+    )
+    g.add_argument(
+        "--qsr-warmup-steps", type=int, default=0,
+        help="Hold H at h0 until the run's global step passes this -- set it to the "
+             "clusters' lr_scheduler.warmup_steps. QSR's K~eta^-2 is a decay-phase "
+             "rule; during warmup it would produce a huge H exactly when the un-warmed "
+             "model least tolerates long phases.",
+    )
+    g.add_argument(
+        "--qsr-lr-max", type=float, default=0.0,
+        help="Pin eta_max instead of learning it from the largest LR the clusters "
+             "report. Only needed if the server joins mid-decay with no checkpoint.",
+    )
+    g.add_argument(
+        "--jensen-lo", type=float, default=0.015,
+        help="Target band for the Jensen gauge J = L(merged) - mean L(endpoints): "
+             "keep J in [-jensen-hi, -jensen-lo] nats. J above -lo means the replicas' "
+             "dispersion is under-used and H is nudged up 15%%; J >= 0 means they left "
+             "a common basin and H is cut 30%%.",
+    )
+    g.add_argument(
+        "--jensen-hi", type=float, default=0.06,
+        help="Lower edge of the band; J below -hi means the endpoints are approaching "
+             "the basin boundary and H is trimmed 15%%. Rough sizing: 0.5-2%% of the "
+             "current held-out loss.",
+    )
+
     g = parser.add_argument_group("global-model checkpoints")
     g.add_argument(
         "--checkpoint-dir", type=str, default=None,
@@ -193,8 +235,15 @@ def build_metric_aggregators(
     wandb_entity: str | None = None,
     wandb_run_name: str | None = None,
     config_dict: dict | None = None,
+    control: dict | None = None,
 ):
-    """The two metric aggregation callbacks, as a pair."""
+    """The two metric aggregation callbacks, as a pair.
+
+    `control` is the dict the strategy shares its QSR/Jensen numbers through
+    (strategy writes, these closures read for wandb) -- the strategy is the single
+    computer of everything in it, so the charts cannot disagree with the controller.
+    """
+    control = control if control is not None else {}
     state = {
         "total_tokens": 0,
         "site_tokens": {},
@@ -235,6 +284,19 @@ def build_metric_aggregators(
         except Exception as exc:
             logger.warning("Failed to initialize WandB for central aggregator: %s", exc)
             wandb_run = None
+
+    if wandb_run is not None:
+        # Handed to the strategy through `control`, so the Jensen controller can put
+        # its gauge on the same global-step axis as the round it was measured on --
+        # the controller runs inside aggregate_evaluate AFTER these closures, so
+        # logging it from the next round's closure would shift every point one round.
+        def _log_control(payload: dict) -> None:
+            try:
+                wandb_run.log(payload, step=wandb_step(state["global_step"]))
+            except Exception as exc:                                  # noqa: BLE001
+                logger.warning("WandB log control failed: %s", exc)
+
+        control["log"] = _log_control
 
     def aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
         """Token-weighted training loss, plus how far replicas drifted."""
@@ -368,6 +430,18 @@ def build_metric_aggregators(
                 for k in ("tokens_per_s", "mfu_pct", "tflops_per_rank", "peak_memory_gib", "peak_memory_pct", "power_watts", "grad_norm", "drift_ratio"):
                     if k in m:
                         wb_metrics[f"cluster/{cid}/{k}"] = float(m[k])
+                if (proto.LOCAL_EVAL_LOSS in m
+                        and math.isfinite(float(m[proto.LOCAL_EVAL_LOSS]))):
+                    wb_metrics[f"cluster/{cid}/endpoint_eval_loss"] = float(
+                        m[proto.LOCAL_EVAL_LOSS])
+            # QSR/Jensen numbers, computed once in the strategy and read back here:
+            # the H the server just asked for, the controller's multiplier, and the
+            # endpoint-mean side of the gauge (the merged side lands via control[log]).
+            if "next_inner_steps" in control:
+                wb_metrics["qsr/next_inner_steps"] = int(control["next_inner_steps"])
+                wb_metrics["qsr/h_multiplier"] = float(control.get("h_multiplier", 1.0))
+            if "local_eval_mean" in control:
+                wb_metrics["jensen/endpoint_mean_loss"] = float(control["local_eval_mean"])
             try:
                 wandb_run.log(wb_metrics, step=wandb_step(global_step))
             except Exception as exc:
@@ -566,12 +640,23 @@ def main() -> None:
             "a BatchNorm model; for an LLM this switches FedMom off."
         )
 
+    if args.qsr_h0 > 0:
+        logger.info(
+            "QSR is ON: per-round H = clamp(%d * (eta_max/eta)^2 * jensen, %d, %d), "
+            "held at %d until global step %d; Jensen band [%.3f, %.3f] nats. Clusters "
+            "will score their own endpoints each round.",
+            args.qsr_h0, max(1, args.qsr_h0 // 2), args.qsr_max, args.qsr_h0,
+            args.qsr_warmup_steps, -args.jensen_hi, -args.jensen_lo,
+        )
+
+    control: dict = {}
     aggregate_fit_metrics, aggregate_eval_metrics = build_metric_aggregators(
         enable_wandb=args.enable_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_run_name=args.wandb_run_name,
         config_dict=vars(args),
+        control=control,
     )
 
     strategy = FedMom(
@@ -593,6 +678,13 @@ def main() -> None:
         persist_every=args.persist_every,
         keep_persistent=args.keep_persistent,
         solo_full_step=args.solo_full_step,
+        qsr_h0=args.qsr_h0,
+        qsr_max=args.qsr_max,
+        qsr_warmup_steps=args.qsr_warmup_steps,
+        qsr_lr_max=args.qsr_lr_max,
+        jensen_lo=args.jensen_lo,
+        jensen_hi=args.jensen_hi,
+        control=control,
     )
 
     # Resume from disk before Flower's INIT, so `initialize_parameters` answers from the

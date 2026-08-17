@@ -1380,6 +1380,149 @@ if HAS_FLWR:
             assert config[proto.GLOBAL_STEP] == 237, config
             assert config[proto.ROUND] == 3, config
 
+    @check("QSR is off by default and puts nothing new on the wire")
+    def _():
+        from pww.central.strategy import FedMom
+
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters(
+                [np.zeros((4,), dtype=np.float16)]),
+        )
+        config = strategy._round_config(1)
+        assert proto.INNER_STEPS not in config, config
+        assert proto.LOCAL_EVAL not in config, config
+
+    @check("QSR holds H at h0 through warmup, grows it as eta^-2, and caps it")
+    def _():
+        from pww.central.strategy import FedMom
+
+        strategy = FedMom(qsr_h0=100, qsr_max=500, qsr_warmup_steps=300)
+        # Cold start: no LR observed yet, and inside warmup -- both mean h0.
+        assert strategy._next_inner_steps() == 100
+        strategy._inline_global_step = 10_000
+        strategy._observe_fit_results([
+            (None, _fit_res({proto.CLUSTER: "lumi", "lr": 4.5e-4}, 1_000)),
+        ])
+        # At eta_max the quadratic term is 1.
+        assert strategy._next_inner_steps() == 100
+        # Halfway down the decay: (eta_max / (eta_max/2))^2 = 4.
+        strategy._observe_fit_results([
+            (None, _fit_res({proto.CLUSTER: "lumi", "lr": 2.25e-4}, 1_000)),
+        ])
+        assert strategy._next_inner_steps() == 400
+        # Deep decay: the raw term is 400x h0; the cap holds.
+        strategy._observe_fit_results([
+            (None, _fit_res({proto.CLUSTER: "lumi", "lr": 2.25e-5}, 1_000)),
+        ])
+        assert strategy._next_inner_steps() == 500
+        # And what goes on the wire is the same number, plus the eval request.
+        config = strategy._round_config(1)
+        assert config[proto.INNER_STEPS] == 500, config
+        assert config[proto.LOCAL_EVAL] == "1", config
+
+    @check("the Jensen controller cuts H on fracture even at the QSR cap")
+    def _():
+        """The multiplier acts on the CAPPED value. Applied under the cap it would
+        be clamped away late in the decay -- leaving the fracture response, the one
+        guard that must always bite, powerless exactly where H is longest."""
+        from pww.central.strategy import FedMom
+
+        strategy = FedMom(qsr_h0=100, qsr_max=500, qsr_warmup_steps=0)
+        strategy._inline_global_step = 16_000
+        strategy._lr_ref, strategy._lr_last = 4.5e-4, 2.25e-5  # raw term: 40,000
+        assert strategy._next_inner_steps() == 500
+
+        # Two clusters scored their endpoints; the merged model came out WORSE than
+        # their mean -- a positive gap, i.e. the replicas left a common basin.
+        strategy._observe_fit_results([
+            (None, _fit_res({proto.CLUSTER: "lumi",
+                             proto.LOCAL_EVAL_LOSS: 3.70,
+                             proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000)),
+            (None, _fit_res({proto.CLUSTER: "snellius",
+                             proto.LOCAL_EVAL_LOSS: 3.80,
+                             proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000)),
+        ])
+        assert strategy._last_local_eval == (3.75, 2), strategy._last_local_eval
+        strategy._update_jensen(3.76, server_round=9)   # gap = +0.01
+        assert strategy._h_multiplier == 0.7, strategy._h_multiplier
+        assert strategy._next_inner_steps() == 350, "0.7 x cap, not clamped away"
+
+        # A solo round must leave the controller alone: one endpoint, no dispersion.
+        strategy._observe_fit_results([
+            (None, _fit_res({proto.CLUSTER: "lumi",
+                             proto.LOCAL_EVAL_LOSS: 3.70,
+                             proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000)),
+        ])
+        before = (strategy._h_multiplier, strategy._jensen_ema)
+        strategy._update_jensen(3.70, server_round=10)
+        assert (strategy._h_multiplier, strategy._jensen_ema) == before
+
+    @check("the Jensen controller raises H when dispersion is under-used, trims when deep")
+    def _():
+        from pww.central.strategy import FedMom
+
+        def scored(mean_pair):
+            return [(None, _fit_res({proto.CLUSTER: c,
+                                     proto.LOCAL_EVAL_LOSS: v,
+                                     proto.LOCAL_EVAL_TOKENS: 1_000}, 1_000))
+                    for c, v in mean_pair]
+
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
+        strategy._update_jensen(3.745, 1)               # gap -0.005: inside (-lo, 0)
+        assert abs(strategy._h_multiplier - 1.15) < 1e-9
+
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
+        strategy._update_jensen(3.65, 1)                # gap -0.10: below -hi
+        assert abs(strategy._h_multiplier - 0.85) < 1e-9
+
+        strategy = FedMom(qsr_h0=100, jensen_lo=0.015, jensen_hi=0.06)
+        strategy._observe_fit_results(scored([("a", 3.75), ("b", 3.75)]))
+        strategy._update_jensen(3.71, 1)                # gap -0.04: in the band
+        assert strategy._h_multiplier == 1.0
+
+        # A non-finite endpoint loss is filtered; the finite one still counts, but
+        # a count of 1 is below the >= 2 the controller needs, so it cannot act.
+        strategy = FedMom(qsr_h0=100)
+        strategy._observe_fit_results(scored([("a", 3.75), ("b", float("nan"))]))
+        assert strategy._last_local_eval == (3.75, 1), strategy._last_local_eval
+        strategy._update_jensen(3.80, 1)
+        assert strategy._h_multiplier == 1.0
+
+    @check("QSR/Jensen controller state survives an aggregator restart")
+    def _():
+        """Same reasoning as global_step's restart test: the controller's memory --
+        the observed eta_max, the multiplier, the gauge EMA -- should survive the
+        same crash the weights do, or the first post-restart rounds run at h0 with
+        a reset controller. Older checkpoints without the qsr array still load."""
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = FedMom(qsr_h0=100, checkpoint_dir=tmp)
+            first._global_fp32 = [np.ones((4,), dtype=np.float32)]
+            first._lr_last, first._lr_ref = 2e-4, 4.5e-4
+            first._h_multiplier, first._jensen_ema = 0.7, -0.02
+            first._inline_round, first._inline_global_step = 7, 700
+            assert first._checkpoint(7) is not None
+
+            second = FedMom(qsr_h0=100, checkpoint_dir=tmp)
+            assert second.resume_from_checkpoint() == 7
+            assert second._lr_last == 2e-4
+            assert second._lr_ref == 4.5e-4
+            assert second._h_multiplier == 0.7
+            assert second._jensen_ema == -0.02
+            assert second._inline_global_step == 700
+
+            # A pre-QSR checkpoint: only w/meta arrays, and newer by round number.
+            with open(Path(tmp) / "round-000008-ephemeral.npz", "wb") as handle:
+                np.savez(handle, w0=np.ones((4,), dtype=np.float32),
+                         meta=np.array([8, 1, 0, 800], dtype=np.int64))
+            third = FedMom(qsr_h0=100, checkpoint_dir=tmp)
+            assert third.resume_from_checkpoint() == 8
+            assert third._h_multiplier == 1.0, "old format leaves the defaults alone"
+
     @check("uint16 (bfloat16) wire dtype is preserved across inline aggregation rounds")
     def _():
         from flwr.common import ndarrays_to_parameters

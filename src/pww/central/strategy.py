@@ -62,6 +62,7 @@ of the fork is logged and ignored.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from logging import ERROR, INFO, WARNING
 from pathlib import Path
@@ -161,6 +162,14 @@ if HAS_FLWR:
             keep_persistent: int = 4,
             # eta = 1 for a round with a single contributor. See `_aggregate_inline`.
             solo_full_step: bool = True,
+            # --- QSR + Jensen-gauge dispersion control. 0 = off, every run before it.
+            qsr_h0: int = 0,
+            qsr_max: int = 500,
+            qsr_warmup_steps: int = 0,
+            qsr_lr_max: float = 0.0,
+            jensen_lo: float = 0.015,
+            jensen_hi: float = 0.06,
+            control: dict[str, Any] | None = None,
         ) -> None:
             super().__init__(
                 fraction_fit=fraction_fit,
@@ -212,6 +221,42 @@ if HAS_FLWR:
             self.keep_persistent = max(0, int(keep_persistent))
             if self.checkpoint_dir is not None:
                 self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # --- QSR (Quadratic Synchronization Rule, arXiv:2310.14423) state -------
+            #
+            # H_next = clamp(h0 * (lr_ref / lr_now)^2 * jensen_multiplier, h0/2, qsr_max)
+            #
+            # The schedule is server-side because only the server sees every cluster's
+            # reported learning rate and the Jensen gauge; the clients obey the round's
+            # `pww_inner_steps`. lr comes from the fit metrics the clusters already
+            # send, so the server never duplicates the client LR schedule -- it cannot
+            # drift from what the sites actually run.
+            #
+            # Held at h0 until `qsr_warmup_steps`: QSR's K ~ eta^-2 is derived for the
+            # decay phase, and applying it during warmup (small eta) would produce a
+            # huge H exactly when the un-warmed model least tolerates long phases.
+            self.qsr_h0 = max(0, int(qsr_h0))
+            self.qsr_max = max(1, int(qsr_max))
+            self.qsr_warmup_steps = max(0, int(qsr_warmup_steps))
+            self._lr_ref = max(0.0, float(qsr_lr_max))  # 0 = learn from observations
+            self._lr_last = 0.0
+            # --- Jensen gauge J = L_val(theta_bar) - mean_i L_val(theta_i) ----------
+            #
+            # J < 0 is the per-round model-soup harvest (~ -1/2(1-1/N) tr(H Sigma));
+            # J >= 0 means the endpoints left a common linearly-connected basin and
+            # averaging is paying a barrier penalty instead of collecting one. The
+            # controller keeps an EMA of J inside [-jensen_hi, -jensen_lo] by scaling
+            # H: more H when dispersion is under-used, less when it approaches the
+            # basin edge, a hard cut on fracture. Only updated on rounds where >= 2
+            # clusters reported endpoint losses -- solo rounds have no dispersion.
+            self.jensen_lo = float(jensen_lo)
+            self.jensen_hi = float(jensen_hi)
+            self._jensen_ema: float | None = None
+            self._h_multiplier = 1.0
+            self._last_local_eval: tuple[float, int] | None = None  # (mean, clusters)
+            # Shared with server.py's metric closures, which log these to wandb; the
+            # strategy is the single writer of everything derived here.
+            self.control = control if control is not None else {}
+
             # The dtype the clients put on the wire, remembered.
             #
             # It used to be a local inside `_aggregate_inline`, discovered from the
@@ -311,6 +356,34 @@ if HAS_FLWR:
 
         # --- fit ----------------------------------------------------------
 
+        def _next_inner_steps(self) -> int:
+            """This round's H under QSR, or 0 when the feature is off.
+
+            Quadratic in the LR ratio (arXiv:2310.14423), scaled by the Jensen
+            controller's multiplier, floored at h0/2 (only the fracture response can
+            go below h0) and capped at qsr_max (H ~ eta^-2 reaches four figures at the
+            end of a cosine decay, where a single round would otherwise swallow a
+            quarter of the step budget -- and the outer update magnitude grows like
+            eta*H ~ 1/eta, so an uncapped H hands FedMom ever-larger pseudo-gradients
+            exactly when the model is settling).
+            """
+            if self.qsr_h0 <= 0:
+                return 0
+            h = float(self.qsr_h0)
+            past_warmup = self.global_step >= self.qsr_warmup_steps
+            if past_warmup and self._lr_last > 0 and self._lr_ref > 0:
+                h *= min(self._lr_ref / self._lr_last, 1e3) ** 2
+            # Cap BEFORE the Jensen multiplier: late in the decay the raw eta^-2 term
+            # is far above qsr_max, and a multiplier applied under the cap would be
+            # clamped away -- leaving the fracture response (the one guard that must
+            # always bite) powerless exactly where H is longest.
+            h = min(h, float(self.qsr_max)) * self._h_multiplier
+            floor = max(1, self.qsr_h0 // 2)
+            chosen = int(min(self.qsr_max, max(floor, round(h))))
+            self.control["next_inner_steps"] = chosen
+            self.control["h_multiplier"] = self._h_multiplier
+            return chosen
+
         def _round_config(self, server_round: int) -> dict[str, Scalar]:
             config: dict[str, Scalar] = {
                 proto.TRANSPORT: self.transport,
@@ -318,6 +391,12 @@ if HAS_FLWR:
                 proto.RUN_ID: self.run_id,
                 proto.GLOBAL_STEP: self.global_step,
             }
+            inner = self._next_inner_steps()
+            if inner > 0:
+                config[proto.INNER_STEPS] = inner
+                # The gauge needs theta_i scored every round; one extra ~512-window
+                # validation pass per site, seconds against a multi-minute phase.
+                config[proto.LOCAL_EVAL] = "1"
             if self.on_fit_config_fn is not None:
                 config.update(self.on_fit_config_fn(server_round))
             if self.transport != proto.TRANSPORT_BLOB:
@@ -411,10 +490,98 @@ if HAS_FLWR:
             if not self.accept_failures and failures:
                 return self._current_parameters(), {}
 
+            self._observe_fit_results(results)
             metrics = self._aggregate_metrics(results)
             if self.transport == proto.TRANSPORT_BLOB:
                 return self._aggregate_blob(server_round, results, metrics)
             return self._aggregate_inline(server_round, results, metrics)
+
+        def _observe_fit_results(self, results) -> None:
+            """Capture what QSR and the Jensen gauge need from this round's replies.
+
+            The learning rate: max across clusters, because `align_to_global_step`
+            keeps the schedules agreeing and the max is robust to one site reporting
+            a stale value from mid-warmup. `_lr_ref` (eta_max, the QSR anchor) is the
+            largest rate ever seen unless --qsr-lr-max pinned it.
+
+            The endpoint losses: token-weighted mean of the finite ones, with the
+            contributing cluster count -- the gauge is only meaningful at >= 2.
+            Both transports pass through here, which is the point of hooking
+            `aggregate_fit` rather than either `_aggregate_*`.
+            """
+            lrs = [float(res.metrics["lr"]) for _, res in results
+                   if "lr" in res.metrics and math.isfinite(float(res.metrics["lr"]))]
+            if lrs:
+                self._lr_last = max(lrs)
+                self._lr_ref = max(self._lr_ref, self._lr_last)
+
+            scored = []
+            for _, res in results:
+                loss = res.metrics.get(proto.LOCAL_EVAL_LOSS)
+                tokens = int(res.metrics.get(proto.LOCAL_EVAL_TOKENS, 0) or 0)
+                if loss is None or tokens <= 0 or not math.isfinite(float(loss)):
+                    continue
+                scored.append((float(loss), tokens))
+            if scored:
+                weight = sum(t for _, t in scored)
+                mean = sum(l * t for l, t in scored) / weight
+                self._last_local_eval = (mean, len(scored))
+                self.control["local_eval_mean"] = mean
+                self.control["local_eval_clusters"] = len(scored)
+            else:
+                self._last_local_eval = None
+
+        def aggregate_evaluate(self, server_round, results, failures):
+            loss, metrics = super().aggregate_evaluate(server_round, results, failures)
+            # Prefer the closure's finite-filtered pooled loss over Flower's raw
+            # weighted average, which would carry a diverged site's nan into the gauge.
+            pooled = metrics.get("eval_loss", loss) if metrics else loss
+            self._update_jensen(pooled, server_round)
+            return loss, metrics
+
+        def _update_jensen(self, pooled: float | None, server_round: int) -> None:
+            """One controller step on the Jensen gauge. See __init__ for the law.
+
+            EMA(0.5) over rounds before acting, because a single J is measured on
+            ~1M validation tokens per side and its round-to-round noise is comparable
+            to jensen_lo; acting on the raw value would thrash H. Asymmetric
+            responses on purpose: fracture (J >= 0) means averaging is actively
+            paying a barrier penalty, so the cut is the strongest move, while the
+            under-dispersed nudge is gentle -- H also rises on its own through the
+            QSR term as the LR decays.
+            """
+            if self.qsr_h0 <= 0 or pooled is None or not math.isfinite(float(pooled)):
+                return
+            if self._last_local_eval is None or self._last_local_eval[1] < 2:
+                # Solo or unscored round: no dispersion to control. Keep the EMA as
+                # it is rather than decaying it toward a value no round produced.
+                return
+            gap = float(pooled) - self._last_local_eval[0]
+            self._jensen_ema = (gap if self._jensen_ema is None
+                                else 0.5 * self._jensen_ema + 0.5 * gap)
+            before = self._h_multiplier
+            if self._jensen_ema >= 0.0:
+                self._h_multiplier *= 0.7
+            elif self._jensen_ema > -self.jensen_lo:
+                self._h_multiplier *= 1.15
+            elif self._jensen_ema < -self.jensen_hi:
+                self._h_multiplier *= 0.85
+            self._h_multiplier = min(2.0, max(0.5, self._h_multiplier))
+            self.control["jensen_gap"] = gap
+            self.control["jensen_ema"] = self._jensen_ema
+            self.control["h_multiplier"] = self._h_multiplier
+            log_fn = self.control.get("log")
+            if callable(log_fn):
+                log_fn({"jensen/gap": gap, "jensen/gap_ema": self._jensen_ema,
+                        "jensen/h_multiplier": self._h_multiplier})
+            log(INFO,
+                "Round %s Jensen gauge: merged %.4f vs endpoint mean %.4f -> gap %+.4f "
+                "(ema %+.4f)%s. Negative is the averaging harvest; >= 0 means the "
+                "replicas left a common basin.",
+                server_round, float(pooled), self._last_local_eval[0], gap,
+                self._jensen_ema,
+                (f"; H multiplier {before:.2f} -> {self._h_multiplier:.2f}"
+                 if self._h_multiplier != before else ""))
 
         # --- global-model checkpoints ---------------------------------------
 
@@ -468,6 +635,14 @@ if HAS_FLWR:
                 [merge_round, len(self._global_fp32),
                  0 if self.v_vector is None else len(self.v_vector),
                  self._inline_global_step], dtype=np.int64)
+            # QSR/Jensen controller state. Without this a server restart forgets the
+            # observed eta_max and the multiplier, so the first post-restart round
+            # would run at h0 -- harmless once, but the controller's memory should
+            # survive the same crash the weights do.
+            payload["qsr"] = np.array(
+                [self._lr_last, self._lr_ref, self._h_multiplier,
+                 float("nan") if self._jensen_ema is None else self._jensen_ema],
+                dtype=np.float64)
             try:
                 # Uncompressed on purpose: these are float32 weights, which compress
                 # by a few percent for several minutes of CPU. Write to .tmp and
@@ -570,6 +745,13 @@ if HAS_FLWR:
                 # global_step was added after the initial checkpoint format; older
                 # checkpoints have only 3 elements in the meta array.
                 self._inline_global_step = int(meta[3]) if len(meta) > 3 else 0
+                # Older checkpoints predate the QSR/Jensen controller state.
+                if "qsr" in data:
+                    qsr = data["qsr"]
+                    self._lr_last = float(qsr[0])
+                    self._lr_ref = max(self._lr_ref, float(qsr[1]))
+                    self._h_multiplier = float(qsr[2])
+                    self._jensen_ema = None if math.isnan(float(qsr[3])) else float(qsr[3])
             self._inline_round = merge_round
             logger.info("restored global model from %s at merge round %d "
                         "(global_step=%d)",

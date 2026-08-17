@@ -1,0 +1,144 @@
+# Qwen3 0.6B on C4 -- the DCLT arm: dispersion-controlled local training.
+#
+# Same model, corpus, tokenizer, DARL partitioning and 20,000-step budget as
+# configs/titan/qwen3_0.6b_c4_diloco.toml, which is the arm this one is measured
+# against. Three deliberate departures, each one mechanism from the local-update
+# literature that plain DiLoCo leaves on the table:
+#
+#   1. HOT LOCAL RECIPE (Photon, arXiv:2411.02908 s5). lr 4.5e-4 instead of 3e-4
+#      -- 1.5x -- with a longer warmup, and the decay stretched from the last 10%
+#      of the run to the last 50%. The averaging step is what makes the hotter
+#      rate survivable: conditionally on the round's starting point the sites'
+#      endpoints are independent, so the merged iterate sees 1/k of the local
+#      variance, and the aggregator's non-finite/weight-growth guards plus the
+#      client's release-on-nonfinite bound a genuinely bad round at one round.
+#
+#   2. QSR (arXiv:2310.14423). The SERVER sets each round's inner steps to
+#      H = 100 * (eta_max/eta)^2, capped at 500 -- the sync period grows as the
+#      LR decays, which is where the extra local steps buy sharpness reduction
+#      instead of drift. Nothing to set here: darl.inner_steps stays 100 and is
+#      the opening H and the fallback under a server that does not send
+#      pww_inner_steps. Enabled on the aggregator with --qsr-h0 100 (see
+#      configs/central_aggregator_dclt.yaml).
+#
+#   3. JENSEN GAUGE. Each round every site also scores its OWN phase endpoint on
+#      the held-out split, so the server can measure J = L(merged) - mean L(local)
+#      -- the per-round model-soup harvest -- and trim or extend H to keep the
+#      replicas dispersed but inside one basin. Also server-side; the client just
+#      answers the round's pww_local_eval flag with one extra validation pass.
+#
+# Launch exactly like the diloco arm:
+#   scripts/titan/run_train.sh --config configs/titan/qwen3_0.6b_c4_dclt.toml ...
+# with the aggregator started from configs/central_aggregator_dclt.yaml.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-dclt"
+description = "Qwen3 0.6B C4 cross-site DCLT (DiLoCo + QSR + Jensen-controlled H)"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+# Overridden by run_train.sh with the site's tokenizer directory.
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+# 1.5x the diloco arm's 3e-4. The local temperature eta/B is the knob the whole
+# recipe turns; the merge's variance reduction is what pays for it. If a site
+# diverges in the first hot rounds the run survives it (guards above), but if it
+# happens twice, drop to 3.75e-4 before blaming anything else.
+lr = 4.5e-4
+eps = 1e-8
+
+[lr_scheduler]
+# Longer than the diloco arm's 200 because the peak is hotter: the first steps
+# after every outer replacement amplify an un-warmed LR (see the diloco config).
+warmup_steps = 300
+# The stretch. 0.1 -> 0.5: the decay now spans steps 10,000..20,000 instead of
+# 18,000..20,000. Two reasons. More optimiser time at high LR is the Photon
+# data-efficiency mechanism itself; and QSR is a *decay-phase* rule -- against
+# the diloco arm's 90%-constant schedule it would only act in the last tenth of
+# the run.
+decay_ratio = 0.5
+decay_type = "cosine"
+min_lr_factor = 0.05
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+# The same 20,000-step, same-token budget as the diloco arm -- what varies is how
+# those steps are grouped into rounds. At H in [100, 500] that is between ~40 and
+# 200 merges; the client stops itself at this ceiling mid-phase if it must.
+steps = 20000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+# 1, NOT 100 -- and this is load-bearing under QSR. `checkpointer.save` is only
+# ever called at a phase end, so with variable H the phase-end step is almost
+# never a multiple of 100 and interval = 100 would write nearly no checkpoints --
+# and under the 'checkpoint' commit policy, no checkpoint means no DARL commit,
+# so leases pile up held-but-never-durable. interval = 1 restores exactly the
+# old cadence: one checkpoint and one commit per round, whatever H was.
+interval = 1
+last_save_model_only = false
+keep_latest_k = 2
+
+[comm]
+# One collective's wait, not the round's. The gloo control group that spans the
+# round barrier gets 4x this (see train.py), i.e. 7200s -- enough for a fast site
+# to wait out a slow site's full 500-step phase plus the merge.
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+# Same held-out contract as the diloco arm: run_train.sh upgrades this to the
+# real c4-validation split and sizes steps so every site scores the same window
+# total. The endpoint eval (pww_local_eval) reuses exactly this configuration --
+# same split, same window count -- which is what makes L(merged) and
+# mean L(endpoints) subtractable.
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 500
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+# url/site are supplied per site by run_train.sh.
+url = ""
+site = ""
+# The OPENING H and the fallback if the server sends no pww_inner_steps (an old
+# server, or --qsr-h0 0). Also sizes the DARL lease granularity -- which the
+# per-round H may then straddle freely: the dataloader is one continuous
+# iterator across leases and commits are watermark-based, so a 500-step round
+# simply consumes five leases' worth.
+inner_steps = 100
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = true
+server_address = ""
+transport = "inline"
+wire_dtype = "bfloat16"

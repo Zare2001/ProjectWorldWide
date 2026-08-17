@@ -218,6 +218,44 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             return self._fit_blob(config)
         return self._fit_inline(parameters, config)
 
+    def _apply_round_length(self, config: dict) -> int:
+        """Adopt the server's per-round H, if it sent one. Returns what was applied.
+
+        The QSR schedule lives on the server (strategy._next_inner_steps) because only
+        the server sees every cluster's learning rate and the Jensen gauge; the client
+        just obeys. -1 when the server sent nothing, so `_broadcast` can tell the
+        workers "leave yours alone" -- an old server must not zero a new client's H.
+        """
+        requested = int(config.get(proto.INNER_STEPS, -1) or -1)
+        if requested > 0 and requested != self.federated.inner_steps:
+            logger.info(
+                "server set this round's inner steps to %d (was %d)",
+                requested, self.federated.inner_steps,
+            )
+        if requested > 0:
+            self.federated.inner_steps = requested
+        return requested
+
+    def _local_endpoint_eval(self, config: dict, metrics: dict) -> None:
+        """Score this cluster's own endpoint for the Jensen gauge, when asked.
+
+        Runs AFTER the endpoint has been gathered/streamed for the return payload, so
+        the weights it scores are exactly the weights the server will average. It is a
+        collective (torchtitan's Validator all-reduces over the dp mesh), so the
+        workers mirror it in `run_worker_loop` -- gated by the same broadcast flag,
+        in the same position after their own gather/delta collectives.
+        """
+        loss, tokens = self.federated.validate()
+        metrics[proto.LOCAL_EVAL_LOSS] = float(loss)
+        metrics[proto.LOCAL_EVAL_TOKENS] = int(tokens)
+        if math.isfinite(loss):
+            logger.info("endpoint held-out loss %.4f over %s tokens (Jensen gauge)",
+                        loss, f"{tokens:,}")
+
+    @staticmethod
+    def _wants_local_eval(config: dict) -> bool:
+        return str(config.get(proto.LOCAL_EVAL, "")) == "1"
+
     def evaluate(self, parameters: list, config: dict) -> tuple:
         transport = str(config.get(proto.TRANSPORT, proto.TRANSPORT_INLINE))
         self._require_transport(transport)
@@ -299,6 +337,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         run_id = str(config.get(proto.RUN_ID, "pww"))
         staging = self._staging_dir()
 
+        inner_steps = self._apply_round_length(config)
+        local_eval = self._wants_local_eval(config)
         if str(config.get(proto.NEED_INIT, "")) == "1":
             # Cold start: this cluster's freshly initialised weights become the global
             # model. Written before any training so the delta below is measured against
@@ -306,7 +346,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             init_name = str(config.get(proto.INIT_BLOB, proto.init_blob(run_id)))
             reference = staging / init_name
             self._broadcast(CMD_FIT, reference=str(reference), write_full=True,
-                            global_step=self._global_step_for(config))
+                            global_step=self._global_step_for(config),
+                            inner_steps=inner_steps, local_eval=local_eval)
             stream_write_full(
                 self.trainer.model_parts, reference,
                 meta={"cluster": self.cluster_id, "round": base_round},
@@ -316,7 +357,9 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
             logger.info("seeded the global model from this cluster's initial weights")
         else:
             reference = self._fetch_global(config)
-            self._broadcast(CMD_FIT, reference=str(reference), global_step=self._global_step_for(config))
+            self._broadcast(CMD_FIT, reference=str(reference),
+                            global_step=self._global_step_for(config),
+                            inner_steps=inner_steps, local_eval=local_eval)
             stream_apply_global(self.trainer.model_parts, reference)
             seeded = False
 
@@ -331,6 +374,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         )
 
         metrics = self._round_metrics(result, drift, base_round)
+        if local_eval:
+            self._local_endpoint_eval(config, metrics)
         if seeded:
             metrics[proto.UPLOADED_INIT] = "1"
 
@@ -360,8 +405,11 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
 
     def _fit_inline(self, parameters: list, config: dict) -> tuple:
         self._check_transport_ceiling()
+        inner_steps = self._apply_round_length(config)
+        local_eval = self._wants_local_eval(config)
         self._broadcast(CMD_FIT, has_parameters=bool(parameters),
-                        global_step=self._global_step_for(config))
+                        global_step=self._global_step_for(config),
+                        inner_steps=inner_steps, local_eval=local_eval)
         if parameters:
             self.set_parameters(parameters)
 
@@ -391,6 +439,10 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         drift = outer_agreement(delta, self._reference)
 
         metrics = self._round_metrics(result, drift, int(config.get(proto.ROUND, 0)))
+        # Unconditionally when asked -- even on a 0-step round -- because the workers
+        # only see the broadcast flag and will enter the validation collectives.
+        if local_eval:
+            self._local_endpoint_eval(config, metrics)
         if result["exhausted"]:
             self.done = True
         if result["steps"] == 0:
@@ -482,6 +534,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         reference: str = "",
         write_full: bool = False,
         global_step: int = -1,
+        inner_steps: int = -1,
+        local_eval: bool = False,
     ) -> None:
         """Tell the other ranks which collectives to enter, and over which file.
 
@@ -508,7 +562,8 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         """
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.broadcast_object_list(
-                [(command, has_parameters, gather_only, reference, write_full, global_step)],
+                [(command, has_parameters, gather_only, reference, write_full,
+                  global_step, inner_steps, local_eval)],
                 src=0, group=self._control_group,
             )
 
@@ -535,7 +590,8 @@ def broadcast_stop(control_group: Any | None = None) -> None:
     """
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.broadcast_object_list(
-            [(CMD_STOP, False, False, "", False, -1)], src=0, group=control_group
+            [(CMD_STOP, False, False, "", False, -1, -1, False)],
+            src=0, group=control_group,
         )
 
 
@@ -556,13 +612,18 @@ def run_worker_loop(
         # site's remaining phase plus the merge -- and under NCCL the default group's
         # 300s watchdog SIGABRTed the fast site mid-run. See _broadcast.
         dist.broadcast_object_list(box, src=0, group=control_group)
-        command, has_parameters, gather_only, reference, write_full, global_step = box[0]
+        (command, has_parameters, gather_only, reference, write_full,
+         global_step, inner_steps, local_eval) = box[0]
 
         # Every rank owns an LR scheduler, so every rank has to be moved -- aligning only
         # rank 0 would leave the shards optimising at different learning rates within a
         # single cluster, which is worse than the cross-site skew this fixes.
         if global_step >= 0:
             federated.align_to_global_step(global_step)
+        # Every rank runs its own `range(self.inner_steps)`, so every rank has to adopt
+        # the server's per-round H or the phase ends in a mismatched collective.
+        if inner_steps > 0:
+            federated.inner_steps = inner_steps
 
         if command == CMD_STOP:
             return
@@ -588,6 +649,11 @@ def run_worker_loop(
                     scatter_full_state(federated.trainer.model_parts, {})
                 federated.run_inner_phase()
                 gather_full_state(federated.trainer.model_parts)
+            # The Jensen-gauge endpoint validation, mirroring rank 0's
+            # `_local_endpoint_eval` -- same collectives, same position after the
+            # gather/delta, unconditional on how many steps the phase managed.
+            if local_eval:
+                federated.validate()
         elif command == CMD_EVAL:
             if reference:
                 stream_apply_global(federated.trainer.model_parts, reference)
