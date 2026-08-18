@@ -232,6 +232,94 @@ overrides=()
 #
 # DARL needs no change: blocks_for_phase already takes grad_accum, so the lease grows with
 # the phase.
+# --- PWW_BALANCE: derive this site's accumulation from measured throughput -------
+#
+# PWW_GRAD_ACCUM above says "accumulate N times" but leaves N to be worked out by
+# hand, per site, from timings someone read off a log. That is exactly the kind
+# of number that goes stale: it depends on the hardware, the container, the model
+# flavor, seq_len and local_batch_size, and it has to be RE-derived whenever the
+# federation's membership changes, because the target is set by whoever is
+# slowest.
+#
+# PWW_BALANCE=1 computes it instead, from configs/site_throughput.env. What has
+# to be equalised is the time of one optimiser STEP, and that is not throughput
+# alone -- sites contribute different batches per step (ranks x local_batch), so
+#
+#     step_time_i = batch_i / tput_i
+#     accum_i     = round( max_j(step_time_j) / step_time_i )
+#
+#     Snellius   32 / 72.7 = 0.44s        LUMI   64 / 37.2 = 1.72s
+#     -> Snellius accumulates 4x, LUMI 1x
+#
+# Balancing on throughput alone would have said 2x here (72.7/37.2 = 1.95) and
+# left half the idle in place; the batch difference is the other factor of two.
+#
+# The slowest site gets 1 and sets the pace; everyone else accumulates in
+# proportion, so every site's phase takes about the same wall-clock and the
+# barrier stops being an idle period. Snellius's 44s phase becomes ~176s against
+# LUMI's 172s -- essentially all of the 128s idle recovered, and the round now
+# carries 4x the tokens from Snellius for the same H, the same drift and the
+# same peak memory.
+#
+# Deliberately conservative in three ways:
+#
+#   * rounds to an integer, and never below 1. Accumulation is a count of
+#     microbatches; there is no such thing as 1.7 of them.
+#   * capped at PWW_BALANCE_MAX (default 8). A site 20x faster than the slowest
+#     is not a balancing problem, it is a sign the slow site should not be in the
+#     round at all, and a 20x batch would change the optimisation rather than
+#     just fill the time.
+#   * silent no-op when this site or any other is missing from the registry, or
+#     when PWW_GRAD_ACCUM was set explicitly. An unknown site is left at 1, which
+#     is the behaviour that existed before this block.
+#
+# PWW_BALANCE_PEERS lists who is expected in the round; without it the minimum is
+# taken over every site in the registry, which is right for a full-membership run
+# and wrong for a two-of-three subset -- name the peers in that case.
+if [[ "${PWW_BALANCE:-0}" == "1" && -z "${PWW_GRAD_ACCUM:-}" ]]; then
+    _bal_registry="${PWW_BALANCE_REGISTRY:-${PWW_ROOT}/configs/site_throughput.env}"
+    if [[ -r "${_bal_registry}" ]]; then
+        # shellcheck disable=SC1090
+        source "${_bal_registry}"
+        _bal_uc="$(echo "${PWW_SITE}" | tr '[:lower:]-' '[:upper:]_')"
+        _bal_t="PWW_TPUT_${_bal_uc}"; _bal_b="PWW_BATCH_${_bal_uc}"
+        _bal_self=""
+        if [[ -n "${!_bal_t:-}" && -n "${!_bal_b:-}" ]]; then
+            _bal_self="$(awk -v b="${!_bal_b}" -v t="${!_bal_t}" 'BEGIN{print b/t}')"
+        fi
+        _bal_slow=""
+        for _peer in ${PWW_BALANCE_PEERS:-$(compgen -A variable | grep '^PWW_TPUT_' | sed 's/^PWW_TPUT_//')}; do
+            _puc="$(echo "${_peer}" | tr '[:lower:]-' '[:upper:]_')"
+            _pt="PWW_TPUT_${_puc}"; _pb="PWW_BATCH_${_puc}"
+            if [[ -z "${!_pt:-}" || -z "${!_pb:-}" ]]; then
+                echo "WARNING: PWW_BALANCE: ${_peer} lacks PWW_TPUT_/PWW_BATCH_ in ${_bal_registry}; balancing skipped" >&2
+                _bal_slow=""; break
+            fi
+            _pst="$(awk -v b="${!_pb}" -v t="${!_pt}" 'BEGIN{print b/t}')"
+            # the SLOWEST step sets the pace, so this is a max over peers
+            if [[ -z "${_bal_slow}" ]] || awk "BEGIN{exit !(${_pst} > ${_bal_slow})}"; then
+                _bal_slow="${_pst}"
+            fi
+        done
+        if [[ -n "${_bal_self}" && -n "${_bal_slow}" ]]; then
+            _bal_max="${PWW_BALANCE_MAX:-8}"
+            GRAD_ACCUM="$(awk -v s="${_bal_slow}" -v m="${_bal_self}" -v cap="${_bal_max}" \
+                'BEGIN{n=int(s/m + 0.5); if(n<1)n=1; if(n>cap)n=cap; print n}')"
+            export PWW_GRAD_ACCUM="${GRAD_ACCUM}"
+            echo "balance     : ${PWW_SITE} step $(printf '%.3f' "${_bal_self}")s vs slowest" \
+                 "$(printf '%.3f' "${_bal_slow}")s -> accumulate ${GRAD_ACCUM}x (cap ${_bal_max});" \
+                 "fills the round barrier instead of idling at it"
+        elif [[ -z "${_bal_self}" ]]; then
+            echo "WARNING: PWW_BALANCE=1 but PWW_TPUT_${_bal_uc}/PWW_BATCH_${_bal_uc} are not in" \
+                 "${_bal_registry}; run scripts/titan/calibrate_throughput.sh --write." \
+                 "Leaving accumulation at 1." >&2
+        fi
+        unset _bal_registry _bal_uc _bal_t _bal_b _bal_self _bal_slow _bal_max _peer _puc _pt _pb _pst
+    else
+        echo "WARNING: PWW_BALANCE=1 but ${_bal_registry} is not readable; leaving accumulation at 1" >&2
+    fi
+fi
+
 GRAD_ACCUM="${PWW_GRAD_ACCUM:-1}"
 if [[ "${GRAD_ACCUM}" =~ ^[1-9][0-9]*$ ]] && (( GRAD_ACCUM > 1 )); then
     ga_batch="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}"                 | cut -d= -f2 | tr -d ' ')"
