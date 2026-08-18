@@ -1,0 +1,113 @@
+# Qwen3 0.6B on C4 -- the best federated run this campaign can produce, for a
+# like-for-like comparison against a centralized run at the same tokens AND the
+# same steps.
+#
+# This is not an exploration config. Every value here is what the campaign's
+# measurements said was best, with the mechanisms that did not pay removed:
+#
+#   KEPT: the hot schedule (lr 4.5e-4, warmup 300, decay over the last 50% to
+#   0.05x). Measured worth 13% final and 18% mid-run perplexity, in BOTH
+#   topologies -- see CAMPAIGN.md section 5.
+#
+#   CHANGED: H = 50 rather than 100. At matched steps and matched per-step
+#   batch, the federated arm's disadvantage is local drift, and drift falls
+#   monotonically as H -> 1. Halving H halves the divergence each round has to
+#   reconcile, at the cost of twice the merges. H=25 was rejected on wall-clock:
+#   LUMI's phase halves with H but the ~90s merge does not, so 25 would push the
+#   arm to ~30h against ~19h here.
+#
+#   REMOVED: QSR and the Jensen controller. Both are server-side, so they are
+#   switched off by running this against configs/central_aggregator_titan.yaml
+#   instead of the dclt yaml. QSR *raises* H as the LR decays, which is exactly
+#   backwards when less drift is what you want; and the controller was observed
+#   chattering on a gauge whose round-to-round noise (+-0.07 nats) exceeds its
+#   own target band (0.045 wide), pinning H below its design value for much of
+#   dclt run2. Neither earned its place in this comparison. They belong in the
+#   Photon-regime experiment (CAMPAIGN.md section 9), not this one.
+#
+# Compare against: configs/titan/qwen3_0.6b_c4_central_hot.toml at
+# PWW_GLOBAL_BATCH=96, which is the same schedule, the same 96 sequences/step,
+# the same 20,000 steps and the same 3.93B tokens on a single site. That pair is
+# the cleanest "does federating cost anything?" measurement in the campaign.
+
+[job]
+dump_folder = "./outputs/qwen3-0.6b-c4-diloco-best"
+description = "Qwen3 0.6B C4 cross-site DiLoCo -- hot schedule, H=50, no QSR/controller"
+custom_config_module = "pww.titan.config"
+
+[experimental]
+custom_import = "pww.titan"
+
+[model]
+name = "pww_qwen3"
+flavor = "0.6B"
+hf_assets_path = "./data/tokenizers/tokenizer-128k"
+
+[metrics]
+log_freq = 10
+
+[optimizer]
+name = "AdamW"
+# The campaign's measured best. Survives centrally too (central_hot did not
+# diverge), so it is not a federation-only setting.
+lr = 4.5e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 300
+decay_ratio = 0.5
+decay_type = "cosine"
+min_lr_factor = 0.05
+
+[training]
+dtype = "bfloat16"
+local_batch_size = 8
+seq_len = 2048
+steps = 20000
+max_norm = 1.0
+dataset = "pww_tokens"
+dataset_path = "./data/c4-oellm128k-2048"
+
+[parallelism]
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+
+[activation_checkpoint]
+mode = "selective"
+
+[checkpoint]
+enable = true
+# One checkpoint per round, matching darl.inner_steps. Under the 'checkpoint'
+# commit policy this is also the DARL commit cadence, so it must divide H.
+interval = 50
+last_save_model_only = false
+keep_latest_k = 2
+
+[comm]
+train_timeout_seconds = 1800
+
+[validation]
+enable = true
+dataset = "c4_test"
+dataset_path = "./third_party/torchtitan/tests/assets/c4_test"
+freq = 500
+steps = 20
+
+[fault_tolerance]
+enable = false
+
+[darl]
+url = ""
+site = ""
+# H. Half the campaign default; see the header.
+inner_steps = 50
+block_size = 1024
+blocks_per_phase = 0
+epochs = 1
+space_seed = 42
+
+[flower]
+enable = true
+server_address = ""
+transport = "inline"
+wire_dtype = "bfloat16"

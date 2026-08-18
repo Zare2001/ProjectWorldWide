@@ -1,9 +1,10 @@
 __pycache__/
 *.py[cod]
 .gitconfig
-
+CAMPAIGN.md
 # SLURM job output
 logs/
+/all_logs
 
 # Symlinks into scratch created by scripts/bootstrap.sh -- the real data and
 # checkpoints live on /scratch and must never be committed.
