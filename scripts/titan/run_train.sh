@@ -248,11 +248,11 @@ overrides=()
 #     step_time_i = batch_i / tput_i
 #     accum_i     = round( max_j(step_time_j) / step_time_i )
 #
-#     Snellius   32 / 72.7 = 0.44s        LUMI   64 / 37.2 = 1.72s
-#     -> Snellius accumulates 4x, LUMI 1x
+#     Snellius   32 / 89.8 = 0.356s       LUMI   64 / 38.2 = 1.675s
+#     -> Snellius accumulates 5x, LUMI 1x
 #
-# Balancing on throughput alone would have said 2x here (72.7/37.2 = 1.95) and
-# left half the idle in place; the batch difference is the other factor of two.
+# Balancing on throughput alone would have said 2x here (89.8/38.2 = 2.4) and
+# left most of the idle in place; the batch difference is the rest.
 #
 # The slowest site gets 1 and sets the pace; everyone else accumulates in
 # proportion, so every site's phase takes about the same wall-clock and the

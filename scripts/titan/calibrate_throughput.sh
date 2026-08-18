@@ -1,123 +1,78 @@
 #!/usr/bin/env bash
-# Measure this site's training throughput, so the federation can balance a round.
+# Read a site's training throughput out of a job log, for round balancing.
 #
-#   scripts/titan/calibrate_throughput.sh                    # measure and print
-#   scripts/titan/calibrate_throughput.sh --write            # also update configs/site_throughput.env
-#   scripts/titan/calibrate_throughput.sh --steps 60 --config configs/titan/qwen3_0.6b_c4_diloco.toml
+#   scripts/titan/calibrate_throughput.sh logs/pww-snellius-titan-full-123.out
+#   scripts/titan/calibrate_throughput.sh --write logs/...        # update the registry
 #
-# Runs a short single-site training job -- no Flower, no DARL coordinator, no
-# central node -- and reports SEQUENCES PER SECOND for the whole site at its
-# normal geometry. That number is what `run_train.sh --balance` divides into a
-# target round duration to pick each site's gradient accumulation, so that a
-# fast site fills the barrier instead of idling at it. See
-# configs/site_throughput.env for why this matters and what it is worth.
+# No benchmark job: torchtitan already logs per-rank tps every log_freq steps, so
+# any real run of the current model/geometry has the number in it. Reads the
+# median of the post-warmup steps (one GC pause must not move the answer) and
+# normalises to accumulation = 1, which is what configs/site_throughput.env
+# stores and what run_train.sh's PWW_BALANCE divides.
 #
-# Measured at accumulation = 1 on purpose: it is a property of the hardware and
-# the model, not of the balancing decision that will later be derived from it.
-#
-# The first steps of any run are unrepresentative -- compile, autotune, cache
-# warm-up, and torchtitan's own first-step MFU is typically a third of steady
-# state -- so the first --warmup steps are discarded and only the remainder is
-# timed.
+# Re-read a log after the hardware, container, model flavor, seq_len or
+# local_batch_size changes.
 set -euo pipefail
 
 : "${PWW_ROOT:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-source "${PWW_ROOT}/env.sh"
-
-CONFIG="${PWW_ROOT}/configs/titan/qwen3_0.6b_c4_diloco.toml"
-STEPS=60
-WARMUP=20
 WRITE=0
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --config) CONFIG="$2"; shift 2 ;;
-        --steps)  STEPS="$2";  shift 2 ;;
-        --warmup) WARMUP="$2"; shift 2 ;;
-        --write)  WRITE=1;     shift ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-        *) echo "unknown argument: $1" >&2; exit 2 ;;
-    esac
-done
-(( STEPS > WARMUP )) || { echo "--steps must exceed --warmup" >&2; exit 2; }
+[[ "${1:-}" == "--write" ]] && { WRITE=1; shift; }
+LOG="${1:-}"
+[[ -r "${LOG}" ]] || { echo "usage: $0 [--write] <job-log>" >&2; exit 2; }
 
-REGISTRY="${PWW_ROOT}/configs/site_throughput.env"
-SITE_UC="$(echo "${PWW_SITE}" | tr '[:lower:]-' '[:upper:]_')"
-LOG="${PWW_OUTPUT_DIR}/calibrate-${PWW_SITE}-$$.log"
-mkdir -p "$(dirname "${LOG}")"
-
-echo "calibrating ${PWW_SITE}: ${STEPS} steps (first ${WARMUP} discarded), config $(basename "${CONFIG}")"
-
-# flower.enable=false and the stock dataset: this must not touch a coordinator,
-# a token or another site. It is a hardware measurement, not a run.
-"${PWW_ROOT}/scripts/titan/run_train.sh" \
-    --config "${CONFIG}" -- \
-    --training.steps "${STEPS}" \
-    --flower.enable false \
-    --checkpoint.enable false \
-    --validation.enable false \
-    --metrics.log_freq 1 \
-    > "${LOG}" 2>&1 || { echo "calibration run failed; see ${LOG}" >&2; exit 1; }
-
-# torchtitan prints per-rank tps every log_freq steps. Sum over ranks for the
-# site figure, and take the median of the post-warmup steps rather than the mean
-# so one slow step (a GC pause, a filesystem hiccup) cannot move the answer.
-read -r SEQ_PER_S NPROC_SEEN <<EOF
-$(python3 - "${LOG}" "${WARMUP}" <<'PY'
+read -r SITE SEQ_PER_S BATCH STEP_TIME RANKS ACCUM <<EOF
+$(python3 - "${LOG}" <<'PY'
 import re, sys, statistics
-log, warmup = sys.argv[1], int(sys.argv[2])
-per_step = {}
-ranks = set()
-pat = re.compile(r"\[rank(\d+)\].*?step:\s*(\d+).*?tps:\s*([\d,]+)")
-for line in open(log, errors="ignore"):
-    m = pat.search(re.sub(r"\x1b\[[0-9;]*m", "", line))
-    if not m:
-        continue
-    rank, step, tps = int(m.group(1)), int(m.group(2)), int(m.group(3).replace(",", ""))
-    if step <= warmup:
-        continue
-    ranks.add(rank)
-    per_step.setdefault(step, {})[rank] = tps
-# a step counts only once every rank has reported it
-full = [sum(v.values()) for v in per_step.values() if len(v) == len(ranks)]
+raw = open(sys.argv[1], errors="ignore").read()
+txt = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+
+m = re.search(r"^site\s+:\s*(\S+)", txt, re.M)
+site = m.group(1) if m else "UNKNOWN"
+
+m = re.search(r"local batch size (\d+), global batch size (\d+), "
+              r"gradient accumulation steps (\d+), sequence length (\d+)", txt)
+if not m:
+    print("- 0 0 0 0 0"); raise SystemExit
+local, gbs, accum, seq_len = (int(g) for g in m.groups())
+ranks = gbs // (local * accum)
+batch = local * ranks                      # sequences per step at accumulation 1
+
+# per-rank tps, grouped by step; a step counts only once every rank reported it
+steps = {}
+for rank, step, tps in re.findall(r"\[rank(\d+)\].*?step:\s*(\d+).*?tps:\s*([\d,]+)", txt):
+    steps.setdefault(int(step), {})[int(rank)] = int(tps.replace(",", ""))
+full = [sum(v.values()) for s, v in sorted(steps.items()) if len(v) == ranks and s > 10]
 if not full:
-    print("0 0"); raise SystemExit
-seq_len = 2048
-print(f"{statistics.median(full) / seq_len:.1f} {len(ranks)}")
+    print(f"{site} 0 {batch} 0 {ranks} {accum}"); raise SystemExit
+
+tok_s = statistics.median(full)
+seq_s = tok_s / seq_len * accum            # normalise to accumulation 1
+print(f"{site} {seq_s:.1f} {batch} {batch/seq_s:.3f} {ranks} {accum}")
 PY
 )
 EOF
 
-if [[ "${SEQ_PER_S}" == "0" || -z "${SEQ_PER_S}" ]]; then
-    echo "ERROR: no usable throughput lines in ${LOG} (did the run reach step ${WARMUP}?)" >&2
-    exit 1
-fi
+[[ "${SEQ_PER_S}" != "0" ]] || { echo "ERROR: no usable tps lines in ${LOG}" >&2; exit 1; }
+SITE_UC="$(echo "${SITE}" | tr '[:lower:]-' '[:upper:]_')"
 
-# Both numbers are needed, not just throughput: what the balancer equalises is
-# the time of one optimiser step, and sites run different batches per step. See
-# the header of configs/site_throughput.env.
-LOCAL_BATCH="$(grep -m1 -E '^[[:space:]]*local_batch_size[[:space:]]*=' "${CONFIG}" | cut -d= -f2 | tr -d ' ')"
-BATCH_PER_STEP=$(( NPROC_SEEN * LOCAL_BATCH ))
-STEP_TIME="$(awk -v b="${BATCH_PER_STEP}" -v t="${SEQ_PER_S}" 'BEGIN{printf "%.3f", b/t}')"
+cat <<EOF
 
-echo
-echo "  site        : ${PWW_SITE}  (${NPROC_SEEN} ranks x local_batch ${LOCAL_BATCH})"
-echo "  throughput  : ${SEQ_PER_S} sequences/s at accumulation 1"
-echo "  batch/step  : ${BATCH_PER_STEP} sequences"
-echo "  step time   : ${STEP_TIME}s  <- this is what gets equalised across sites"
-echo
-echo "  PWW_TPUT_${SITE_UC}=${SEQ_PER_S}"
-echo "  PWW_BATCH_${SITE_UC}=${BATCH_PER_STEP}"
-echo
+  site       : ${SITE}  (${RANKS} ranks, log ran at accumulation ${ACCUM})
+  throughput : ${SEQ_PER_S} sequences/s, normalised to accumulation 1
+  batch/step : ${BATCH} sequences
+  step time  : ${STEP_TIME}s   <- this is what gets equalised across sites
 
+  PWW_TPUT_${SITE_UC}=${SEQ_PER_S}
+  PWW_BATCH_${SITE_UC}=${BATCH}
+EOF
+
+REGISTRY="${PWW_ROOT}/configs/site_throughput.env"
 if (( WRITE )); then
     tmp="$(mktemp)"
     grep -vE "^PWW_(TPUT|BATCH)_${SITE_UC}=" "${REGISTRY}" > "${tmp}" 2>/dev/null || true
-    printf 'PWW_TPUT_%s=%s\nPWW_BATCH_%s=%s\n' \
-        "${SITE_UC}" "${SEQ_PER_S}" "${SITE_UC}" "${BATCH_PER_STEP}" >> "${tmp}"
+    printf 'PWW_TPUT_%s=%s\nPWW_BATCH_%s=%s\n' "${SITE_UC}" "${SEQ_PER_S}" "${SITE_UC}" "${BATCH}" >> "${tmp}"
     mv "${tmp}" "${REGISTRY}"
-    echo "updated ${REGISTRY} -- commit it so every site sees the same numbers"
+    echo "  updated ${REGISTRY} -- commit it so every site reads the same numbers"
 else
-    echo "add those two lines to ${REGISTRY} (or re-run with --write), then commit:"
-    echo "every site reads the SAME file to work out who is the slow one."
+    echo "  add those two lines to ${REGISTRY}, or re-run with --write"
 fi
-rm -f "${LOG}"
