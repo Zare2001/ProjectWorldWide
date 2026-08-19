@@ -18,10 +18,12 @@ logs/
 *.bin
 *.npy
 *.tar.gz
-
+make_all_plots.sh
+plot_metrics.py
 # torchtitan's default dump_folder. Every configs/titan/*.toml redirects this to
 # scratch, but a run launched from the repo root without an override lands here,
 # and one Qwen3 0.6B checkpoint shard is several GB.
 /outputs
 wandb/
 .wandb/
+plots/
