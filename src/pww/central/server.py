@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
+import time
 from pathlib import Path
 
 from ..config import apply_config_file
@@ -569,6 +571,124 @@ def build_metric_aggregators(
     return aggregate_fit_metrics, aggregate_eval_metrics
 
 
+def _install_init_retry(backoff: float = 2.0) -> None:
+    """Stop one cluster's disconnect during INIT from ending the run for everyone.
+
+    `FedMom.initialize_parameters` already answers without a client in three of the four
+    cases (blob either way; inline once `_has_global`). The gap is inline on a cold
+    start: the server cannot know the tensor shapes until some cluster tells it, so it
+    returns None and Flower asks a random client for them. If that client dies
+    mid-request the bridge closes, `GrpcBridgeClosed` leaves `Server.fit`, and nothing
+    catches it -- observed 2026-08-19, when one cluster registered with DARL and vanished
+    five minutes later, ending the run for every other site before they were out of the
+    queue.
+
+    The retry goes here, on `_get_initial_parameters`, and NOT around
+    `fl.server.start_server`. start_server only calls `grpc_server.stop()` on the way out
+    of a clean `run_fl`, so an exception escaping it leaks the listening socket inside
+    this process: the port never frees, a rebind can never succeed, and wrapping it
+    converts the crash into a slower crash. Retrying here leaves the gRPC server bound
+    and serving throughout, so a site arriving mid-retry still connects normally.
+
+    Scoping to this method also keeps the blast radius honest -- Flower calls it only
+    from the INIT phase, so a bridge failure during an actual round still surfaces
+    instead of being looped over.
+    """
+    try:
+        from flwr.server.server import Server
+        from flwr.server.superlink.fleet.grpc_bidi.grpc_bridge import GrpcBridgeClosed
+    except ImportError:
+        # Deliberately narrow: if flwr moved these, do nothing rather than fall back to a
+        # broad `except Exception` that would also swallow real faults.
+        logger.warning(
+            "flwr does not expose Server._get_initial_parameters / GrpcBridgeClosed "
+            "where this expects them, so a cluster dropping during the INIT handshake "
+            "will stop the server. Check the import paths in %s.", __file__,
+        )
+        return
+
+    original = Server._get_initial_parameters
+
+    def _retrying(self, server_round, timeout):  # type: ignore[no-untyped-def]
+        attempt = 0
+        while True:
+            try:
+                return original(self, server_round=server_round, timeout=timeout)
+            except GrpcBridgeClosed:
+                attempt += 1
+                logger.warning(
+                    "a cluster disconnected while seeding the global model (INIT "
+                    "attempt %d); the model is still cold, so waiting for the next "
+                    "cluster instead of ending the run", attempt,
+                )
+                # Let the servicer unregister the dead proxy, so `sample(1)` does not
+                # immediately hand back the client that just died.
+                time.sleep(backoff)
+
+    Server._get_initial_parameters = _retrying
+
+
+def _install_grpc_keepalive(keepalive_ms: int) -> bool:
+    """Ping the clients often enough that a proxy does not reap the idle stream.
+
+    A site whose compute nodes reach us only through an HTTP gateway (ORNL routes
+    Frontier through proxy.ccs.ornl.gov:3128) holds the Flower stream inside a CONNECT
+    tunnel. The tunnel goes quiet for as long as the merge takes -- this VM has no GPU,
+    so deserialising the inbound parameters, evaluating and re-serialising the outbound
+    ones is a minute-plus with nothing on the wire -- and the gateway reaps it. The
+    client then dies on `Stream removed (recvmsg: Connection reset by peer)`, which is
+    observed as a round failure here and a dead job there. Seen 2026-08-20: the reset
+    landed 92s after a 1.32 GiB upload had completed successfully.
+
+    Flower's own default is 210000ms and its docstring says why -- it is aimed at
+    cloud providers that drop idle TCP after ~4 minutes. A site gateway is far more
+    aggressive than that, and start_server() does not expose the knob at all, so this
+    patches the reference `flwr.compat.server.app` holds.
+
+    BOTH options are load-bearing. `keepalive_time_ms` alone is silently clamped:
+    grpc.http2.min_time_between_pings_ms defaults to 300000ms and throttles pings sent
+    while no data frame has gone out -- which is exactly the idle window this is meant
+    to cover, so the pings would be spaced 5 minutes apart no matter what keepalive
+    asked for. flwr sets max_pings_without_data=0 (no count limit) but leaves the
+    interval alone.
+    """
+    try:
+        import grpc
+        from flwr.compat.server import app as _flwr_app
+    except ImportError:
+        logger.warning(
+            "cannot reach flwr's gRPC server factory to set a keepalive; clients behind "
+            "an HTTP proxy may have their stream reaped during a long merge"
+        )
+        return False
+
+    original = _flwr_app.start_grpc_server
+
+    def _with_keepalive(*args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["keepalive_time_ms"] = keepalive_ms
+        # generic_create_grpc_server builds the option list itself and offers no way to
+        # extend it, so intercept the grpc.server call it makes rather than duplicating
+        # flwr's list here -- that list is where max_message_length also comes from, and
+        # a copy of it would rot silently the next time flwr changes a default.
+        real_grpc_server = grpc.server
+
+        def _grpc_server(*sargs, **skwargs):  # type: ignore[no-untyped-def]
+            merged = dict(skwargs.get("options") or [])
+            merged["grpc.keepalive_time_ms"] = keepalive_ms
+            merged["grpc.http2.min_time_between_pings_ms"] = keepalive_ms
+            skwargs["options"] = list(merged.items())
+            return real_grpc_server(*sargs, **skwargs)
+
+        grpc.server = _grpc_server
+        try:
+            return original(*args, **kwargs)
+        finally:
+            grpc.server = real_grpc_server
+
+    _flwr_app.start_grpc_server = _with_keepalive
+    return True
+
+
 def main() -> None:
     setup_logging(rank=0)
     args = apply_config_file(build_parser())
@@ -743,6 +863,20 @@ def main() -> None:
         else:
             logger.info("no usable checkpoint in %s; the first cluster to connect will "
                         "seed the global model", checkpoint_dir)
+
+    _install_init_retry()
+
+    # Env rather than a flag: it is a property of the least-reachable site in the
+    # federation, not of this run, so it wants setting once on the VM.
+    # 30s, not 60s: the only measurement of the gateway that prompted this is a single
+    # reset 92s into an idle stream, so the reaper's real threshold is unknown and a
+    # 60s ping would be racy against a 60s timeout. A ping frame costs nothing.
+    keepalive_ms = int(os.environ.get("PWW_GRPC_KEEPALIVE_MS", "30000"))
+    if _install_grpc_keepalive(keepalive_ms):
+        logger.info(
+            "gRPC keepalive %.0fs (flwr default 210s): proxied sites are reaped during "
+            "a merge if the stream goes quiet for longer", keepalive_ms / 1000,
+        )
 
     if args.min_clients <= 1:
         logger.info(

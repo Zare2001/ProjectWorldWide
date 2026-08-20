@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slurm_scanner</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --s4: #eda100; --s5: #e87ba4; --s6: #008300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --s4: #c98500; --s5: #d55181; --s6: #008300;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --s4: #c98500; --s5: #d55181; --s6: #008300;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px;
+  background: var(--page); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1080px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 0 0 2px; }
+p.sub { color: var(--ink-2); margin: 0 0 24px; max-width: 68ch; }
+section {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 20px; margin-bottom: 20px;
+}
+.hdr { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.note { color: var(--muted); font-size: 12px; margin: 2px 0 16px; }
+
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+td.num, th.num { text-align: right; }
+tbody tr:last-child td { border-bottom: none; }
+.scroll { overflow-x: auto; }
+.swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: baseline; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 10px; font-size: 12px; color: var(--ink-2); }
+.legend span { white-space: nowrap; }
+
+button {
+  font: inherit; font-size: 12px; color: var(--ink-2); background: none;
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer;
+}
+button:hover { color: var(--ink); }
+button[aria-pressed="true"] { color: var(--ink); border-color: var(--axis); }
+
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 0 0 14px; }
+.controls label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.controls input {
+  font: inherit; font-size: 13px; width: 9ch; color: var(--ink); background: var(--page);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+  font-variant-numeric: tabular-nums;
+}
+.controls button[type="submit"] { color: var(--ink); border-color: var(--axis); padding: 4px 14px; }
+.controls code { color: var(--muted); }
+
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.grid-line { stroke: var(--grid); stroke-width: 1; }
+.axis-line { stroke: var(--axis); stroke-width: 1; }
+.tick { fill: var(--muted); font-size: 11px; }
+.tick-y { text-anchor: end; }
+.series { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.end-label { font-size: 11px; font-weight: 600; }
+.crosshair { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; }
+.dot { stroke: var(--surface); stroke-width: 2; }
+
+.tip {
+  position: fixed; pointer-events: none; opacity: 0; transition: opacity .08s;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.14);
+  font-variant-numeric: tabular-nums; z-index: 9; max-width: 280px;
+}
+.tip b { display: block; margin-bottom: 4px; font-weight: 600; }
+.tip div { display: flex; justify-content: space-between; gap: 14px; }
+.status { font-weight: 600; }
+.hidden { display: none; }
+.empty { color: var(--muted); padding: 8px 0; }
+.warn { color: var(--critical); font-size: 13px; margin: 0 0 12px; }
+
+.bar-queue { fill: var(--grid); }
+.bar-reserve { fill-opacity: .3; }
+.bar-label { font-size: 11px; font-weight: 600; }
+.row-name { fill: var(--ink-2); font-size: 12px; }
+.reasons { margin: 14px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--ink-2); }
+.reasons li { padding: 3px 0; border-top: 1px solid var(--grid); }
+.reasons b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Slurm start times and walltime usage</h1>
+  <p class="sub">
+    Two independent measurements per cluster, shown side by side and never
+    blended: what <code>sbatch --test-only</code> says right now about when a
+    given job shape would start, and how much of their requested walltime
+    finished jobs actually used. The planner below is the one place they are
+    combined, under a <code>discount_strength</code> it reports back.
+  </p>
+
+  <section id="overview-section">
+    <div class="hdr">
+      <div>
+        <h2>Expected start times, all clusters</h2>
+        <p class="note" id="overview-note">Loading…</p>
+      </div>
+      <button id="theme" aria-pressed="false">Dark</button>
+    </div>
+    <div class="scroll"><table id="overview">
+      <thead><tr>
+        <th>Cluster</th><th>Shape</th><th>Partition</th>
+        <th class="num">Est. wait</th><th class="num">Starts at</th>
+        <th class="num">Walltime used</th><th class="num">Probe age</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="plan-section">
+    <div class="hdr">
+      <div>
+        <h2>Plan a job</h2>
+        <p class="note" id="plan-note">Loading…</p>
+      </div>
+      <button id="plan-knobs" aria-pressed="false">Parameters</button>
+    </div>
+    <form class="controls" id="plan-form">
+      <label>Data units
+        <input id="plan-units" type="number" min="1" step="1" value="100" required></label>
+      <button type="submit">Plan</button>
+      <span class="note" id="plan-status" style="margin:0"></span>
+    </form>
+    <!-- Blank means "whatever plan.json says", so the page never asserts a
+         default it would go stale on. -->
+    <div class="controls hidden" id="plan-params">
+      <label><code>discount_strength</code>
+        <input id="p-discount_strength" type="number" min="0" max="1" step="0.1" placeholder="config"></label>
+      <label><code>min_units</code>
+        <input id="p-min_units" type="number" min="0" step="1" placeholder="config"></label>
+      <label><code>reserve_units</code>
+        <input id="p-reserve_units" type="number" min="0" step="1" placeholder="config"></label>
+      <label><code>max_probe_age_hours</code>
+        <input id="p-max_probe_age_hours" type="number" min="0" step="1" placeholder="config"></label>
+      <label><code>max_gpus</code>
+        <input id="p-max_gpus" type="number" min="1" step="1" placeholder="unlimited"></label>
+    </div>
+    <div id="plan-out"></div>
+  </section>
+
+  <div id="charts"></div>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
+const tip = document.getElementById("tip");
+
+const fmtWait = s => {
+  if (s == null) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  if (s < 86400) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + "h";
+  return (s / 86400).toFixed(1) + "d";
+};
+const fmtClock = t => t == null ? "—" :
+  new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric",
+                                          hour: "2-digit", minute: "2-digit" });
+const fmtPct = r => r == null ? "—" : Math.round(r * 100) + "%";
+/* Minutes below the hour, hours above it however long the job. One decimal of an
+   hour turns everything under three minutes into "0.0h", which reads as no time
+   at all rather than a short time — exactly what a reserve on a fast cluster is,
+   at 100 seconds for 10 units at 360 units/h. Days are deliberately not used:
+   these numbers go into `sbatch -t`, and "3.0d" is not a walltime. */
+const fmtHours = h =>
+  h == null ? "—" :
+  h === 0 ? "0h" :
+  h < 1 ? fmtWait(Math.round(h * 3600)) :
+  (h < 10 ? h.toFixed(1) : Math.round(h)) + "h";
+
+async function get(path) {
+  const response = await fetch(path);
+  if (!response.ok) throw new Error(path + " -> " + response.status);
+  return response.json();
+}
+
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  // The endpoint's 400s carry the actual reason (unknown parameter, bad units);
+  // showing it beats "400".
+  if (!response.ok) throw new Error(data.detail || path + " -> " + response.status);
+  return data;
+}
+
+function placeTip(event) {
+  tip.style.opacity = 1;
+  const flip = event.clientX > window.innerWidth - 300;
+  tip.style.left = (event.clientX + (flip ? -16 - tip.offsetWidth : 16)) + "px";
+  tip.style.top = Math.min(event.clientY + 16, window.innerHeight - tip.offsetHeight - 8) + "px";
+}
+
+function rows(pairs) {
+  return pairs.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join("");
+}
+
+// -------------------------------------------------------------------------
+// overview: latest estimate per cluster and shape
+// -------------------------------------------------------------------------
+
+function renderOverview(rows) {
+  const body = document.querySelector("#overview tbody");
+  const note = document.getElementById("overview-note");
+  if (!rows.length) {
+    note.textContent = "No probes yet.";
+    body.innerHTML = `<tr><td colspan="7" class="empty">Waiting for the first probe.</td></tr>`;
+    return;
+  }
+  const clusters = new Set(rows.map(r => r.cluster));
+  note.textContent = `${rows.length} shapes across ${clusters.size} cluster`
+    + `${clusters.size === 1 ? "" : "s"}. Each estimate is conditioned on the `
+    + `probing account's own priority, so a different account may see a different queue.`;
+
+  body.innerHTML = rows.map(row => {
+    // Age is the one thing that can quietly invalidate the whole row, so it
+    // carries an explicit state rather than just a number.
+    const stale = row.age_sec > 3600, old = row.age_sec > 900;
+    const colour = stale ? "var(--critical)" : old ? "var(--warning)" : "var(--muted)";
+    const wait = row.ok
+      ? `<span class="status">${fmtWait(row.estimated_wait_sec)}</span>`
+      : `<span class="status" style="color:var(--critical)" title="${row.message || ""}">no answer</span>`;
+    return `<tr>
+      <td>${row.cluster}</td>
+      <td>${row.shape}<div class="note" style="margin:0">${row.args || ""}</div></td>
+      <td>${row.partition || "—"}</td>
+      <td class="num">${wait}</td>
+      <td class="num">${row.ok ? fmtClock(row.estimated_start) : "—"}</td>
+      <td class="num" title="${row.used_ratio_n_jobs || 0} jobs over ${row.used_ratio_window_hours || "?"}h">
+        ${fmtPct(row.used_ratio)}</td>
+      <td class="num" style="color:${colour}">${fmtWait(row.age_sec)} ago</td>
+    </tr>`;
+  }).join("");
+}
+
+// -------------------------------------------------------------------------
+// line chart
+// -------------------------------------------------------------------------
+
+const PAD = { top: 12, right: 84, bottom: 26, left: 46 };
+const W = 900, H = 260;
+
+function niceTicks(max, count = 4) {
+  if (!(max > 0)) return [0, 1];
+  const raw = max / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].find(m => mag * m >= raw) * mag;
+  const ticks = [];
+  for (let v = 0; v <= max + step / 2; v += step) ticks.push(v);
+  return ticks;
+}
+
+/* series: [{name, colour, points: [{x, y, meta}]}] — a null y breaks the line
+   rather than interpolating across it, so a failed probe reads as a gap
+   instead of an invented straight segment. */
+function lineChart(series, {yFormat, yLabel}) {
+  const points = series.flatMap(s => s.points);
+  const xs = points.map(p => p.x);
+  const ys = points.map(p => p.y).filter(y => y != null);
+  if (!ys.length) return `<p class="empty">No data in this window.</p>`;
+
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const ticks = niceTicks(Math.max(...ys));
+  const yMax = ticks[ticks.length - 1];
+  const sx = v => PAD.left + (x1 === x0 ? 0 : (v - x0) / (x1 - x0)) * (W - PAD.left - PAD.right);
+  const sy = v => PAD.top + (1 - v / yMax) * (H - PAD.top - PAD.bottom);
+
+  const paths = series.map(s => {
+    let d = "", pen = false;
+    for (const p of s.points) {
+      if (p.y == null) { pen = false; continue; }
+      d += (pen ? "L" : "M") + sx(p.x).toFixed(1) + " " + sy(p.y).toFixed(1) + " ";
+      pen = true;
+    }
+    const last = [...s.points].reverse().find(p => p.y != null);
+    // Direct labels are the relief for the light-mode contrast warning: identity
+    // never rests on the line colour alone.
+    const label = last ? `<text class="end-label" fill="${s.colour}"
+        x="${sx(last.x) + 8}" y="${sy(last.y) + 4}">${s.name}</text>` : "";
+    return `<path class="series" stroke="${s.colour}" d="${d.trim()}"/>${label}`;
+  }).join("");
+
+  const xTicks = [x0, (x0 + x1) / 2, x1].map(t =>
+    `<text class="tick" x="${sx(t)}" y="${H - 8}" text-anchor="middle">${fmtClock(t)}</text>`);
+
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${yLabel} over time"
+               data-x0="${x0}" data-x1="${x1}" data-ymax="${yMax}">
+    ${ticks.map(t => `
+      <line class="${t === 0 ? "axis-line" : "grid-line"}"
+            x1="${PAD.left}" x2="${W - PAD.right}" y1="${sy(t)}" y2="${sy(t)}"/>
+      <text class="tick tick-y" x="${PAD.left - 8}" y="${sy(t) + 4}">${yFormat(t)}</text>`).join("")}
+    ${xTicks.join("")}
+    ${paths}
+    <g class="hover"></g>
+    <rect x="${PAD.left}" y="${PAD.top}" width="${W - PAD.left - PAD.right}"
+          height="${H - PAD.top - PAD.bottom}" fill="transparent"/>
+  </svg>`;
+}
+
+/* Crosshair and tooltip on every line chart: an SVG chart in a page is
+   interactive by default, and the nearest-x readout is how you compare series
+   at one instant without reading pixels. */
+function attachHover(svg, series, {yFormat}) {
+  const x0 = +svg.dataset.x0, x1 = +svg.dataset.x1, yMax = +svg.dataset.ymax;
+  const plotW = W - PAD.left - PAD.right, plotH = H - PAD.top - PAD.bottom;
+  const layer = svg.querySelector(".hover");
+  const stamps = [...new Set(series.flatMap(s => s.points.map(p => p.x)))].sort((a, b) => a - b);
+
+  const hide = () => { layer.innerHTML = ""; tip.style.opacity = 0; };
+
+  svg.addEventListener("pointerleave", hide);
+  svg.addEventListener("pointermove", event => {
+    const box = svg.getBoundingClientRect();
+    const ratio = W / box.width;
+    const svgX = (event.clientX - box.left) * ratio;
+    if (svgX < PAD.left - 4 || svgX > W - PAD.right + 4 || !stamps.length) return hide();
+
+    const target = x0 + ((svgX - PAD.left) / plotW) * (x1 - x0 || 1);
+    const at = stamps.reduce((a, b) => Math.abs(b - target) < Math.abs(a - target) ? b : a);
+    const cx = PAD.left + (x1 === x0 ? 0 : (at - x0) / (x1 - x0)) * plotW;
+
+    const hits = series.map(s => ({ s, p: s.points.find(p => p.x === at) }))
+                       .filter(h => h.p && h.p.y != null);
+    layer.innerHTML = `<line class="crosshair" x1="${cx}" x2="${cx}"
+        y1="${PAD.top}" y2="${PAD.top + plotH}"/>` + hits.map(h =>
+      `<circle class="dot" cx="${cx}" r="4.5" fill="${h.s.colour}"
+               cy="${PAD.top + (1 - h.p.y / yMax) * plotH}"/>`).join("");
+
+    tip.innerHTML = `<b>${fmtClock(at)}</b>` + (hits.length ? hits.map(h =>
+      `<div><span><span class="swatch" style="background:${h.s.colour}"></span>${h.s.name}</span>
+       <span>${h.p.meta || yFormat(h.p.y)}</span></div>`).join("")
+      : `<div>no successful probe</div>`);
+    placeTip(event);
+  });
+}
+
+// -------------------------------------------------------------------------
+// per-cluster charts
+// -------------------------------------------------------------------------
+
+function toSeries(rows, keyField, valueField, {meta}) {
+  const names = [...new Set(rows.map(r => r[keyField]))].sort();
+  const stamps = [...new Set(rows.map(r => r.collected_at))].sort((a, b) => a - b);
+  // Colour follows the entity, not its rank, so a series that vanishes from the
+  // window never repaints the others.
+  return names.slice(0, SLOTS.length).map((name, index) => {
+    const byStamp = new Map(rows.filter(r => r[keyField] === name)
+                                .map(r => [r.collected_at, r]));
+    return {
+      name,
+      colour: `var(${SLOTS[index]})`,
+      points: stamps.map(x => {
+        const row = byStamp.get(x);
+        const y = row ? row[valueField] : null;
+        return { x, y: y == null ? null : y, meta: row ? meta(row) : null };
+      }),
+    };
+  });
+}
+
+function chartBlock(id, title, note, series, options) {
+  const legend = series.map(s =>
+    `<span><span class="swatch" style="background:${s.colour}"></span>${s.name}</span>`).join("");
+  const table = `<div class="scroll"><table><thead><tr><th>Time</th>
+      ${series.map(s => `<th class="num">${s.name}</th>`).join("")}</tr></thead><tbody>
+      ${(series[0]?.points || []).map((_, i) => `<tr>
+        <td>${fmtClock(series[0].points[i].x)}</td>
+        ${series.map(s => `<td class="num">${s.points[i].y == null ? "—"
+            : options.yFormat(s.points[i].y)}</td>`).join("")}
+      </tr>`).reverse().join("")}</tbody></table></div>`;
+
+  return `<section>
+    <div class="hdr">
+      <div><h2>${title}</h2><p class="note">${note}</p></div>
+      <button data-table="${id}" aria-pressed="false">Table</button>
+    </div>
+    <div class="legend">${legend}</div>
+    <div id="${id}">${lineChart(series, options)}</div>
+    <div id="${id}-table" class="hidden">${table}</div>
+  </section>`;
+}
+
+function renderCharts(probes, usage) {
+  const clusters = [...new Set([...probes, ...usage].map(r => r.cluster))].sort();
+  const host = document.getElementById("charts");
+  if (!clusters.length) { host.innerHTML = ""; return; }
+
+  const blocks = [];
+  const wire = [];
+  clusters.forEach((cluster, n) => {
+    const mine = probes.filter(r => r.cluster === cluster);
+    const theirs = usage.filter(r => r.cluster === cluster);
+
+    if (mine.length) {
+      const series = toSeries(mine, "name", "estimated_wait_sec", {
+        meta: row => row.ok ? fmtWait(row.estimated_wait_sec) : "no answer",
+      });
+      const failures = mine.filter(r => !r.ok).length;
+      const options = { yFormat: fmtWait, yLabel: "Estimated wait" };
+      blocks.push(chartBlock(`wait-${n}`, `${cluster} — estimated wait per shape`,
+        `What <code>sbatch --test-only</code> answered, per probe. Gaps are probes `
+        + `Slurm declined to answer${failures ? ` (${failures} in this window)` : ""}.`,
+        series, options));
+      wire.push([`wait-${n}`, series, options]);
+    }
+
+    if (theirs.length) {
+      const series = toSeries(theirs, "partition", "used_ratio", {
+        meta: row => `${fmtPct(row.used_ratio)} · ${row.n_jobs} jobs`,
+      });
+      const options = { yFormat: fmtPct, yLabel: "Walltime used" };
+      blocks.push(chartBlock(`usage-${n}`, `${cluster} — walltime actually used`,
+        `Time-weighted <code>elapsed / timelimit</code> for jobs finishing in each `
+        + `window. Each point is its own overlapping window, so these are `
+        + `independent measurements, not increments.`, series, options));
+      wire.push([`usage-${n}`, series, options]);
+    }
+  });
+
+  host.innerHTML = blocks.join("");
+  for (const [id, series, options] of wire) {
+    const svg = document.querySelector(`#${id} svg`);
+    if (svg) attachHover(svg, series, options);
+  }
+  host.querySelectorAll("button[data-table]").forEach(button => {
+    button.addEventListener("click", () => {
+      const shown = button.getAttribute("aria-pressed") === "true";
+      button.setAttribute("aria-pressed", String(!shown));
+      document.getElementById(button.dataset.table + "-table").classList.toggle("hidden", shown);
+    });
+  });
+}
+
+// -------------------------------------------------------------------------
+// planner: X data units -> a job per cluster, drawn on one timeline
+// -------------------------------------------------------------------------
+
+const BPAD = { top: 8, right: 76, bottom: 28, left: 108 };
+const ROW = 32, BAR = 16;
+
+/* One row per cluster, all sharing an x-axis in hours from now, because the
+   whole point of the plan is which clusters overlap: the queue wait, the work
+   itself and the reserve tail are three segments of one bar rather than three
+   numbers in a table. */
+function timeline(plan) {
+  const jobs = plan.clusters;
+  const H = BPAD.top + jobs.length * ROW + BPAD.bottom;
+  // The axis ends at the real span, not at a round tick: niceTicks may round its
+  // last tick below the maximum, and here that would push bars past the plot and
+  // over the labels rather than just clipping a peak.
+  const xMax = Math.max(plan.latest_finish_hours || 0,
+    ...jobs.map(job => job.start_hours + job.walltime_hours), 0.5);
+  const ticks = niceTicks(xMax, 5).filter(t => t <= xMax);
+  const plotW = W - BPAD.left - BPAD.right;
+  const sx = h => BPAD.left + (h / xMax) * plotW;
+
+  const grid = ticks.map(t => `
+    <line class="${t === 0 ? "axis-line" : "grid-line"}" x1="${sx(t)}" x2="${sx(t)}"
+          y1="${BPAD.top}" y2="${H - BPAD.bottom}"/>
+    <text class="tick" x="${sx(t)}" y="${H - 10}" text-anchor="middle">${fmtHours(t)}</text>`);
+
+  const bars = jobs.map((job, index) => {
+    const colour = `var(${SLOTS[index % SLOTS.length]})`;
+    const top = BPAD.top + index * ROW + (ROW - BAR) / 2;
+    const mid = top + BAR / 2 + 4;
+    const work = sx(job.start_hours), done = sx(job.finish_hours);
+    const tail = sx(job.start_hours + job.walltime_hours);
+    // A width of at least 2 px wherever the quantity is nonzero. A fast cluster's
+    // reserve is genuinely short — 10 units at 360 units/h is 100 seconds, which
+    // is a sixth of a pixel here — and drawing that as nothing says "no reserve"
+    // when the truth is "a small one". The tooltip carries the real number.
+    const least = (span, present) => present ? Math.max(span, 2) : 0;
+    return `<g class="bar-row" data-index="${index}">
+      <rect x="${BPAD.left}" y="${BPAD.top + index * ROW}" width="${plotW}"
+            height="${ROW}" fill="transparent"/>
+      <text class="row-name" x="${BPAD.left - 10}" y="${mid}" text-anchor="end">${job.cluster}</text>
+      <rect class="bar-queue" x="${sx(0)}" y="${top}" rx="3"
+            width="${least(work - sx(0), job.start_hours > 0)}" height="${BAR}"/>
+      <rect x="${work}" y="${top}" rx="3" fill="${colour}"
+            width="${least(done - work, true)}" height="${BAR}"/>
+      <rect class="bar-reserve" x="${done}" y="${top}" rx="3" fill="${colour}"
+            width="${least(tail - done, job.reserve_hours > 0)}" height="${BAR}"/>
+      <text class="bar-label" x="${tail + 8}" y="${mid}" fill="${colour}">${job.units}</text>
+    </g>`;
+  });
+
+  // The horizon is the answer to "when is the data done", and it is not the end
+  // of the longest bar: the reserve sits past it.
+  const horizon = plan.horizon_hours ? `
+    <line class="crosshair" x1="${sx(plan.horizon_hours)}" x2="${sx(plan.horizon_hours)}"
+          y1="${BPAD.top}" y2="${H - BPAD.bottom}"/>
+    <text class="tick" x="${sx(plan.horizon_hours)}" y="${BPAD.top - 0}"
+          text-anchor="middle">all done ${fmtHours(plan.horizon_hours)}</text>` : "";
+
+  return `<svg viewBox="0 0 ${W} ${H}" role="img"
+               aria-label="allocation per cluster over the next ${fmtHours(xMax)}">
+    ${grid.join("")}${bars.join("")}${horizon}
+  </svg>`;
+}
+
+function attachBarHover(svg, plan) {
+  svg.addEventListener("pointerleave", () => tip.style.opacity = 0);
+  svg.querySelectorAll(".bar-row").forEach(group => {
+    group.addEventListener("pointermove", event => {
+      const job = plan.clusters[+group.dataset.index];
+      const raw = job.wait_raw_sec === job.wait_eff_sec ? ""
+        : ` (raw ${fmtWait(job.wait_raw_sec)})`;
+      tip.innerHTML = `<b>${job.cluster} — ${job.shape}</b>` + rows([
+        ["data units", job.units],
+        ["ask for walltime", fmtHours(job.walltime_hours)],
+        ["of which reserve", fmtHours(job.reserve_hours)],
+        ["queue wait used", fmtWait(job.wait_eff_sec) + raw],
+        ["their walltime use", fmtPct(job.used_ratio)],
+        ["throughput", job.units_per_hour + " units/h" + (job.units_per_gpu_per_hour && job.gpus ? ` (${job.gpus} GPU${job.gpus > 1 ? "s" : ""} @ ${job.units_per_gpu_per_hour}/GPU/h)` : "")],
+        ["starts / finishes", fmtHours(job.start_hours) + " / " + fmtHours(job.finish_hours)],
+        ["probe age", fmtWait(job.probe_age_sec)],
+      ]);
+      placeTip(event);
+    });
+  });
+}
+
+function renderPlan(plan) {
+  const parameters = Object.entries(plan.params)
+    .map(([k, v]) => `<code>${k}</code> ${v}`).join(", ");
+  document.getElementById("plan-note").innerHTML =
+    `Waterfilled with ${parameters}. Bars run from now: grey is the queue wait, `
+    + `colour is processing, faint is reserve walltime the job may not need.`;
+
+  const parts = [];
+  // Two ways to come up short, and they have nothing to do with each other: no
+  // cluster was usable at all, or the usable ones are full.
+  if (!plan.clusters.length) {
+    parts.push(plan.excluded.length
+      ? `<p class="warn">None of the ${plan.units} units could be placed — every
+         configured cluster was ruled out:</p>`
+      : `<p class="empty">No clusters are configured for planning —
+         <code>plan.json</code> has an empty <code>clusters</code> list.</p>`);
+  } else {
+    if (!plan.feasible) {
+      parts.push(`<p class="warn">${plan.unassigned_units} of ${plan.units} units do not
+        fit — the clusters below are at their walltime limit. Send less, raise
+        <code>max_walltime_hours</code>, or add a cluster.</p>`);
+    }
+    parts.push(`<div class="legend">
+      <span><span class="swatch" style="background:var(--grid)"></span>queue wait</span>
+      <span><span class="swatch" style="background:var(--s1)"></span>processing</span>
+      <span><span class="swatch" style="background:var(--s1);opacity:.3"></span>reserve</span>
+    </div>`);
+    parts.push(`<div id="plan-chart">${timeline(plan)}</div>`);
+    parts.push(`<div class="scroll"><table><thead><tr>
+        <th>Cluster</th><th>Shape</th><th>Partition</th><th class="num">Units</th>
+        <th class="num">Walltime</th><th class="num">Starts in</th>
+        <th class="num">Done in</th><th class="num">Wait used</th>
+        <th class="num">Walltime used</th>
+      </tr></thead><tbody>${plan.clusters.map((job, index) => `<tr>
+        <td><span class="swatch" style="background:var(${SLOTS[index % SLOTS.length]})"></span>${job.cluster}</td>
+        <td>${job.shape}</td>
+        <td>${job.partition || "—"}</td>
+        <td class="num status">${job.units}</td>
+        <td class="num">${fmtHours(job.walltime_hours)}</td>
+        <td class="num">${fmtHours(job.start_hours)}</td>
+        <td class="num">${fmtHours(job.finish_hours)}</td>
+        <td class="num" title="raw estimate ${fmtWait(job.wait_raw_sec)}">${fmtWait(job.wait_eff_sec)}</td>
+        <td class="num">${fmtPct(job.used_ratio)}</td>
+      </tr>`).join("")}</tbody></table></div>`);
+  }
+
+  // Never silently short a cluster: every configured cluster is either a bar
+  // above or a reason here.
+  if (plan.excluded.length) {
+    parts.push(`<ul class="reasons">${plan.excluded.map(item =>
+      `<li><b>${item.cluster}</b> — ${item.reason}</li>`).join("")}</ul>`);
+  }
+
+  const host = document.getElementById("plan-out");
+  host.innerHTML = parts.join("");
+  const svg = host.querySelector("#plan-chart svg");
+  if (svg) attachBarHover(svg, plan);
+}
+
+const KNOBS = ["discount_strength", "min_units", "reserve_units", "max_probe_age_hours", "max_gpus"];
+
+async function requestPlan() {
+  const status = document.getElementById("plan-status");
+  const units = parseInt(document.getElementById("plan-units").value, 10);
+  if (!(units >= 1)) {
+    status.innerHTML = `<span style="color:var(--critical)">Enter a positive number of units.</span>`;
+    return;
+  }
+  const body = { units };
+  for (const knob of KNOBS) {
+    const raw = document.getElementById("p-" + knob).value.trim();
+    if (raw !== "") body[knob] = Number(raw);
+  }
+  status.textContent = "Planning…";
+  try {
+    renderPlan(await post("/plan", body));
+    status.textContent = "";
+  } catch (error) {
+    status.innerHTML = `<span style="color:var(--critical)">${error.message}</span>`;
+  }
+}
+
+document.getElementById("plan-form").addEventListener("submit", event => {
+  event.preventDefault();
+  requestPlan();
+});
+document.getElementById("plan-knobs").addEventListener("click", event => {
+  const shown = event.target.getAttribute("aria-pressed") === "true";
+  event.target.setAttribute("aria-pressed", String(!shown));
+  document.getElementById("plan-params").classList.toggle("hidden", shown);
+});
+
+// -------------------------------------------------------------------------
+
+document.getElementById("theme").addEventListener("click", event => {
+  const dark = document.documentElement.dataset.theme === "dark";
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  event.target.setAttribute("aria-pressed", String(!dark));
+  event.target.textContent = dark ? "Dark" : "Light";
+});
+
+async function load() {
+  try {
+    const [overview, probes, usage] = await Promise.all([
+      get("/overview"), get("/probes?hours=168"), get("/usage?hours=720"),
+    ]);
+    renderOverview(overview.rows);
+    renderCharts(probes.rows, usage.rows);
+  } catch (error) {
+    document.getElementById("overview-note").textContent = "Failed to load: " + error.message;
+  }
+  // Replanned on every refresh, not just on submit: a plan drawn against
+  // half-hour-old estimates beside a fresh overview would be quietly wrong.
+  requestPlan();
+}
+
+load();
+setInterval(load, 300000);
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "cluster": "snellius",
+  "server": "http://145.38.195.124:8000",
+  "token": "<existing snellius token>",
+
+  "partitions": ["gpu_h100"],
+  "usage_hours": 48,
+
+  "shapes": [
+    {"name": "h100_1gpu_1h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "1", "-t", "1:00:00"]},
+    {"name": "h100_1gpu_4h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "1", "-t", "4:00:00"]},
+    {"name": "h100_1gpu_8h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "1", "-t", "8:00:00"]},
+    {"name": "h100_1gpu_24h",  "args": ["-p", "gpu_h100", "--gpus-per-node", "1", "-t", "24:00:00"]},
+    {"name": "h100_1gpu_40h",  "args": ["-p", "gpu_h100", "--gpus-per-node", "1", "-t", "40:00:00"]},
+
+    {"name": "h100_full_1h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "4", "-t", "1:00:00"]},
+    {"name": "h100_full_4h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "4", "-t", "4:00:00"]},
+    {"name": "h100_full_8h",   "args": ["-p", "gpu_h100", "--gpus-per-node", "4", "-t", "8:00:00"]},
+    {"name": "h100_full_24h",  "args": ["-p", "gpu_h100", "--gpus-per-node", "4", "-t", "24:00:00"]},
+    {"name": "h100_full_40h",  "args": ["-p", "gpu_h100", "--gpus-per-node", "4", "-t", "40:00:00"]},
+
+    {"name": "h100_2node_8h",  "args": ["-p", "gpu_h100", "-N", "2", "--gpus-per-node", "4", "-t", "8:00:00"]},
+    {"name": "h100_32node_8h", "args": ["-p", "gpu_h100", "-N", "32", "--gpus-per-node", "4", "-t", "8:00:00"]}
+  ]
+}

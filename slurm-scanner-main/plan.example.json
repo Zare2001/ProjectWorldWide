@@ -1,0 +1,41 @@
+{
+  "defaults": {
+    "reserve_units": 10,
+    "min_units": 10,
+    "discount_strength": 0.5,
+    "max_probe_age_hours": 9999999,
+    "max_gpus": 0
+  },
+
+  "clusters": [
+    {
+      "cluster": "snellius",
+      "units_per_gpu_per_hour": 10,
+      "shapes": {
+        "h100_1gpu_8h": 1,
+        "h100_full_8h": 4
+      },
+      "max_walltime_hours": 120,
+      "min_units": 10
+    },
+    {
+      "cluster": "frontier",
+      "units_per_gpu_per_hour": 22.5,
+      "shapes": {
+        "mi250_8gpu_24h": 8
+      },
+      "max_walltime_hours": 72,
+      "min_units": 40
+    },
+    {
+      "cluster": "lumi",
+      "units_per_gpu_per_hour": 22.5,
+      "shapes": {
+        "mi250x_1node_8h": 8,
+        "mi250x_2node_8h": 16
+      },
+      "max_walltime_hours": 48,
+      "min_units": 80
+    }
+  ]
+}

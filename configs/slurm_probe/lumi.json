@@ -1,0 +1,24 @@
+{
+  "cluster": "lumi",
+  "server": "http://145.38.195.124:8000",
+  "token": "<existing lumi token>",
+
+  "partitions": ["small-g", "standard-g"],
+  "usage_hours": 48,
+
+  "shapes": [
+    {"name": "1gpu_1h",    "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=1", "-t", "1:00:00"]},
+    {"name": "1gpu_4h",    "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=1", "-t", "4:00:00"]},
+    {"name": "1gpu_8h",    "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=1", "-t", "8:00:00"]},
+    {"name": "1gpu_24h",   "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=1", "-t", "24:00:00"]},
+    {"name": "1gpu_40h",   "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=1", "-t", "40:00:00"]},
+
+    {"name": "2gpu_1h",    "args": ["-A", "project_462000226", "-p", "small-g", "--gpus=2", "-t", "1:00:00"]},
+
+    {"name": "1node_1h",   "args": ["-A", "project_462000226", "-p", "standard-g", "-N", "1", "--gpus-per-node", "8", "-t", "1:00:00"]},
+    {"name": "1node_4h",   "args": ["-A", "project_462000226", "-p", "standard-g", "-N", "1", "--gpus-per-node", "8", "-t", "4:00:00"]},
+    {"name": "1node_8h",   "args": ["-A", "project_462000226", "-p", "standard-g", "-N", "1", "--gpus-per-node", "8", "-t", "8:00:00"]},
+    {"name": "1node_24h",  "args": ["-A", "project_462000226", "-p", "standard-g", "-N", "1", "--gpus-per-node", "8", "-t", "24:00:00"]},
+    {"name": "1node_40h",  "args": ["-A", "project_462000226", "-p", "standard-g", "-N", "1", "--gpus-per-node", "8", "-t", "40:00:00"]}
+  ]
+}
