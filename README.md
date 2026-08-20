@@ -191,13 +191,16 @@ commands** — including first-time setup, which this omits.
 | the outer step | [src/pww/central/globalstate.py](src/pww/central/globalstate.py) — the streaming FedMom merge; [strategy.py](src/pww/central/strategy.py) — the round protocol |
 | getting weights across | [src/pww/titan/params.py](src/pww/titan/params.py) inline, [src/pww/delta.py](src/pww/delta.py) out-of-band |
 | single-site DiLoCo (no WAN) | [src/pww/diloco.py](src/pww/diloco.py) — same algorithm as a collective inside one allocation |
+| which sites to submit, and when | [src/pww/plan/](src/pww/plan/) — `timeline.py` simulates the round barrier forward, `search.py` picks the submission plan ([PLANNER.md](PLANNER.md)) |
 
 Step-by-step commands are in **[RUNBOOK.md](RUNBOOK.md)**, the reference behind them in
 **[FEDERATION_GUIDE.md](FEDERATION_GUIDE.md)**, the torchtitan environment
 requirements in **[scripts/titan/README.md](scripts/titan/README.md)**, and bringing a
 third machine into the federation in **[ADDING_A_CLUSTER.md](ADDING_A_CLUSTER.md)**.
 The arm that goes past plain DiLoCo — server-scheduled sync periods (QSR) plus a
-Jensen-gauge dispersion controller — is **[DCLT_ARM.md](DCLT_ARM.md)**.
+Jensen-gauge dispersion controller — is **[DCLT_ARM.md](DCLT_ARM.md)**. Deciding which
+sites to submit, at what shape and starting when, from the measured queue and the corpus
+DARL has left, is **[PLANNER.md](PLANNER.md)**.
 
 ## Layout
 

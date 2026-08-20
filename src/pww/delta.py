@@ -335,15 +335,27 @@ def _full(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _write_shard_into(param: torch.Tensor, full_value: torch.Tensor) -> None:
-    """Copy the slice of `full_value` this rank owns into `param`, in place."""
+    """Copy the slice of `full_value` this rank owns into `param`, in place.
+
+    Device as well as dtype, and the device half is not optional: `full_value` reaches
+    here from a TensorFile, which builds every tensor with torch.frombuffer and so
+    always hands back CPU -- its `dtype` argument does not touch device. `param` under
+    FSDP2 is a DTensor on a CUDA mesh, and distribute_tensor requires its input on that
+    mesh, raising "Expected all tensors to be on the same device" otherwise.
+
+    The inline path resolves the target device exactly this way (see
+    titan/params.py: `incoming.to(dtype=..., device=target_device)`); this one converted
+    dtype alone, so it could only ever work on a CPU-only model. It stayed invisible
+    until blob transport carried a real run for the first time.
+    """
+    target = param.to_local().device if hasattr(param, "to_local") else param.device
+    value = full_value.to(dtype=param.dtype, device=target)
     if not hasattr(param, "device_mesh"):
-        param.detach().copy_(full_value.to(param.dtype))
+        param.detach().copy_(value)
         return
     from torch.distributed.tensor import distribute_tensor
 
-    sharded = distribute_tensor(
-        full_value.to(param.dtype), param.device_mesh, param.placements
-    )
+    sharded = distribute_tensor(value, param.device_mesh, param.placements)
     param.detach().to_local().copy_(sharded.to_local())
 
 
@@ -448,7 +460,12 @@ def stream_gather_delta(
                 local_full = _full(param)
                 if writer is None:
                     continue
-                base = reference.get(key, torch.float32)
+                # Same CPU-from-TensorFile problem as _write_shard_into, in the other
+                # direction: `local_full` is the live parameter (CUDA) and `base` was
+                # just read off disk, so the subtraction below is cross-device unless
+                # one of them moves. Moving `base` keeps the arithmetic where the
+                # weights already are; TensorWriter.add copies back to CPU anyway.
+                base = reference.get(key, torch.float32).to(local_full.device)
                 difference = local_full.to(torch.float32) - base
                 delta_sq += float(difference.pow(2).sum())
                 base_sq += float(base.pow(2).sum())

@@ -1,0 +1,95 @@
+{
+  "_": [
+    "Overrides for the planner's built-in calibration (src/pww/plan/rounds.py).",
+    "The defaults live in CODE, not here, because rounds.residuals() checks the model",
+    "against the measured regimes at import time and a self-check that depends on an",
+    "editable config checks nothing. This file overrides; every entry it overrides must",
+    "carry its own quality flag, and an unlabelled number is refused rather than assumed",
+    "identified.",
+    "",
+    "Deliberately NOT the scanner's plan.json: that file is read at import time and a",
+    "missing or malformed one makes the server refuse to boot, so every edit costs a",
+    "restart and loses the probe rows that land during it."
+  ],
+
+  "merge": {
+    "value_s": 17.0,
+    "quality": "identified",
+    "provenance": "merge-complete deltas across all four central logs, every membership: 15-19 s. fp32 weighted mean + Nesterov outer step + 5.29 GiB npz write. The only site-independent term."
+  },
+
+  "sites": {
+    "snellius": {
+      "xfer": {
+        "value_s": 33.5,
+        "quality": "identified",
+        "provenance": "solo fit-transport, central-latejoin (33.5 s) and central-churn (34 s), n=199 rounds"
+      },
+      "eval_fix": {
+        "value_s": 23.6,
+        "quality": "identified",
+        "provenance": "solo evaluate segment 25.5 s minus 512 windows / (3 x 89.8 seq/s) of forward-only validation compute"
+      }
+    },
+    "lumi": {
+      "xfer": {
+        "value_s": 64.2,
+        "quality": "derived_by_subtraction",
+        "provenance": "two-site fit-transport 97.7 s minus Snellius' identified 33.5 s. NO LUMI-SOLO ROUND EXISTS in any log, so this is a difference of two measurements, not a measurement."
+      },
+      "eval_fix": {
+        "value_s": 34.7,
+        "quality": "derived_by_subtraction",
+        "provenance": "two-site evaluate 64.7 s minus Snellius' 25.5 s minus 512/(3 x 38.2). Same caveat."
+      }
+    }
+  },
+
+  "regimes": [
+    {
+      "label": "snellius@4 solo",
+      "members": [["snellius", 4]],
+      "inner_steps": 100, "accums": [1],
+      "measured_period_s": 113.0, "quality": "identified", "tolerance": 0.05,
+      "note": "111-117 s over 98+100 solo rounds (latejoin, churn, full-run6)"
+    },
+    {
+      "label": "snellius@4 + lumi@8",
+      "members": [["snellius", 4], ["lumi", 8]],
+      "inner_steps": 100, "accums": [1, 1],
+      "measured_period_s": 353.0, "quality": "identified", "tolerance": 0.05,
+      "note": "348-358 s over 197+99+101 two-site rounds"
+    },
+    {
+      "label": "snellius@1 solo, accum 5",
+      "members": [["snellius", 1]],
+      "inner_steps": 100, "accums": [5],
+      "measured_period_s": 248.0, "quality": "identified", "tolerance": 0.05,
+      "note": "balanced-LIVE. Out of sample for the fitted constants, so it is a real check of them."
+    },
+    {
+      "label": "snellius@1 + lumi@1",
+      "members": [["snellius", 1], ["lumi", 1]],
+      "inner_steps": 100, "accums": [1, 1],
+      "measured_period_s": 363.0, "quality": "extrapolated", "tolerance": 0.05,
+      "note": "n=2 rounds, and NO additive form reproduces it. LUMI@1's predicted evaluate compute alone approaches the whole measured evaluate segment, so either that barrier is partly a MAX rather than a SUM, or validation.local_batch_size differs at reduced geometry. THE MEASUREMENT THAT CLOSES IT: one two-site 1-device round with PWW_VAL_WINDOWS logged, differenced merge-complete to merge-complete."
+    }
+  ],
+
+  "val_windows": 512,
+  "tau_stall_s": 378.0,
+  "seq_len": 2048,
+  "block_size": 1024,
+
+  "startup_cost_s": {
+    "_": "c is an INPUT, not a guess, and it is not measurable from any existing log: no job script prints a timestamp before torchrun and Slurm writes no start line into logs/%x-%j.out. To measure it, add `date +%s > ${PWW_ROOT}/logs/jobstart-${SLURM_JOB_ID}` as the first command after the #SBATCH block, then diff against the first [titan] line; or sacct -j <id> -o Start on a login node. Until then these are LOWER BOUNDS and the c-sensitivity pass (c/2, c, 2c) runs on every plan.",
+    "snellius": {"value_s": 108.0, "quality": "lower_bound", "provenance": "first titan line to first training step: 10.9 s solo, 49 s federated-at-start; plus an unmeasured shell/venv prologue"},
+    "lumi": {"value_s": 216.0, "quality": "lower_bound", "provenance": "19.7 s solo, 157 s federated-at-start; plus a 13.5 GB sif exec on Lustre and the per-job MIOpen autotune warm-up (cache keyed on SLURM_JOB_ID, so every chain link re-pays it)"}
+  },
+
+  "site_limits": {
+    "_": "NOT readable from the aggregator VM -- there is no sbatch, sacct or scontrol on it -- and not recorded in the repo. Every value here is ASSUMED and the report echoes it as such. Verify with `scontrol show assoc_mgr account=<acct>` on a login node. Snellius priority is ~98% fairshare with a one-day decay half-life, so many submissions do cost queue position.",
+    "snellius": {"max_submit_jobs": null, "max_running_jobs": null, "max_array_size": null, "source": "assumed"},
+    "lumi": {"max_submit_jobs": null, "max_running_jobs": null, "max_array_size": null, "source": "assumed"}
+  }
+}

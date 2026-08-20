@@ -45,10 +45,17 @@ try:
 except Exception:
     sys.exit()
 gib = 2 ** 30
-print(f"  blobs {usage.get(\"blobs\", 0)} | {usage.get(\"bytes\", 0) / gib:.2f} GiB used "
-      f"| {usage.get(\"disk_free\", 0) / gib:.2f} GiB free")
-print(f"  transferred: {usage.get(\"bytes_in\", 0) / gib:.2f} GiB in, "
-      f"{usage.get(\"bytes_out\", 0) / gib:.2f} GiB out")
+# Bound to locals first: an f-string expression cannot contain a backslash before
+# Python 3.12, and this VM runs 3.10 -- the escaped quotes needed by the enclosing
+# shell single-quotes made every blob line a SyntaxError, so the one transport that
+# needs these counters was the one that never printed them.
+blobs = usage.get("blobs", 0)
+used = usage.get("bytes", 0) / gib
+free = usage.get("disk_free", 0) / gib
+bin_ = usage.get("bytes_in", 0) / gib
+bout = usage.get("bytes_out", 0) / gib
+print(f"  blobs {blobs} | {used:.2f} GiB used | {free:.2f} GiB free")
+print(f"  transferred: {bin_:.2f} GiB in, {bout:.2f} GiB out")
 ' || true
 else
     echo "Blob store is STOPPED (only needed for TRANSPORT=blob)."

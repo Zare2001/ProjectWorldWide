@@ -37,7 +37,12 @@ DARL_PORT="${PWW_DARL_PORT:-29510}"
 FLOWER_PORT="${PWW_FLOWER_PORT:-29511}"
 NPROC=""
 NNODES="${SLURM_NNODES:-1}"
-DUMP=""
+# --dump is unreachable from an sbatch line: both job scripts call this script with
+# a fixed argument list terminated by `-- "$@"`, so PWW_DUMP is the only way to give
+# a lane its own dump folder. It must be read HERE and not only where --job.dump_folder
+# is appended, because PWW_FRESH_RUN reads ${DUMP:-} and otherwise falls back to the
+# toml's dump_folder -- deleting the SHARED checkpoint instead of the lane's.
+DUMP="${PWW_DUMP:-}"
 SITE_OVERRIDE=""
 # Distinguishes concurrent jobs at ONE site. Empty means "the only job here", which
 # is the common case; see the block that consumes it below for why it matters.
@@ -288,7 +293,12 @@ if [[ "${PWW_BALANCE:-0}" == "1" && -z "${PWW_GRAD_ACCUM:-}" ]]; then
             _bal_self="$(awk -v b="${!_bal_b}" -v t="${!_bal_t}" 'BEGIN{print b/t}')"
         fi
         _bal_slow=""
-        for _peer in ${PWW_BALANCE_PEERS:-$(compgen -A variable | grep '^PWW_TPUT_' | sed 's/^PWW_TPUT_//')}; do
+        # The fallback globs the registry. Geometry-keyed cells (PWW_TPUT_LUMI_1 and
+        # friends) are read only by src/pww/plan, which resolves geometry itself; letting
+        # them in here invents peers that are not in the round and lets the wrong one set
+        # the pace. They differ from a real site name by the _<devices> suffix alone, so
+        # that suffix is what gets filtered. Naming PWW_BALANCE_PEERS skips all of this.
+        for _peer in ${PWW_BALANCE_PEERS:-$(compgen -A variable | grep '^PWW_TPUT_' | sed 's/^PWW_TPUT_//' | grep -vE '_[0-9]+$')}; do
             _puc="$(echo "${_peer}" | tr '[:lower:]-' '[:upper:]_')"
             _pt="PWW_TPUT_${_puc}"; _pb="PWW_BATCH_${_puc}"
             if [[ -z "${!_pt:-}" || -z "${!_pb:-}" ]]; then
