@@ -277,15 +277,34 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 client = DiLoCoFlowerClient(federated, initial_state,
                                             control_group=control_pg)
-                logger.info(
-                    "connecting to Flower server at %s (H=%d inner steps per round)",
-                    flower_cfg.server_address, darl_cfg.inner_steps,
-                )
-                fl.client.start_client(
-                    server_address=flower_cfg.server_address,
-                    client=client.to_client(),
-                    grpc_max_message_length=flower_cfg.max_message_length,
-                )
+                if getattr(flower_cfg, "protocol", "grpc") == "http":
+                    from ..http_round_client import run_http_client
+
+                    logger.info(
+                        "connecting to the HTTP round endpoint at %s "
+                        "(H=%d inner steps per round)",
+                        flower_cfg.server_address, darl_cfg.inner_steps,
+                    )
+                    run_http_client(
+                        client,
+                        url=f"http://{flower_cfg.server_address}",
+                        cluster_id=client.cluster_id,
+                        ranks=dist.get_world_size() if dist.is_initialized() else 1,
+                        token=darl_cfg.token,
+                        # A site that needs the proxy for DARL needs it here too: both
+                        # are plain HTTP to the same host.
+                        use_proxy=darl_cfg.use_proxy,
+                    )
+                else:
+                    logger.info(
+                        "connecting to Flower server at %s (H=%d inner steps per round)",
+                        flower_cfg.server_address, darl_cfg.inner_steps,
+                    )
+                    fl.client.start_client(
+                        server_address=flower_cfg.server_address,
+                        client=client.to_client(),
+                        grpc_max_message_length=flower_cfg.max_message_length,
+                    )
             finally:
                 if client is not None:
                     client.stop_workers()

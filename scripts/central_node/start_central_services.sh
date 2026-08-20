@@ -49,6 +49,17 @@ _remember() {  # $1=file $2=key $3=ERE the value must match entirely
 # real disk: the global model and the momentum buffer are resident, plus one
 # delta per site transiently. See scripts/titan/README.md for the arithmetic.
 TRANSPORT="${TRANSPORT:-$(_remember "${LAUNCH_FILE}" TRANSPORT '[a-z]+' || echo inline)}"
+# How the ROUND protocol reaches the sites, as opposed to how the WEIGHTS do.
+#
+#   PROTOCOL=http   the round config and result metrics travel as short HTTP
+#                   request/response calls instead of on one long-lived gRPC stream.
+#
+# For a site whose compute nodes reach us only through an HTTP forward proxy: that
+# proxy carries DARL and the blob store all day without a single failure, and reaps
+# the gRPC stream mid-round every time. Requires TRANSPORT=blob -- the round protocol
+# carries metrics, never weights. Remembered like TRANSPORT so a restart cannot
+# quietly become the other one while the sites still expect this.
+PROTOCOL="${PROTOCOL:-$(_remember "${LAUNCH_FILE}" PROTOCOL '[a-z]+' || echo grpc)}"
 # Both under PWW_OUTPUT_DIR by default, and deliberately on the same filesystem:
 # publishing a merged global model into the blob store is then a hard link rather
 # than a copy of up to hundreds of gigabytes.
@@ -76,7 +87,8 @@ echo " Central Node Host: $(hostname -f 2>/dev/null || hostname)"
 echo " Central Node Public IP: 145.38.206.143"
 echo " DARL Port:   ${DARL_PORT}"
 echo " Flower Port: ${FLOWER_PORT}"
-echo " Transport:   ${TRANSPORT}"
+echo " Transport:   ${TRANSPORT}   (weights)"
+echo " Protocol:    ${PROTOCOL}   (round protocol)"
 if [[ "${TRANSPORT}" == "blob" ]]; then
 echo " Blob Port:   ${BLOB_PORT}  (${BLOB_URL})"
 echo " Blob Root:   ${BLOB_ROOT}"
@@ -322,7 +334,7 @@ else
 fi
 
 # 2. Start the blob store (blob transport only)
-SERVER_EXTRA=(--transport "${TRANSPORT}" --run-id "${RUN_ID}"
+SERVER_EXTRA=(--transport "${TRANSPORT}" --protocol "${PROTOCOL}" --run-id "${RUN_ID}"
               ${FRESH_MODEL_EXTRA[@]+"${FRESH_MODEL_EXTRA[@]}"}
               ${NUM_ROUNDS_EXTRA[@]+"${NUM_ROUNDS_EXTRA[@]}"})
 if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
@@ -333,6 +345,13 @@ if [[ "${ENABLE_WANDB:-0}" == "1" ]] || [[ -n "${WANDB_PROJECT:-}" ]]; then
     export WANDB_DIR="${WANDB_DIR:-${STATE_DIR}}"
     SERVER_EXTRA+=(--enable-wandb --wandb-project "${WANDB_PROJECT}" --wandb-run-name "${WANDB_RUN_NAME}")
 fi
+if [[ "${PROTOCOL}" == "http" && "${TRANSPORT}" != "blob" ]]; then
+    echo "ERROR: PROTOCOL=http requires TRANSPORT=blob. The HTTP round protocol carries" >&2
+    echo "       round config and metrics only; inline would put the whole model in a" >&2
+    echo "       control message, which is the thing it exists to avoid." >&2
+    exit 2
+fi
+
 if [[ "${TRANSPORT}" == "blob" ]]; then
     mkdir -p "${BLOB_ROOT}" "${GLOBAL_STATE_DIR}"
     if [[ -f "${BLOB_PID_FILE}" ]] && kill -0 "$(cat "${BLOB_PID_FILE}")" 2>/dev/null; then
@@ -387,8 +406,8 @@ else
     # on the DEFAULT 29510-29512 -- observed killing the full arm's live
     # aggregator mid-run as a side effect of stopping the dclt stack, because
     # the stop call carried PWW_OUTPUT_DIR but not the port variables.
-    printf 'TRANSPORT=%s\nAGGREGATOR_CONFIG=%s\nDARL_PORT=%s\nFLOWER_PORT=%s\nBLOB_PORT=%s\n' \
-        "${TRANSPORT}" "${AGGREGATOR_CONFIG}" \
+    printf 'TRANSPORT=%s\nPROTOCOL=%s\nAGGREGATOR_CONFIG=%s\nDARL_PORT=%s\nFLOWER_PORT=%s\nBLOB_PORT=%s\n' \
+        "${TRANSPORT}" "${PROTOCOL}" "${AGGREGATOR_CONFIG}" \
         "${DARL_PORT}" "${FLOWER_PORT}" "${BLOB_PORT}" > "${LAUNCH_FILE}"
 fi
 

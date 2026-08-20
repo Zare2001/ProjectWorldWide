@@ -59,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen on")
     parser.add_argument("--flower-port", type=int, default=None, help="Alias for --port")
+    parser.add_argument(
+        "--protocol", choices=("grpc", "http"), default="grpc",
+        help="How the ROUND protocol reaches the sites. 'grpc' is Flower's own "
+             "transport. 'http' serves the same rounds over short request/response "
+             "calls instead, for a site whose compute nodes reach us only through an "
+             "HTTP forward proxy -- there the gRPC stream is reaped mid-round. Weights "
+             "are unaffected either way; 'http' requires --transport blob.",
+    )
     parser.add_argument("--darl-port", type=int, default=29510, help="DARL coordinator port")
     parser.add_argument(
         "--num-samples", type=int, default=1000000, help="DARL total sample count"
@@ -714,6 +722,33 @@ def main() -> None:
 
         from .globalstate import GlobalState
 
+        # --fresh-model has to reach the BLOB store of the global model too, and before
+        # GlobalState opens it.
+        #
+        # It used to move only the inline checkpoints aside, and `checkpoint_dir` is
+        # None under blob transport -- so PWW_FRESH_RUN=1 printed "discarding the lease
+        # table AND the global model", reset the lease table, and left the model at
+        # whatever merge round it had reached. That is exactly the half-reset the
+        # switch exists to prevent, and the loud half of it was the lie: every block
+        # was handed out again to a model that had already trained on it.
+        #
+        # Moved aside rather than deleted, like the npz path, so a mistaken --fresh-
+        # model is recoverable -- these are 2.1 GiB each and the only copy.
+        if args.fresh_model:
+            moved = []
+            for name in ("meta.json", "global.pww", "momentum.pww"):
+                stale = Path(args.state_dir) / name
+                if stale.exists():
+                    try:
+                        stale.replace(stale.with_suffix(stale.suffix + ".superseded"))
+                        moved.append(name)
+                    except OSError as exc:
+                        logger.warning("could not move %s aside: %s", name, exc)
+            if moved:
+                logger.info("--fresh-model: moved the durable global model aside (%s); "
+                            "this run starts from whichever cluster seeds it",
+                            ", ".join(moved))
+
         dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
         state = GlobalState(args.state_dir, storage_dtype=dtypes[args.storage_dtype])
 
@@ -864,7 +899,10 @@ def main() -> None:
             logger.info("no usable checkpoint in %s; the first cluster to connect will "
                         "seed the global model", checkpoint_dir)
 
-    _install_init_retry()
+    # Both of these patch flwr's gRPC transport, so neither means anything under
+    # --protocol http, where that transport is not used at all.
+    if args.protocol == "grpc":
+        _install_init_retry()
 
     # Env rather than a flag: it is a property of the least-reachable site in the
     # federation, not of this run, so it wants setting once on the VM.
@@ -872,7 +910,7 @@ def main() -> None:
     # reset 92s into an idle stream, so the reaper's real threshold is unknown and a
     # 60s ping would be racy against a 60s timeout. A ping frame costs nothing.
     keepalive_ms = int(os.environ.get("PWW_GRPC_KEEPALIVE_MS", "30000"))
-    if _install_grpc_keepalive(keepalive_ms):
+    if args.protocol == "grpc" and _install_grpc_keepalive(keepalive_ms):
         logger.info(
             "gRPC keepalive %.0fs (flwr default 210s): proxied sites are reaped during "
             "a merge if the stream goes quiet for longer", keepalive_ms / 1000,
@@ -883,6 +921,34 @@ def main() -> None:
             "waiting for the first cluster; every site being queued is a normal state "
             "and nothing is lost while it lasts"
         )
+
+    if args.protocol == "http":
+        # The weights must already be out of band. Carrying them here would put 1.32 GiB
+        # in a control message, which is the thing this protocol exists to avoid.
+        if args.transport != proto.TRANSPORT_BLOB:
+            logger.error(
+                "--protocol http requires --transport blob: the HTTP round protocol "
+                "carries round config and metrics only, and inline would put the whole "
+                "model in a control message. Start the node with --transport blob."
+            )
+            sys.exit(2)
+        from .httpround import serve as serve_http_rounds
+
+        serve_http_rounds(
+            strategy,
+            host=args.host,
+            port=port,
+            token=os.environ.get("DARL_TOKEN", ""),
+            num_rounds=args.num_rounds,
+            round_timeout=args.round_timeout,
+            min_clients=args.min_clients,
+        )
+        if state is not None:
+            logger.info(
+                "server stopped at merge round %d; state in %s is complete and a "
+                "restart resumes from it", state.round, args.state_dir,
+            )
+        return
 
     fl.server.start_server(
         server_address=server_address,
