@@ -94,6 +94,16 @@ class Flower:
     server_address: str = ""
     """host:port of the Flower server, e.g. 145.38.206.143:29511."""
 
+    protocol: str = "grpc"
+    """How the ROUND protocol reaches the central node: 'grpc' or 'http'.
+
+    Orthogonal to `transport`, which is about the WEIGHTS. 'http' exists for a site
+    whose compute nodes have no route out except an HTTP forward proxy: Flower's gRPC
+    stream has to stay open for the whole job and such a proxy reaps it mid-round,
+    while short request/response calls -- the same shape as the DARL client and the
+    blob store, both of which work from those sites -- do not. Must match the central
+    node's --protocol, and requires transport = "blob"."""
+
     transport: str = "inline"
     """Which weight transport this cluster expects: 'inline' or 'blob'.
 

@@ -302,6 +302,53 @@ one is caught by a human remembering to run two commands.
 
 ---
 
+### 9. The HTTP round protocol, and when to delete it
+
+`src/pww/central/httpround.py` + `src/pww/http_round_client.py` carry the round
+protocol over short HTTP request/response calls instead of Flower's gRPC stream.
+Selected with `--protocol http` on the server and `flower.protocol = "http"` on the
+client; **gRPC remains the default and is untouched**, so this is an option for sites
+that need it, not a migration.
+
+It exists because a site whose compute nodes have no route out except an HTTP forward
+proxy cannot hold a gRPC stream open. Frontier is such a site: OLCF documents that
+"by default, the compute nodes are closed off from the internet ... you can go through
+the proxy server", and the proxy is provisioned for the short fetches that sentence
+describes. Measured 2026-08-20 through that proxy:
+
+| component | shape | result |
+|---|---|---|
+| DARL coordinator | small HTTP request/response | never failed |
+| blob store | discrete HTTP PUT/GET, 1-2 GiB | 1.07 GiB delta uploaded fine |
+| Flower gRPC | one multi-hour bidirectional stream | reset mid-round, every time |
+
+The gigabytes got through and the small message that followed did not, which is what
+makes this a transport-shape problem rather than a bandwidth or firewall one.
+
+- [ ] **Delete this module once Flower ships an HTTP Fleet API.** As of 1.33 the
+      `--enable-http-api --disable-grpc-api` mode converts only the CONTROL plane
+      (`/create-federation`, `/list-nodes`, `/list-runs` -- operator routes). The Fleet
+      API that clients actually connect through is still gRPC-only
+      (`grpc_bidi`/`grpc_rere`/`grpc_adapter`), and the one runtime route that looks
+      like message passing, `POST /messages`, raises 501 and is not even mounted. So
+      `--disable-grpc-api` today would leave NO channel for any site to connect on.
+      Flower's own docs call the conversion in progress; when it reaches the fleet
+      plane, our join/poll/result shape is close enough to their `pull_messages` design
+      that swapping should be small.
+- [ ] **Prefer gRPC again at any site that opens the ports.** Frontier may get a direct
+      egress exception for 29514 eventually. HTTP costs a poll round-trip per round and
+      loses gRPC's immediate detection of a dropped client -- which is why the client
+      heartbeats and the server gives up early on a silent cluster. A site with real
+      egress should go back to `--protocol grpc`; the two are per-federation, not
+      per-site, so that is a whole-campaign switch.
+- [ ] **It is HTTP, not HTTPS.** No TLS on the round protocol, same as the gRPC path
+      (`SSL is disabled`). Fine inside a trusted collaboration, and worth fixing before
+      anyone asks a security team to approve an egress exception for it.
+- [ ] Untested against a real client: the protocol is covered end to end with stubs
+      (3 rounds two-site, a site dying mid-campaign, early give-up on a silent site),
+      but `DiLoCoFlowerClient`'s blob fetch and rank broadcast need a GPU, so the first
+      real run is still the test that matters.
+
 ## Notes on the machines
 
 - **Snellius multi-node must take whole nodes.** A multi-node GPU job asking for
