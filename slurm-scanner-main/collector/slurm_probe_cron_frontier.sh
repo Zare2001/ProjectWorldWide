@@ -5,8 +5,8 @@
 #   scp slurm_probe.py slurm_probe_cron_frontier.sh frontier:~/slurm_probe/
 #   ssh frontier && crontab -e
 #
-#     */10 * * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh probe
-#     17   4 * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh usage
+#     */15 * * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh probe
+#     */15 * * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh usage
 #
 #   touch ~/slurm_probe/.stop         pause both, without editing the crontab
 #   tail -f ~/slurm_probe/slurm_probe.log

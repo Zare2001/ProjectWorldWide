@@ -9,10 +9,11 @@
   "shapes": [
     {"name": "1node_1h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "1:00:00"]},
     {"name": "1node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "2:00:00"]},
+    {"name": "1node_24h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "24:00:00"]},
     {"name": "2node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "2", "-t", "2:00:00"]},
     {"name": "8node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "8", "-t", "2:00:00"]},
 
-    {"name": "16node_6h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "92", "-t", "6:00:00"]},
-    {"name": "32node_8h", "args": ["-A", "lrn087", "-p", "batch", "-N", "184", "-t", "12:00:00"]}
+    {"name": "16node_6h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "16", "-t", "6:00:00"]},
+    {"name": "32node_8h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "32", "-t", "8:00:00"]}
   ]
 }
