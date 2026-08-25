@@ -241,15 +241,31 @@ crontab -e
 `~/slurm_probe/slurm_probe.log` holds every run (rotated at 8 MB, because home
 is quota'd).
 
-**Check the walltime bins before trusting the shapes.**
+**Walltime on Frontier is a function of job size, and it runs the way nobody
+expects: the fewer nodes you ask for, the shorter the limit.**
 [`configs/slurm_probe/frontier.json`](../configs/slurm_probe/frontier.json) in
 the parent repo is the starting config — fill in the project id and token. Its
-shapes are built around Frontier's node-count bins, where a small job gets a
-much shorter limit than a large one, so a shape that is fine on LUMI comes back
-`ok: false` here. Confirm the current bins against `scontrol show partition
-batch` and OLCF's scheduling policy, and note that `plan.example.json` still
-carries `mi250_8gpu_24h` — a one-node, 24-hour job, which the small-job bin does
-not allow.
+`batch` shapes sit on the bin boundaries
+([OLCF](https://docs.olcf.ornl.gov/systems/frontier_user_guide.html#job-priority-by-node-count)),
+because a shape over its bin is refused outright and stored as `ok: false`:
+
+| nodes | max walltime | aging boost |
+|---|---|---|
+| 1–91 | **2 h** | — |
+| 92–183 | 6 h | — |
+| 184–1,881 | 12 h | — |
+| 1,882–5,644 | 12 h | 4 days |
+| 5,645–9,472 | 12 h | 8 days |
+
+A one-node job on `batch` therefore tops out at **two hours** — a shape that is
+routine on LUMI is impossible here. The way to a long small job is the separate
+`extended` partition (24 h, but at most 64 nodes, and **one running job per user
+at a time**), which is what the `ext_*` shapes measure and the only thing that
+makes `plan.example.json`'s one-node `mi250_8gpu_24h` submittable at all.
+
+Both partitions are in `partitions`, so `usage` reports their walltime ratios
+separately — they are different populations, and averaging them would hide the
+regime the planner actually uses.
 
 **If the post starts failing**, set `PROXY` at the top of the wrapper to
 `http://proxy.ccs.ornl.gov:3128`. It exports `$http_proxy`, which is all the

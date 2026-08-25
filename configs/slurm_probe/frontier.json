@@ -3,17 +3,22 @@
   "server": "http://145.38.195.124:8000",
   "token": "<the token minted for frontier>",
 
-  "partitions": ["batch"],
+  "partitions": ["batch", "extended"],
   "usage_hours": 48,
 
   "shapes": [
-    {"name": "1node_1h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "1:00:00"]},
-    {"name": "1node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "2:00:00"]},
-    {"name": "1node_24h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "24:00:00"]},
-    {"name": "2node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "2", "-t", "2:00:00"]},
-    {"name": "8node_2h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "8", "-t", "2:00:00"]},
+    {"name": "1node_1h",       "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "1:00:00"]},
+    {"name": "1node_2h",       "args": ["-A", "lrn087", "-p", "batch", "-N", "1", "-t", "2:00:00"]},
+    {"name": "2node_2h",       "args": ["-A", "lrn087", "-p", "batch", "-N", "2", "-t", "2:00:00"]},
+    {"name": "8node_2h",       "args": ["-A", "lrn087", "-p", "batch", "-N", "8", "-t", "2:00:00"]},
+    {"name": "16node_2h",      "args": ["-A", "lrn087", "-p", "batch", "-N", "16", "-t", "2:00:00"]},
+    {"name": "32node_2h",      "args": ["-A", "lrn087", "-p", "batch", "-N", "32", "-t", "2:00:00"]},
 
-    {"name": "16node_6h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "16", "-t", "6:00:00"]},
-    {"name": "32node_8h",   "args": ["-A", "lrn087", "-p", "batch", "-N", "32", "-t", "8:00:00"]}
+    {"name": "92node_6h",      "args": ["-A", "lrn087", "-p", "batch", "-N", "92", "-t", "6:00:00"]},
+    {"name": "184node_12h",    "args": ["-A", "lrn087", "-p", "batch", "-N", "184", "-t", "12:00:00"]},
+
+    {"name": "ext_1node_24h",  "args": ["-A", "lrn087", "-p", "extended", "-N", "1", "-t", "24:00:00"]},
+    {"name": "ext_8node_24h",  "args": ["-A", "lrn087", "-p", "extended", "-N", "8", "-t", "24:00:00"]},
+    {"name": "ext_64node_24h", "args": ["-A", "lrn087", "-p", "extended", "-N", "64", "-t", "24:00:00"]}
   ]
 }
