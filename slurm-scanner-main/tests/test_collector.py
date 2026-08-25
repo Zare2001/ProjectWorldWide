@@ -87,6 +87,30 @@ def test_probe_runs_every_shape(monkeypatch):
     assert payload["probes"][1]["args"] == "-p gpu_a100 -N 2"
 
 
+def test_probing_user_survives_a_cron_environment(monkeypatch):
+    # cron hands a job a bare environment and several crons set only LOGNAME.
+    # An estimate is conditioned on the account that asked for it, so dropping
+    # the name stores a number without its condition -- and cron is how the
+    # Frontier collector runs.
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setenv("LOGNAME", "csc000")
+    assert probe.probing_user() == "csc000"
+
+
+def test_probing_user_prefers_user_over_logname(monkeypatch):
+    monkeypatch.setenv("USER", "who-submits")
+    monkeypatch.setenv("LOGNAME", "who-logged-in")
+    assert probe.probing_user() == "who-submits"
+
+
+def test_probing_user_never_raises(monkeypatch):
+    # Better an unattributed row than a probe cycle lost to a name lookup.
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setattr(probe.getpass, "getuser",
+                        lambda: (_ for _ in ()).throw(OSError("no login name")))
+    assert probe.probing_user() == ""
+
+
 # --------------------------------------------------------------------------
 # sacct usage
 # --------------------------------------------------------------------------

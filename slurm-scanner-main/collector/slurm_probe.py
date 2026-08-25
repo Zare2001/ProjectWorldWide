@@ -13,6 +13,7 @@ config, the payload is printed instead of posted -- which is also how you check
 a new site before pointing it anywhere.
 """
 
+import getpass
 import json
 import os
 import re
@@ -45,6 +46,20 @@ def load_config():
                  % CONFIG_PATH)
     config.setdefault("usage_hours", 48)
     return config
+
+
+def probing_user():
+    """Who the --test-only verdicts are conditioned on.
+
+    Slurm answers against this account's fairshare, QOS and priority, so a
+    stored estimate nobody can attribute is a number without its condition.
+    `$USER` alone is not enough: cron hands a job a bare environment, and
+    several crons set only LOGNAME -- and cron is how Frontier runs this.
+    """
+    try:
+        return os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return ""
 
 
 def sh(cmd, timeout=120):
@@ -130,7 +145,7 @@ def probe(config):
         "cluster": config["cluster"],
         "collected_at": now,
         "collector_version": VERSION,
-        "probed_by_user": os.environ.get("USER", ""),
+        "probed_by_user": probing_user(),
         "probes": probes,
     }
 

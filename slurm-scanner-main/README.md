@@ -17,12 +17,13 @@ work** — [`POST /plan`](#4-planning-a-job) splits X data units across the
 clusters and says how long a job to ask for at each.
 
 ```
-collector/slurm_probe.py   runs on each login node. stdlib only, single file.
-server/app.py              ingest + query + dashboard
-server/plan.py             the waterfill behind POST /plan
-server/static/index.html   the dashboard, including the planner view
-plan.example.json          per-cluster throughput, copy to plan.json
-tests/                     86 tests, no cluster required
+collector/slurm_probe.py                 runs on each login node. stdlib only, single file.
+collector/slurm_probe_cron_frontier.sh   the cron wrapper Frontier needs
+server/app.py                            ingest + query + dashboard
+server/plan.py                           the waterfill behind POST /plan
+server/static/index.html                 the dashboard, including the planner view
+plan.example.json                        per-cluster throughput, copy to plan.json
+tests/                                   98 tests, no cluster required
 ```
 
 ---
@@ -189,7 +190,70 @@ hit the server at once:
 
 There is no state file and no lock: each run recomputes its own window, so a
 missed run leaves no gap to catch up on. A failed post is simply lost, which is
-the right trade for a 10-minute cadence.
+the right trade for a 10-minute cadence. (Frontier is the exception on the lock,
+and says why below.)
+
+### Frontier
+
+Frontier runs the same collector and posts the same two payloads, through a
+wrapper —
+[`collector/slurm_probe_cron_frontier.sh`](collector/slurm_probe_cron_frontier.sh)
+— rather than the bare cron lines above. Four things there are not true
+elsewhere.
+
+**It runs from cron, and it has to.** The other sites can drive the collector
+from a self-resubmitting `sbatch` chain that keeps it on a compute node.
+Frontier's compute nodes have no route to the internet except the OLCF forward
+proxy, and that proxy is the one path this project already knows is fragile —
+so the collector stays on a login node, where the post goes out directly.
+
+**Cron gives it an environment nothing else does.** `PATH` is `/usr/bin:/bin`,
+no profile is sourced, no module is loaded, and `$USER` may not be set at all —
+which would have stored every Frontier estimate with no record of the account it
+was conditioned on. The wrapper fixes the `PATH` and fails loudly if `sbatch` is
+still not on it; the collector now falls back to `LOGNAME` for
+`probed_by_user`.
+
+**Two ticks can overlap, where two jobs could not.** `usage` scans 48 hours of
+the busiest queue in the fleet and can outrun its cron slot; cron will happily
+start a second copy on top of it. The wrapper takes one lock per subcommand, so
+a slow `usage` skips its own next tick and says so in the log, while `probe` on
+the same tick still goes through. A lock left behind by a reboot is cleared once
+its pid is gone.
+
+**A Frontier crontab is pinned to one login node.** The entry runs only on the
+host you installed it on. Every run logs `hostname`, so which one that is stays
+visible; reinstall it after maintenance moves you elsewhere.
+
+```bash
+scp collector/slurm_probe.py collector/slurm_probe_cron_frontier.sh \
+    frontier:~/slurm_probe/
+ssh frontier
+crontab -e
+```
+
+```cron
+*/10 * * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh probe
+17   4 * * *  $HOME/slurm_probe/slurm_probe_cron_frontier.sh usage
+```
+
+`touch ~/slurm_probe/.stop` pauses both without editing the crontab, and
+`~/slurm_probe/slurm_probe.log` holds every run (rotated at 8 MB, because home
+is quota'd).
+
+**Check the walltime bins before trusting the shapes.**
+[`configs/slurm_probe/frontier.json`](../configs/slurm_probe/frontier.json) in
+the parent repo is the starting config — fill in the project id and token. Its
+shapes are built around Frontier's node-count bins, where a small job gets a
+much shorter limit than a large one, so a shape that is fine on LUMI comes back
+`ok: false` here. Confirm the current bins against `scontrol show partition
+batch` and OLCF's scheduling policy, and note that `plan.example.json` still
+carries `mi250_8gpu_24h` — a one-node, 24-hour job, which the small-job bin does
+not allow.
+
+**If the post starts failing**, set `PROXY` at the top of the wrapper to
+`http://proxy.ccs.ornl.gov:3128`. It exports `$http_proxy`, which is all the
+collector needs — it posts with `urllib`, which reads that variable on its own.
 
 ---
 
@@ -387,5 +451,5 @@ own message.
 .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest tests -q
 ```
 
-86 tests, no cluster required — `sbatch` and `sacct` output is fixed text, and
+98 tests, no cluster required — `sbatch` and `sacct` output is fixed text, and
 the waterfill is pure arithmetic.
