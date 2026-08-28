@@ -1,24 +1,28 @@
 # ProjectWorldWide
 
 Distributed training infrastructure that runs the same code on **LUMI** (CSC,
-AMD MI250X) and **Snellius** (SURF, NVIDIA). Starts with ResNet/CIFAR-10 as a
-fast, cheap way to prove the whole stack works, and is structured so LLM
-training reuses the same pieces rather than replacing them.
+AMD MI250X), **Snellius** (SURF, NVIDIA) and **Frontier** (OLCF, AMD MI250X).
+Starts with ResNet/CIFAR-10 as a fast, cheap way to prove the whole stack works,
+and is structured so LLM training reuses the same pieces rather than replacing
+them.
 
 Machine-specific detail lives in `sites/<site>.sh` and `scripts/<site>/`.
 Everything under `src/pww/` is site-independent: it reads the accelerator kind
 and pinning variable from the environment rather than assuming ROCm or CUDA.
 
-| | LUMI | Snellius |
-|---|---|---|
-| accelerator | AMD MI250X, ROCm/RCCL | NVIDIA H100 / A100, CUDA/NCCL |
-| ranks per node | 8 (each MI250X = 2 GCDs) | 4 |
-| pinning variable | `ROCR_VISIBLE_DEVICES` | `CUDA_VISIBLE_DEVICES` |
-| environment | prebuilt Singularity container | pip venv built by `setup_venv.sh` |
-| torch | 2.7.1+rocm6.2.4 | 2.7.1+cu126 |
-| partitions | `dev-g`, `small-g`, `standard-g` | `gpu_h100`, `gpu_a100` |
-| interconnect | Slingshot (`hsn`) + aws-ofi-rccl | InfiniBand |
-| MIOpen cache workaround | required | not applicable |
+| | LUMI | Snellius | Frontier |
+|---|---|---|---|
+| accelerator | AMD MI250X, ROCm/RCCL | NVIDIA H100 / A100, CUDA/NCCL | AMD MI250X, ROCm/RCCL |
+| ranks per node | 8 (each MI250X = 2 GCDs) | 4 | 8 (each MI250X = 2 GCDs) |
+| pinning variable | `ROCR_VISIBLE_DEVICES` | `CUDA_VISIBLE_DEVICES` | `ROCR_VISIBLE_DEVICES` |
+| environment | prebuilt Singularity container | pip venv built by `setup_venv.sh` | native modules |
+| torch | 2.7.1+rocm6.2.4 | 2.7.1+cu126 | site modules |
+| partitions | `dev-g`, `small-g`, `standard-g` | `gpu_h100`, `gpu_a100` | `batch` (full node only) |
+| interconnect | Slingshot (`hsn`) + aws-ofi-rccl | InfiniBand | Slingshot (`hsn`) + aws-ofi-rccl |
+| MIOpen cache workaround | required | not applicable | required |
+| compute-node egress | outbound | outbound | **HTTP(S) forward proxy only** |
+| round transport | gRPC inline / blob | gRPC inline / blob | **HTTP round protocol + blob** |
+| site scripts in this repo | yes | yes | **no** — see below |
 
 ## How it works
 
@@ -134,6 +138,34 @@ Step 5's `base_round` check is what makes requeueing safe: a site killed at wall
 and restarted hours later computed its delta against a global model that has moved on,
 and that delta is **rejected** rather than averaged in. Its next round is current.
 
+### Frontier, and what a proxy-only site changes
+
+Frontier (OLCF) is the same MI250X hardware as LUMI, so the training side is
+unchanged: 8 GCDs per node, `ROCR_VISIBLE_DEVICES`, the MIOpen cache workaround.
+Two things about it are not the same, and both are policy rather than hardware.
+
+**Compute nodes reach the outside world only through an HTTP forward proxy**
+(`http_proxy=http://proxy.ccs.ornl.gov:3128`, with `no_proxy` covering
+`.olcf.ornl.gov`, `.ornl.gov`, `.ccs.ornl.gov`). The proxy's load balancer reaps
+long-lived gRPC streams, so Flower's normal transport does not survive a round.
+The same round protocol therefore runs over short HTTP requests instead
+(`src/pww/central/httpround.py`), with weights moving through the blob store
+rather than inline. Nothing about the aggregation changes -- only how the bytes
+travel. This is the reason the HTTP path exists at all.
+
+**The environment is native modules, not a container.** LUMI ships an Apptainer
+image; on Frontier the run used the site's own module stack. Allocations are
+full-node only, so the cheap single-core collector trick used elsewhere for queue
+probing does not apply -- Frontier used a user cronjob instead.
+
+**The Frontier site scripts are not in this repo.** The campaign ran from a
+separate checkout at OLCF (`ORNL-SURF/ProjectWorldWide`), so there is no
+`sites/frontier.sh` or `scripts/frontier/` here, only the job logs in `all_logs/`
+and the transport support in `src/pww/central/`. Adding them back is the
+`ADDING_A_CLUSTER.md` procedure: a `sites/<site>.sh` that exports the accelerator
+kind, the pinning variable and the proxy settings, plus a `scripts/<site>/` job
+script. Everything under `src/pww/` already works unmodified.
+
 ### Who is "a site", exactly
 
 A cluster id, and it is worth being careful about because two things with different
@@ -147,7 +179,8 @@ lifetimes were once the same field:
   among concurrent jobs*.
 
 Nothing in the environment is both, which is why the two are separate. Running two jobs
-at one facility — routine, since both sites allow partial-node allocations — needs
+at one facility — routine on LUMI and Snellius, which allow partial-node allocations;
+Frontier is full-node only — needs
 `--replica a` / `--replica b` to give each its own cluster id. Forget it and the
 coordinator refuses the second one rather than letting two processes quietly release
 each other's leases and overwrite each other's deltas. `FEDERATION_GUIDE.md` has the
