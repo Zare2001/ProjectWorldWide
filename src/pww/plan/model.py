@@ -317,6 +317,15 @@ class PlanConfig:
 
     alpha: float = 0.25
     beta: float = 0.0
+    # "federated": U = N_fed + alpha*N_solo + beta*(Tok/1e9), the campaign's own
+    # default -- N_fed is unweighted, so it dominates beta*(Tok/1e9) at realistic
+    # scales (tens to low hundreds of rounds vs. single-digit-billions of tokens)
+    # regardless of alpha/beta. Setting beta=1 alone does NOT make this pick the
+    # highest-token plan; a caller that actually wants that needs "tokens" below.
+    # "tokens": U = Tok/1e9, ignoring federated/solo round counts entirely. For a
+    # caller whose objective genuinely is "maximise tokens in the horizon" (e.g.
+    # pww.plan.schedule), not "guarantee federated rounds happened".
+    objective: str = "federated"
     horizon_s: float = 48 * 3600.0
     num_rounds: int = 400
     inner_steps: int = 100  # darl.inner_steps; the H of the full arm, QSR off
@@ -328,6 +337,15 @@ class PlanConfig:
     min_federated_rounds: int = 1
     reserve_blocks: int = 0
     lanes_max: int = 2
+    # Per-site override of lanes_max, e.g. (("lumi", 32), ("snellius", 16)) when a
+    # QoS caps total nodes rather than job count and the two sites' nodes hold
+    # different GPU counts -- one shared lanes_max cannot express "4 nodes"
+    # correctly at both an 8-GPU/node site and a 4-GPU/node site at once. A site
+    # missing from these pairs falls back to lanes_max, so the default (empty)
+    # is identical to before. A tuple of pairs, not a dict: PlanConfig is hashed
+    # whole as an lru_cache key (timeline._option_windows), which a dict field
+    # would break -- see that function's docstring.
+    lanes_max_by_site: tuple[tuple[str, int], ...] = ()
     max_links_per_lane: int = 8
     chain_policies: tuple[str, ...] = ("none", "self")
     chain_lead_s: float = 0.0
@@ -349,6 +367,11 @@ class PlanConfig:
             raise ValueError(f"balance must be auto|on|off, got {self.balance!r}")
         if self.h_model not in ("fixed", "qsr", "replay"):
             raise ValueError(f"h_model must be fixed|qsr|replay, got {self.h_model!r}")
+        if self.objective not in ("federated", "tokens"):
+            raise ValueError(f"objective must be federated|tokens, got {self.objective!r}")
+        for site, n in self.lanes_max_by_site:
+            if n < 1:
+                raise ValueError(f"lanes_max_by_site[{site!r}] must be >= 1, got {n}")
 
 
 @dataclass(frozen=True)

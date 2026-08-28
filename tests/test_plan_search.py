@@ -73,6 +73,7 @@ from pww.plan import (  # noqa: E402
     Score,
     SiteInput,
     SiteLimits,
+    Timeline,
     WaitEstimate,
     admit,
     chain_breakeven_c,
@@ -1594,6 +1595,90 @@ def _():
     assert roomy.timeline.darl_exhausted_s is None
     assert roomy.balance is True, "walltime binds, so the extra sequences are free"
     assert roomy.timeline.tokens > decide(REAL).timeline.tokens
+
+
+@check("objective='tokens' scores tokens alone; the default N_fed term is unweighted "
+       "and dominates it at realistic scales")
+def _():
+    """REGRESSION for a real correctness bug found 2026-08-24: pww.plan.schedule set
+    alpha=0, beta=1 believing that gives pure token maximisation. It doesn't -- U =
+    N_fed + alpha*N_solo + beta*(tokens/1e9) leaves N_fed with no coefficient at all,
+    so a plan with MORE federated rounds but FEWER tokens can still score higher under
+    every alpha/beta. Constructed directly here rather than via simulate(), since the
+    point is score()'s formula, not any particular timeline."""
+
+    def timeline(*, federated_merges, tokens, ledgers=()):
+        return Timeline(
+            links=(), intervals=(), rounds=(), ledgers=ledgers,
+            federated_merges=federated_merges, solo_merges=0, tokens=tokens,
+            blocks_used=0.0, blocks_available=0.0, attempts_used=0,
+            gpu_s=0.0, compute_s=0.0, darl_exhausted_s=None,
+            attempts_exhausted_s=None, first_federated_s=None,
+            last_federated_s=None, quality="identified",
+        )
+
+    fewer_tokens_more_fed = timeline(federated_merges=72, tokens=1_533_542_400)   # 1.53B
+    more_tokens_zero_fed = timeline(federated_merges=0, tokens=2_097_152_000)     # 2.10B
+
+    cfg_federated = config(alpha=0.0, beta=1.0)   # the exact misreading this bug was
+    u_a = score(fewer_tokens_more_fed, cfg_federated).utility
+    u_b = score(more_tokens_zero_fed, cfg_federated).utility
+    assert u_a > u_b, (
+        "this IS the bug, reproduced: under the default objective, alpha=0/beta=1 "
+        f"still ranks fewer tokens (1.53B, utility {u_a:.2f}) above more tokens "
+        f"(2.10B, utility {u_b:.2f}), because federated_merges=72 outweighs "
+        f"beta*(tokens/1e9)")
+
+    cfg_tokens = config(alpha=0.0, beta=1.0, objective="tokens")
+    u_a2 = score(fewer_tokens_more_fed, cfg_tokens).utility
+    u_b2 = score(more_tokens_zero_fed, cfg_tokens).utility
+    assert close(u_a2, 1.5335424)
+    assert close(u_b2, 2.097152)
+    assert u_b2 > u_a2, "objective='tokens' must rank the higher-token plan higher"
+
+
+@check("objective='tokens' ignores alpha too -- ties are broken on tokens alone")
+def _():
+    def timeline(tokens):
+        return Timeline(
+            links=(), intervals=(), rounds=(), ledgers=(),
+            federated_merges=5, solo_merges=100, tokens=tokens,
+            blocks_used=0.0, blocks_available=0.0, attempts_used=0,
+            gpu_s=0.0, compute_s=0.0, darl_exhausted_s=None,
+            attempts_exhausted_s=None, first_federated_s=None,
+            last_federated_s=None, quality="identified",
+        )
+
+    cfg = config(alpha=0.5, beta=1.0, objective="tokens")
+    lo, hi = timeline(1_000_000_000), timeline(2_000_000_000)
+    assert close(score(lo, cfg).utility, 1.0)
+    assert close(score(hi, cfg).utility, 2.0)
+    # solo_merges=100 and alpha=0.5 would add 50 to a "federated"-objective utility;
+    # under "tokens" it must be invisible.
+    assert score(hi, cfg).utility < 3.0
+
+
+@check("lanes_max_by_site overrides lanes_max per site; a site missing from it "
+       "falls back to lanes_max unchanged")
+def _():
+    """REGRESSION for the per-site cap added to answer 'why is the same lane
+    ceiling applied to two sites whose nodes hold different GPU counts'. Also
+    guards the hashability constraint that broke the first attempt at this: a
+    dict field on PlanConfig crashes every call through _option_windows's
+    lru_cache, because everything in that cache key must be a hashable, frozen
+    builtin -- this is why the field is a tuple of pairs, not a dict."""
+    sites = (snellius([(1, 0.0)]), lumi([(1, 0.0)]))
+    cfg = config(lanes_max=1, lanes_max_by_site=(("lumi", 3),), horizon_s=12 * HOUR)
+    opts, _ = options(sites, cfg)
+    lumi_lanes = {o.lanes for o in opts["lumi"]}
+    snel_lanes = {o.lanes for o in opts["snellius"]}
+    assert lumi_lanes == {1, 2, 3}, f"lumi should see lanes 1-3, got {lumi_lanes}"
+    assert snel_lanes == {1}, f"snellius (not overridden) should stay at 1, got {snel_lanes}"
+
+    # A PlanConfig carrying lanes_max_by_site must still be hashable (it is an
+    # lru_cache key via _option_windows) -- this is the exact bug that shipped
+    # first: a dict field passed every check above and then crashed here.
+    hash(cfg)
 
 
 def main() -> int:

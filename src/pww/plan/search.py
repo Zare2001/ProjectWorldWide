@@ -321,9 +321,10 @@ def generate_options(
     for chain in config.chain_policies:
         _require_simulable_chain(chain, candidates, config, warm)
 
+    site_lanes_max = dict(config.lanes_max_by_site).get(site, config.lanes_max)
     for candidate in candidates:
         for begin_s in grid:
-            for lanes in range(1, max(1, config.lanes_max) + 1):
+            for lanes in range(1, max(1, site_lanes_max) + 1):
                 for chain in config.chain_policies:
                     links = 1 if chain == "none" else _links_to_cover(candidate, config, begin_s)
                     if chain != "none" and links == 1:
@@ -380,7 +381,10 @@ def _prune_dominated(options: Sequence[Option], config: PlanConfig, warm: bool) 
 
 
 def score(timeline: Timeline, config: PlanConfig) -> Score:
-    """U = N_fed + alpha*N_solo + beta*(Tok/1e9).
+    """U = N_fed + alpha*N_solo + beta*(Tok/1e9), or U = Tok/1e9 alone under
+    config.objective == "tokens" -- see PlanConfig.objective for why these are two
+    different formulas, not two settings of the same one: N_fed has no coefficient,
+    so it dominates beta*(Tok/1e9) at realistic scales no matter what beta is.
 
     Solo progress is real work -- this campaign's own finding is that a centralized
     run beats the federated one at matched tokens -- but a run whose PURPOSE is a
@@ -388,9 +392,12 @@ def score(timeline: Timeline, config: PlanConfig) -> Score:
     never buried: the plan reports alpha*, the value at which the recommendation
     changes, on every run.
     """
-    utility = (timeline.federated_merges
-               + config.alpha * timeline.solo_merges
-               + config.beta * timeline.tokens / 1e9)
+    if config.objective == "tokens":
+        utility = timeline.tokens / 1e9
+    else:
+        utility = (timeline.federated_merges
+                   + config.alpha * timeline.solo_merges
+                   + config.beta * timeline.tokens / 1e9)
     # Weighted by device count, because it is divided by gpu_s (GPU-seconds) to give the
     # federation's barrier idle fraction. Timeline.compute_s is a sum of per-site
     # WALL-clock compute, so dividing that by GPU-seconds would report a 4-GPU site as

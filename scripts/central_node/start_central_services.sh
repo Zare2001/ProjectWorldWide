@@ -13,10 +13,6 @@ fi
 export PWW_SITE="${PWW_SITE:-central}"
 source "${PWW_ROOT}/env.sh"
 export PYTHONNOUSERSITE=0
-USER_SITE="$(python3 -m site --user-site 2>/dev/null || true)"
-if [[ -d "${USER_SITE}" ]]; then
-    export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
-fi
 
 DARL_PORT="${DARL_PORT:-29510}"
 FLOWER_PORT="${FLOWER_PORT:-29511}"
@@ -80,6 +76,22 @@ BLOB_PID_FILE="${STATE_DIR}/blob.pid"
 #   VENV_DIR=/data/thomasistriplet/zpalanciya/runs/central/.venv
 VENV_DIR="${VENV_DIR:-${STATE_DIR}/.venv}"
 FLOWER_REPO="${FLOWER_REPO:-git+https://github.com/Zare2001/flower.git@fedmom-strategy#subdirectory=framework}"
+
+# The system Python's --user-site packages help bootstrap a from-scratch install (the
+# "lightweight venv" fallback below reuses whatever is already there instead of
+# reinstalling everything), so it is only worth adding when there is no venv here yet.
+# Unconditionally prepending it -- the previous behaviour -- shadowed an ALREADY WORKING
+# venv's own packages with whatever partial/incompatible installs sit in the user site
+# (a stale numpy/wandb built for a different Python minor version broke `import flwr`
+# behind an opaque "Unknown option: -P" a layer up, because the failure was inside the
+# suppressed `-c "import ..."` check and only the wrong-Python-version symptom surfaced).
+# A working venv's own site-packages must always win for its own interpreter.
+if [[ ! -x "${VENV_DIR}/bin/python3" ]]; then
+    USER_SITE="$(python3 -m site --user-site 2>/dev/null || true)"
+    if [[ -d "${USER_SITE}" ]]; then
+        export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
+    fi
+fi
 
 echo "========================================================="
 echo " Starting Central Node Aggregator Services"
