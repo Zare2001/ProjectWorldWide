@@ -27,3 +27,9 @@ plot_metrics.py
 wandb/
 .wandb/
 plots/
+
+# secrets -- never commit
+.env
+*.env
+.pww_secrets*
+*.token

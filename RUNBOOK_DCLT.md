@@ -133,7 +133,7 @@ twice. Fill `TOK_DCLT` with the token check 1 printed.
 
 ```bash
 # Snellius (~/ProjectWorldWideSnellius/ProjectWorldWide)
-export WANDB_API_KEY=***REMOVED-WANDB-KEY***
+export WANDB_API_KEY="${WANDB_API_KEY:?set it in ~/.pww_secrets.env, never commit it}"
 export TOK_DCLT=<paste the value check 1 printed>
 curl -sS -o /dev/null -w 'darl says %{http_code}\n' \
   -H "X-DARL-Token: $TOK_DCLT" http://145.38.206.143:29540/health          # want 200
@@ -146,7 +146,7 @@ squeue --me -p gpu_h100
 
 ```bash
 # LUMI (~/ProjectWorldWide)
-export WANDB_API_KEY=***REMOVED-WANDB-KEY***
+export WANDB_API_KEY="${WANDB_API_KEY:?set it in ~/.pww_secrets.env, never commit it}"
 export TOK_DCLT=<paste the value check 1 printed>
 curl -sS -o /dev/null -w 'darl says %{http_code}\n' \
   -H "X-DARL-Token: $TOK_DCLT" http://145.38.206.143:29540/health          # want 200
