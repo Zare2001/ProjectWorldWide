@@ -1,0 +1,38 @@
+# Central node aggregator settings for the controlled TWO-SITE run (Snellius + Frontier).
+#
+#   PWW_OUTPUT_DIR=/data/thomasistriplet/zpalanciya/runs-twosite \
+#   DARL_PORT=29513 FLOWER_PORT=29514 BLOB_PORT=29515 \
+#   TRANSPORT=blob PROTOCOL=http \
+#   AGGREGATOR_CONFIG=configs/central_aggregator_twosite.yaml \
+#   NUM_SAMPLES=2756597 BLOCK_SIZE=1024 SEED=42 PWW_FRESH_RUN=1 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# Frontier reaches this node only through an HTTP proxy that closes gRPC streams, so
+# the run uses the blob transport and the HTTP round protocol on both sites.
+#
+# Identical to central_aggregator_titan.yaml except for min-clients. That file
+# explains every other value.
+
+darl-port: 29513
+flower-port: 29514
+
+server-learning-rate: 0.7
+server-momentum: 0.9
+
+# 200 merged rounds are needed (20,000 steps at H=100). Rounds are attempts, not
+# merges, so leave a margin; too high is harmless.
+num-rounds: 300
+
+# 2, not 1. This run is the comparison with centralised training at the same tokens,
+# steps and batch (32 sequences on Snellius + 64 on Frontier = 96). A round with one
+# site has a batch of 32 or 64 and breaks that match, so no round may start until both
+# sites are connected. The cost is that the run stands still while either site is
+# queued or down, which is intended here.
+min-clients: 2
+
+# A round is the slower site's local phase plus three transfers of 1.32 GiB.
+round-timeout: 1800.0
+
+num-samples: 0            # set NUM_SAMPLES; recorded here for provenance only
+block-size: 1024
+darl-state-dir: "./runs/darl"
