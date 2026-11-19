@@ -208,10 +208,7 @@ def _report_dtensor_boundary(part: nn.Module, state: dict[str, torch.Tensor]) ->
     Which direction the mismatch runs decides the fix, and guessing it risks loading
     weights into the wrong shards silently instead of raising. So record it.
     """
-    owned: dict[str, torch.Tensor] = {
-        **dict(part.named_parameters()),
-        **dict(part.named_buffers()),
-    }
+    owned = owned_tensors(part)
     for key, incoming in state.items():
         mine = owned.get(key)
         if mine is None:
@@ -258,7 +255,7 @@ def _without_tied_aliases(
     parameter would leave a replica training from stale weights and show up only as
     a slow divergence, which is far worse than the exception this replaces.
     """
-    owned = set(dict(part.named_parameters())) | set(dict(part.named_buffers()))
+    owned = set(owned_tensors(part))
     dropped = [key for key in state if key not in owned]
     if not dropped:
         return state
@@ -311,8 +308,59 @@ def keys_to_load(part: nn.Module) -> list[str]:
     flavor ties `output.weight` to `tok_embeddings.weight` after parallelising, so it is
     absent from `named_parameters()` and loading the tying source already writes it.
     """
-    owned = set(dict(part.named_parameters())) | set(dict(part.named_buffers()))
+    owned = owned_tensors(part)
     return [key for key in sorted(part.state_dict()) if key in owned]
+
+
+# torch's activation-checkpoint wrapper keeps the wrapped block in an attribute of this
+# name. `state_dict()` strips it from every key (a hook the wrapper installs), but
+# `named_parameters()` and `named_buffers()` do not.
+_CHECKPOINT_WRAPPER_PREFIX = "_checkpoint_wrapped_module."
+
+
+def owned_tensors(part: nn.Module) -> dict[str, torch.Tensor]:
+    """The module's parameters and buffers, keyed the way `state_dict()` keys them.
+
+    torchtitan's selective activation checkpointing wraps every second block. A wrapped
+    block's parameters are named `layers.1._checkpoint_wrapped_module.attention...` by
+    `named_parameters()` and `layers.1.attention...` by `state_dict()`, the codec and the
+    wire. Comparing the two spellings directly made `keys_to_load` drop layers 1, 3, ...,
+    27 (154 of 310 tensors), so `scatter_full_state` never loaded them: each site kept
+    its own odd blocks for a whole run, and a joining site kept randomly initialised
+    ones. The only trace was an INFO line that called the keys tied aliases.
+    """
+    owned: dict[str, torch.Tensor] = {}
+    for name, tensor in list(part.named_parameters()) + list(part.named_buffers()):
+        key = name.replace(_CHECKPOINT_WRAPPER_PREFIX, "")
+        if key in owned and owned[key] is not tensor:
+            raise KeyError(
+                f"two different tensors map to the state-dict key {key!r} once the "
+                f"checkpoint-wrapper prefix is removed"
+            )
+        owned[key] = tensor
+    return owned
+
+
+def unloaded_keys(part: nn.Module, incoming: set[str]) -> list[str]:
+    """Incoming keys that `scatter_full_state` would not load and that are not tied aliases.
+
+    A tied alias (`output.weight` on the 0.6B flavor) is the same tensor as a key that
+    is loaded, so skipping it loses nothing. Any other skipped key is a weight the
+    sender shipped and this model would silently keep its own copy of.
+    """
+    expected = set(keys_to_load(part))
+    owned = owned_tensors(part)
+    # `remove_duplicate=False` is what lists a tied alias under its own name; the
+    # tensors `state_dict()` returns are detached copies and cannot be compared by identity.
+    every_name = {
+        name.replace(_CHECKPOINT_WRAPPER_PREFIX, ""): tensor
+        for name, tensor in part.named_parameters(remove_duplicate=False)
+    }
+    loaded_ids = {id(owned[key]) for key in expected}
+    return sorted(
+        key for key in incoming - expected
+        if key not in every_name or id(every_name[key]) not in loaded_ids
+    )
 
 
 def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tensor]) -> None:
@@ -347,16 +395,18 @@ def scatter_full_state(model_parts: list[nn.Module], state: dict[str, torch.Tens
     is_source = not dist.is_initialized() or dist.get_rank() == 0
 
     for part in model_parts:
-        owned = dict(part.named_parameters())
-        owned.update(dict(part.named_buffers()))
+        owned = owned_tensors(part)
         expected = keys_to_load(part)
         if is_source:
-            extra = sorted(set(state) - set(expected))
-            if extra:
-                logger.info(
-                    "scatter: %d incoming key(s) not loaded directly: %s. Expected for "
-                    "a tied head -- the tying source carries the weights.",
-                    len(extra), ", ".join(extra),
+            # Loud, for the reason `owned_tensors` documents: this used to be an INFO
+            # line, and it hid half the model not being loaded for every inline run.
+            skipped = unloaded_keys(part, set(state))
+            if skipped:
+                raise KeyError(
+                    f"{len(skipped)} incoming key(s) would not be loaded and are not "
+                    f"tied aliases of a loaded parameter: {', '.join(skipped[:8])}"
+                    f"{' ...' if len(skipped) > 8 else ''}. Refusing to keep this "
+                    f"site's own copy of weights the server sent."
                 )
         for key in expected:
             param = owned[key]

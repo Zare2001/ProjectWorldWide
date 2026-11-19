@@ -611,6 +611,60 @@ def _():
     assert keys_to_load(model) == loaded
 
 
+@check("scatter loads the blocks that selective activation checkpointing wraps")
+def _():
+    """Every inline run before this fix trained with half the model never synchronised.
+
+    torchtitan wraps every second block in torch's checkpoint wrapper. The wrapper adds
+    `_checkpoint_wrapped_module.` to the names `named_parameters()` reports and strips it
+    from `state_dict()`, so matching one against the other dropped the wrapped blocks.
+    """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+    from pww.titan.params import keys_to_load, scatter_full_state, unloaded_keys
+
+    class Blocks(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tok_embeddings = torch.nn.Embedding(8, 4)
+            self.layers = torch.nn.ModuleDict(
+                {str(i): torch.nn.Linear(4, 4) for i in range(4)}
+            )
+            self.register_buffer("rope_cache", torch.arange(8.0), persistent=False)
+            self.output = torch.nn.Linear(4, 8, bias=False)
+            self.output.weight = self.tok_embeddings.weight
+            for i in ("1", "3"):                      # what selective AC option "2" does
+                self.layers[i] = checkpoint_wrapper(self.layers[i])
+
+    model = Blocks()
+    shipped = set(model.state_dict())
+    named = set(dict(model.named_parameters()))
+    assert "layers.1.weight" in shipped and "layers.1.weight" not in named, (
+        "premise broken: the wrapper no longer renames parameters"
+    )
+
+    loaded = set(keys_to_load(model))
+    assert shipped - loaded == {"output.weight"}, (
+        f"only the tied alias may be skipped, got {sorted(shipped - loaded)}"
+    )
+    assert "rope_cache" not in loaded
+    assert unloaded_keys(model, shipped) == []
+
+    incoming = {key: torch.full_like(value, 7.0) for key, value in model.state_dict().items()}
+    scatter_full_state([model], incoming)
+    for key, value in model.state_dict().items():
+        assert torch.all(value == 7.0), f"{key} was not loaded"
+    assert torch.equal(model.rope_cache, torch.arange(8.0)), "rope_cache was overwritten"
+
+    # A key the model would keep its own copy of is an error, not a log line.
+    expect_raises(
+        KeyError,
+        lambda: scatter_full_state([model], {**incoming, "layers.9.weight": torch.zeros(4, 4)}),
+        contains="would not be loaded",
+    )
+
+
 @check("outer_agreement reports drift relative to the weights")
 def _():
     reference = {"w": torch.ones(100)}
@@ -701,8 +755,12 @@ def _():
         )
 
     aggregated, _ = strategy.aggregate_fit(1, [empty(), empty()], [])
-    out = parameters_to_ndarrays(aggregated)[0]
+    # No client contributed, so the strategy never learned a wire dtype and replies
+    # in its default: bfloat16 as uint16 bit patterns (0.25 is 0x3E80 = 16000).
+    # Decode it the way a client would, or the bits are read as integers.
+    out = FedMom._from_wire(parameters_to_ndarrays(aggregated))[0]
     assert np.allclose(out, 0.25), f"empty round moved the model to {out}"
+    assert np.allclose(strategy._global_fp32[0], 0.25), strategy._global_fp32[0]
 
 
 # --- config -----------------------------------------------------------------
