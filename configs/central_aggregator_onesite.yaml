@@ -1,12 +1,13 @@
 # Central node aggregator settings for the ONE-SITE diagnostic run.
 #
 #   PWW_OUTPUT_DIR=/data/thomasistriplet/zpalanciya/runs-onesite \
+#   DARL_PORT=29510 FLOWER_PORT=29511 BLOB_PORT=29512 TRANSPORT=blob PROTOCOL=http \
 #   AGGREGATOR_CONFIG=configs/central_aggregator_onesite.yaml \
 #   NUM_SAMPLES=2756597 BLOCK_SIZE=1024 SEED=42 PWW_FRESH_RUN=1 \
 #       ./scripts/central_node/start_central_services.sh
 #
 # One site (Snellius, 96 sequences per step by accumulation) trains through the
-# same server and the same inline transport as the two-site run. The run measures
+# same server and the same blob/HTTP transport as the two-site run. The run measures
 # what the path through the server costs when there is nothing to average: the
 # bfloat16 transfer, the outer step and the reload at the site.
 #
@@ -22,7 +23,9 @@ server-momentum: 0.9
 # The one difference. By default a round with one contributor uses eta = 1.0, and in
 # this run every round has one contributor, so the default would run the whole
 # experiment with a different outer step from the two-site run it is compared with.
-# false keeps eta = 0.7 in every round.
+# false keeps eta = 0.7 in every round. The rule exists on the inline transport only,
+# so on blob/HTTP this line changes nothing; it is set so the run stays correct if it
+# is ever restarted inline.
 solo-full-step: false
 
 # 200 merged rounds are needed (20,000 steps at H=100). Rounds are attempts, not
