@@ -1,0 +1,30 @@
+# Central node aggregator settings for the ONE-SITE run over inline gRPC.
+#
+#   PWW_OUTPUT_DIR=/data/thomasistriplet/zpalanciya/runs-onesite-grpc \
+#   DARL_PORT=29510 FLOWER_PORT=29511 TRANSPORT=inline PROTOCOL=grpc \
+#   AGGREGATOR_CONFIG=configs/central_aggregator_onesite_grpc.yaml \
+#   NUM_SAMPLES=2756597 BLOCK_SIZE=1024 SEED=42 PWW_FRESH_RUN=1 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# One site (Snellius, 96 sequences per step by accumulation) trains through the
+# server. Every round has one contributor, so the single-site rule applies in every
+# round: the outer step uses eta = 1.0 and the momentum of 0.9 is left as it is.
+# central_aggregator_onesite.yaml is the earlier run of the same experiment on
+# blob/HTTP, where the rule did not exist yet and every round used eta = 0.7.
+
+darl-port: 29510
+flower-port: 29511
+
+server-learning-rate: 0.7
+server-momentum: 0.9
+
+# 200 merged rounds are needed (20,000 steps at H=100). Rounds are attempts, not
+# merges, so leave a margin; too high is harmless.
+num-rounds: 300
+
+min-clients: 1
+round-timeout: 1800.0
+
+num-samples: 0            # set NUM_SAMPLES; recorded here for provenance only
+block-size: 1024
+darl-state-dir: "./runs/darl"

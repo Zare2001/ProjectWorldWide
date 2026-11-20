@@ -784,6 +784,51 @@ if HAS_FLWR:
             assert set(state.clusters) == {"snellius"}, sorted(state.clusters)
             assert state.clusters["snellius"].tokens_total == 600
 
+    @check("a round with one site uses eta=1 on the blob transport, and eta<1 with two")
+    def _():
+        """The single-site rule must not depend on the transport.
+
+        It existed on the inline path only, so every single-site round of a blob run
+        was damped by the configured eta (0.7 in the three-site and one-site runs).
+        """
+        from pww.central.strategy import FedMom
+
+        def run(sites: dict[str, float], **options) -> torch.Tensor:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                blobs = root / "blobs"
+                blobs.mkdir()
+                state = GlobalState(root / "state")
+                write_state_dict(root / "init.pww", _model())
+                state.initialise_from_file(root / "init.pww")
+                before = state.open_global().get("norm.scale", torch.float32).clone()
+                strategy = FedMom(
+                    transport=proto.TRANSPORT_BLOB, state=state, blob_root=blobs,
+                    blob_url="http://vm:29512", run_id="t", keep_rounds=0,
+                    server_learning_rate=0.7, server_momentum=0.9, **options,
+                )
+                results = []
+                for cluster, value in sites.items():
+                    name = proto.delta_blob("t", 0, cluster)
+                    _delta(blobs / name, value, 0)
+                    results.append((None, _fit_res({proto.CLUSTER: cluster,
+                                                    proto.DELTA_BLOB: name,
+                                                    proto.BASE_ROUND: 0}, 500)))
+                strategy.aggregate_fit(1, results, [])
+                assert state.round == 1, state.round
+                return state.open_global().get("norm.scale", torch.float32) - before
+
+        # The first Nesterov step from a zero velocity is (1 + beta) * eta * delta.
+        def step(eta: float) -> float:
+            return (1.0 + 0.9) * eta * 0.2
+
+        solo = run({"snellius": 0.2})
+        assert torch.allclose(solo, torch.full_like(solo, step(1.0)), atol=1e-6), solo[0]
+        damped = run({"snellius": 0.2}, solo_full_step=False)
+        assert torch.allclose(damped, torch.full_like(damped, step(0.7)), atol=1e-6), damped[0]
+        pair = run({"snellius": 0.2, "frontier": 0.2})
+        assert torch.allclose(pair, torch.full_like(pair, step(0.7)), atol=1e-6), pair[0]
+
     @check("a duplicated cluster id does not stop the other sites' round")
     def _():
         """And if the duplicated pair is *all* there is, the model must not move."""

@@ -1024,10 +1024,21 @@ if HAS_FLWR:
                     server_round, self.state.round)
                 return self._current_parameters(), metrics
 
+            # The single-contributor rule of the inline path (see aggregate_fit's inline
+            # branch for the reasoning): with one update there is nothing to average, so
+            # the outer step uses eta = 1.0. Momentum is left alone, as it is there.
+            solo = len(contributions) == 1 and self.solo_full_step
+            eta = 1.0 if solo else self.server_learning_rate
+            if solo:
+                log(INFO,
+                    "Round %s: single contributor (%s), so applying the outer step at "
+                    "eta=1.0 instead of %.2f",
+                    server_round, contributions[0].cluster, self.server_learning_rate)
+
             try:
                 new_round = self.state.merge(
                     contributions,
-                    server_learning_rate=self.server_learning_rate,
+                    server_learning_rate=eta,
                     server_momentum=self.server_momentum,
                 )
             except StaleContribution as exc:
