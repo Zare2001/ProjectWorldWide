@@ -7,7 +7,7 @@
 # Snellius-specific value; if you are tempted to add one, it belongs in the site
 # file instead.
 #
-# Override detection with PWW_SITE=lumi|snellius.
+# Override detection with PWW_SITE=lumi|snellius|frontier.
 
 # --- Site detection ---------------------------------------------------------
 pww_detect_site() {
@@ -17,6 +17,8 @@ pww_detect_site() {
         echo lumi
     elif [[ -d /sw/arch ]] || [[ "$(hostname -f 2>/dev/null)" == *snellius* ]]; then
         echo snellius
+    elif [[ -d /lustre/orion ]] || [[ "$(hostname -f 2>/dev/null)" == *frontier* ]]; then
+        echo frontier
     else
         echo central
     fi
