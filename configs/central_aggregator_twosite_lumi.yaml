@@ -1,0 +1,38 @@
+# Central node aggregator settings for the controlled TWO-SITE run, LUMI + Snellius,
+# over inline gRPC.
+#
+#   PWW_OUTPUT_DIR=/data/thomasistriplet/zpalanciya/runs-twosite-lumi \
+#   DARL_PORT=29516 FLOWER_PORT=29517 TRANSPORT=inline PROTOCOL=grpc \
+#   AGGREGATOR_CONFIG=configs/central_aggregator_twosite_lumi.yaml \
+#   NUM_SAMPLES=2756597 BLOCK_SIZE=1024 SEED=42 PWW_FRESH_RUN=1 \
+#       ./scripts/central_node/start_central_services.sh
+#
+# Snellius trains 32 sequences per step and LUMI 64, which together are the 96 of
+# the centralised runs. min-clients is 2, so no round starts with one site.
+# central_aggregator_twosite.yaml is the same run for Frontier + Snellius on
+# blob/HTTP, which Frontier needs. central_aggregator_titan.yaml explains every
+# other value.
+
+darl-port: 29516
+flower-port: 29517
+
+server-learning-rate: 0.7
+server-momentum: 0.9
+
+# 200 merged rounds are needed (20,000 steps at H=100). Rounds are attempts, not
+# merges, so leave a margin; too high is harmless.
+num-rounds: 300
+
+# 2, not 1. This run is the comparison with centralised training at the same tokens,
+# steps and batch (32 sequences on Snellius + 64 on LUMI = 96). A round with one
+# site has a batch of 32 or 64 and breaks that match, so no round may start until both
+# sites are connected. The cost is that the run stands still while either site is
+# queued or down, which is intended here.
+min-clients: 2
+
+# A round is the slower site's local phase plus the weight transfers.
+round-timeout: 1800.0
+
+num-samples: 0            # set NUM_SAMPLES; recorded here for provenance only
+block-size: 1024
+darl-state-dir: "./runs/darl"
