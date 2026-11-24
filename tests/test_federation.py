@@ -871,6 +871,70 @@ if HAS_FLWR:
             )
             assert state.round == 1 and calls[-1] == (4, []), (state.round, calls)
 
+    @check("a merge that cannot be saved is not merged, and its blocks are not committed")
+    def _():
+        """The disk filled up during a run and the checkpoints of two rounds failed.
+
+        The server had already told DARL to commit those rounds' blocks, and after a
+        restart it came back at an older round: blocks committed, their updates in no
+        model. A round whose model cannot be saved now counts as not merged.
+        """
+        import pww.central.strategy as strategy_module
+        from pww.central.strategy import FedMom
+
+        zeros = [np.zeros((4,), dtype=np.float16)]
+
+        def one_round(strategy, server_round, value):
+            strategy.configure_fit(server_round, strategy._current_parameters()
+                                   or ndarrays_to_parameters(zeros), _FakeManager(1))
+            strategy.aggregate_fit(server_round, [(None, _fit_res(
+                {proto.CLUSTER: "snellius", proto.STEPS: 100}, 1000,
+                arrays=[np.full((4,), value, dtype=np.float16)]))], [])
+
+        real_savez = strategy_module.np.savez
+
+        def full_disk(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            strategy = FedMom(
+                transport=proto.TRANSPORT_INLINE,
+                initial_parameters=ndarrays_to_parameters(zeros),
+                server_learning_rate=1.0, server_momentum=0.0, checkpoint_dir=tmp,
+                darl_settle=lambda tag, merged: calls.append((tag, sorted(merged))),
+            )
+            one_round(strategy, 1, 1.0)
+            assert calls == [(1, ["snellius"])], calls
+            assert strategy.merge_round == 1 and strategy.global_step == 100
+            saved = [float(x) for x in strategy._global_fp32[0]]
+
+            strategy_module.np.savez = full_disk
+            try:
+                one_round(strategy, 2, 2.0)
+            finally:
+                strategy_module.np.savez = real_savez
+            assert calls[-1] == (2, []), calls           # nothing to commit
+            assert strategy.merge_round == 1 and strategy.global_step == 100
+            assert [float(x) for x in strategy._global_fp32[0]] == saved, "the merge was undone"
+            assert not list(Path(tmp).glob("*.tmp")), "no half-written file is left"
+
+            # With space again, the next round merges and commits as usual.
+            one_round(strategy, 3, 2.0)
+            assert calls[-1] == (3, ["snellius"]) and strategy.merge_round == 2, calls
+
+            # A server that does not settle keeps the old behaviour: the merge stands.
+            plain = FedMom(transport=proto.TRANSPORT_INLINE,
+                           initial_parameters=ndarrays_to_parameters(zeros),
+                           server_learning_rate=1.0, server_momentum=0.0,
+                           checkpoint_dir=str(Path(tmp) / "plain"))
+            strategy_module.np.savez = full_disk
+            try:
+                one_round(plain, 1, 1.0)
+            finally:
+                strategy_module.np.savez = real_savez
+            assert plain.merge_round == 1
+
     @check("end to end: a merged site's blocks are committed, an unmerged site's are re-issued")
     def _():
         """The strategy, the settle call and a real coordinator together.

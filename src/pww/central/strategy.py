@@ -290,6 +290,9 @@ if HAS_FLWR:
             # clusters commit by themselves, before their update is merged.
             self._darl_settle = darl_settle
             self._merged_clusters: list[str] = []
+            # True when the last `_checkpoint` tried to write and could not. Not the
+            # same as it returning None, which it also does when nothing is due.
+            self._checkpoint_failed = False
             self._last_fedavg: NDArrays | None = None
             # Shared with server.py's metric closures, which log these to wandb; the
             # strategy is the single writer of everything derived here.
@@ -729,6 +732,7 @@ if HAS_FLWR:
             state. `keep_persistent=0` means unbounded, which over 200 rounds at
             `persist_every=5` is 40 checkpoints, ~192 GiB: check the filesystem first.
             """
+            self._checkpoint_failed = False
             if self.checkpoint_dir is None or self._global_fp32 is None:
                 return None
             persistent = (self.persist_every > 0
@@ -767,6 +771,7 @@ if HAS_FLWR:
             except OSError as exc:
                 log(ERROR, "could not write checkpoint %s: %s", name, exc)
                 tmp.unlink(missing_ok=True)
+                self._checkpoint_failed = True
                 return None
 
             size = final.stat().st_size
@@ -1330,6 +1335,8 @@ if HAS_FLWR:
                 for vn, vp in zip(v_next, v_prev)
             ]
 
+            previous = (self.v_vector, self._global_fp32, self._inline_round,
+                        self._inline_global_step, self.initial_parameters)
             self.v_vector = v_next
             self._global_fp32 = w_next
             self._inline_round += 1
@@ -1363,6 +1370,21 @@ if HAS_FLWR:
             self.initial_parameters = aggregated
             # After the merge, so a checkpoint is always a state the run actually had.
             self._checkpoint(self._inline_round)
+            if self._checkpoint_failed and self._darl_settle is not None:
+                # The merged model could not be saved, so a restart of this server
+                # would come back without this round. Committing its blocks would then
+                # leave them committed with their update in no model. Undo the merge
+                # instead: the round counts as not merged, and its blocks return to
+                # the pool. A full disk therefore stops progress, loudly, and does not
+                # lose data silently.
+                (self.v_vector, self._global_fp32, self._inline_round,
+                 self._inline_global_step, self.initial_parameters) = previous
+                log(ERROR,
+                    "Round %s: the merged model could not be saved, so this round is "
+                    "NOT merged: the global model stays at merge round %d and the "
+                    "blocks of this round return to the pool. Free space in %s.",
+                    server_round, self._inline_round, self.checkpoint_dir)
+                return self._current_parameters(), metrics
             self._merged_clusters = [
                 str(res.metrics.get(proto.CLUSTER, "")) for _, res in usable
             ]

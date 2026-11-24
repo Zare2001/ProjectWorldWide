@@ -107,6 +107,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         self._blob: BlobClient | None = None
         self._blob_url = ""
         self._cached_global = ""
+        self._marks_pending = False
         self.done = False
         if self.codec is not None:
             logger.info(
@@ -218,6 +219,7 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
         # round's blocks are then marked pending, and the central node commits them
         # when it merges the update. Without the tag the commit is final, as before.
         tag = config.get(proto.DARL_TAG)
+        self._marks_pending = tag is not None
         self.federated.set_pending_tag(None if tag is None else int(tag))
         if transport == proto.TRANSPORT_BLOB:
             return self._fit_blob(config)
@@ -500,10 +502,14 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
     def _log_round(self, result: dict, drift: float, base_round: int) -> None:
         logger.info(
             "merge round %d: %d steps, %s tokens, loss %.4f (ppl %.2f), drift %.4f, "
-            "%.0f tok/s, %d blocks committed",
+            "%.0f tok/s, %d blocks %s",
             base_round, result["steps"], f"{result['tokens']:,}", result["loss"],
             math.exp(min(20.0, result["loss"])), drift, result["tokens_per_s"],
             result["blocks_committed"],
+            # Under a central node that settles, this cluster only marks its blocks:
+            # they are committed when the central node merges this round's update.
+            "marked pending (committed when the central node merges this round)"
+            if self._marks_pending else "committed",
         )
 
     # --- rank coordination -------------------------------------------------
