@@ -171,6 +171,7 @@ if HAS_FLWR:
             jensen_hi: float = 0.06,
             jensen_warmup_rounds: int = 5,
             pure_eval_every: int = 5,
+            darl_settle: Any = None,
             control: dict[str, Any] | None = None,
         ) -> None:
             super().__init__(
@@ -282,6 +283,13 @@ if HAS_FLWR:
             # blob path would need a second published blob per round. Costs one
             # fp32 model copy in RAM (~2.4 GiB at 0.6B).
             self.pure_eval_every = max(0, int(pure_eval_every))
+            # darl_settle(tag, merged_clusters): tells the DARL coordinator which
+            # clusters' updates a round merged. The clusters mark their blocks pending
+            # under the round's tag (proto.DARL_TAG) and this call commits them, or
+            # returns them to the pool for a cluster that was not merged. None: the
+            # clusters commit by themselves, before their update is merged.
+            self._darl_settle = darl_settle
+            self._merged_clusters: list[str] = []
             self._last_fedavg: NDArrays | None = None
             # Shared with server.py's metric closures, which log these to wandb; the
             # strategy is the single writer of everything derived here.
@@ -421,6 +429,11 @@ if HAS_FLWR:
                 proto.RUN_ID: self.run_id,
                 proto.GLOBAL_STEP: self.global_step,
             }
+            if self._darl_settle is not None:
+                # The attempt number, not the merge counter: a round that merges
+                # nothing leaves the merge counter where it was, and blocks marked in
+                # that attempt must not be committed by the next one.
+                config[proto.DARL_TAG] = int(server_round)
             inner = self._next_inner_steps()
             if inner > 0:
                 config[proto.INNER_STEPS] = inner
@@ -524,6 +537,29 @@ if HAS_FLWR:
             results: list[tuple[ClientProxy, FitRes]],
             failures: list[tuple[ClientProxy, FitRes] | BaseException],
         ) -> tuple[Parameters | None, dict[str, Scalar]]:
+            # Settle on every way out, a merge or not: the blocks of a cluster whose
+            # update was not merged have to go back to the pool. After the merge, which
+            # has saved the global model by then, so a block is committed only once
+            # its update is in a model that survives a restart.
+            self._merged_clusters = []
+            try:
+                return self._aggregate_fit(server_round, results, failures)
+            finally:
+                self._settle_darl(server_round)
+
+        def _settle_darl(self, server_round: int) -> None:
+            if self._darl_settle is None:
+                return
+            try:
+                self._darl_settle(int(server_round), list(self._merged_clusters))
+            except Exception as exc:                              # noqa: BLE001
+                # Not fatal: unsettled blocks return to the pool when their pending
+                # time runs out, so the cost is that they are trained a second time.
+                log(ERROR, "Round %s: could not settle DARL commits (%s). The blocks "
+                    "of this round stay pending and return to the pool on their "
+                    "deadline.", server_round, exc)
+
+        def _aggregate_fit(self, server_round, results, failures):
             if failures:
                 self._log_failures(server_round, failures)
             if not results:
@@ -1045,6 +1081,7 @@ if HAS_FLWR:
                 log(WARNING, "Round %s: %s", server_round, exc)
                 return self._current_parameters(), metrics
 
+            self._merged_clusters = [item.cluster for item in contributions]
             self._publish_global(new_round)
             self._prune(new_round)
             metrics = dict(metrics)
@@ -1326,6 +1363,9 @@ if HAS_FLWR:
             self.initial_parameters = aggregated
             # After the merge, so a checkpoint is always a state the run actually had.
             self._checkpoint(self._inline_round)
+            self._merged_clusters = [
+                str(res.metrics.get(proto.CLUSTER, "")) for _, res in usable
+            ]
 
             metrics = dict(metrics)
             metrics["merge_round"] = self._inline_round

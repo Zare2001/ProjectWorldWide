@@ -210,6 +210,14 @@ class DARLDataSource:
         """
         return self.session.commit_all() if self.is_leader else 0
 
+    def set_pending_tag(self, tag: int | None) -> None:
+        """Send this round's commits as pending under `tag`, or as final with None.
+
+        See `LeaseClient.pending_tag`. Leader-only, like `commit`.
+        """
+        if self.is_leader:
+            self.session.client.pending_tag = tag
+
     def release_unused(self, *, count_attempt: bool = True) -> int:
         """Release any pre-fetched but un-trained leases back to the pool.
 

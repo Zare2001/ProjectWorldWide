@@ -61,7 +61,7 @@ from .table import HEARTBEAT_DIVISOR, MIN_TTL, ClusterBusy, LeaseTable
 DEFAULT_PORT = 8760
 # Mutations that are cheap to lose are batched; a commit is fsynced because
 # losing one costs the epoch a full re-run of that span.
-_FSYNC_OPS = {"commit"}
+_FSYNC_OPS = {"commit", "settle"}
 # Idempotency keys retained per coordinator. A few per cluster is plenty: a
 # client only ever retries the acquire it is currently blocked on.
 _GRANT_CACHE = 256
@@ -218,7 +218,11 @@ class Coordinator:
                 for lease in payload["leases"]:
                     table.replay_lease(lease, deadline_floor=time.time() + grace_s)
             elif op == "commit":
-                table.commit(payload["cluster"], payload["lease"], payload["through"], now=now)
+                table.commit(payload["cluster"], payload["lease"], payload["through"],
+                             pending=bool(payload.get("pending", False)),
+                             tag=int(payload.get("tag", 0)), now=now)
+            elif op == "settle":
+                table.settle(int(payload["tag"]), payload.get("merged", []), now=now)
             elif op == "release":
                 # No incarnation on replay: the journalled release was already
                 # authorised when it was served, and the record's current incarnation
@@ -322,11 +326,33 @@ class Coordinator:
     def commit(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             now = time.time()
+            # pending: the cluster trains under a merge server, which decides about
+            # these blocks in `settle`. Absent from older clients, which commit directly.
+            pending = bool(payload.get("pending", False))
+            tag = int(payload.get("tag", 0))
             result = self.table.commit(payload["cluster"], payload["lease"],
-                                       int(payload["through"]), now=now)
+                                       int(payload["through"]), pending=pending, tag=tag,
+                                       now=now)
             self._log_op("commit", {"cluster": payload["cluster"], "lease": payload["lease"],
-                                    "through": int(payload["through"])}, now)
+                                    "through": int(payload["through"]),
+                                    "pending": pending, "tag": tag}, now)
             return result
+
+    def settle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The merge server's verdict on a round. See `LeaseTable.settle`."""
+        with self.lock:
+            now = time.time()
+            tag = int(payload["tag"])
+            merged = [str(name) for name in payload.get("merged", [])]
+            result = self.table.settle(tag, merged, now=now)
+            self._log_op("settle", {"tag": tag, "merged": merged}, now)
+            if result["committed"] or result["returned"]:
+                get_logger().info(
+                    "darl: settled round tag %d (merged: %s): %d block(s) committed, "
+                    "%d returned to the pool", tag, ", ".join(merged) or "none",
+                    result["committed"], result["returned"])
+            return {**result, "epoch": self.table.epoch,
+                    "epoch_complete": self.table.epoch_complete}
 
     def release(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -438,6 +464,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/acquire": coordinator.acquire,
             "/heartbeat": coordinator.heartbeat,
             "/commit": coordinator.commit,
+            "/settle": coordinator.settle,
             "/release": coordinator.release,
         }
         if route == "/snapshot":
@@ -480,7 +507,7 @@ def format_status(status: dict[str, Any]) -> str:
         f"epoch {status['epoch']} of {status['max_epochs']}  "
         f"({status['epochs_completed']} completed)",
         f"blocks     {status['committed']:,} committed | {status['leased']:,} leased | "
-        f"{status['unassigned']:,} free | {status['quarantined']:,} quarantined "
+        f"{status.get('pending', 0):,} pending | {status['unassigned']:,} free | {status['quarantined']:,} quarantined "
         f"of {status['num_blocks']:,}",
         f"progress   {100 * status['progress']:.2f}%  at {status['blocks_per_s']:.3f} blocks/s"
         + (f"  eta {status['eta_s'] / 60:.1f} min" if status["eta_s"] else ""),

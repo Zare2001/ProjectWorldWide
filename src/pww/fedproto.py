@@ -36,6 +36,12 @@ ROUND = "pww_round"
 """The merge counter the global model is currently at. A cluster stamps this into its
 delta as `base_round`, and the merge refuses anything that does not match."""
 
+DARL_TAG = "pww_darl_tag"
+"""Present when the central node settles DARL commits: the cluster then sends this
+round's commits as pending under this tag, and the central node turns them into commits
+when it merges the cluster's update (`darl.table.LeaseTable.settle`). Absent from a
+central node that does not settle, where a cluster commits by itself."""
+
 RUN_ID = "pww_run_id"
 """Names the blobs for this run, so two runs sharing a blob store cannot collide."""
 

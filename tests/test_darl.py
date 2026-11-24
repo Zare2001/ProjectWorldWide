@@ -991,6 +991,202 @@ def _():
     raise AssertionError("a client with a different permutation must be refused")
 
 
+# --- commits settled by the merge server -----------------------------------
+#
+# Under a merge server a cluster marks its blocks pending and the server decides:
+# committed if it merged the cluster's update, back to the pool if it did not.
+
+
+def _mark(lease_table: LeaseTable, cluster: str, tag: int, blocks: int = 10) -> list[tuple[int, int]]:
+    """Acquire `blocks`, train them (so to speak) and mark them pending under `tag`."""
+    grant = lease_table.acquire(cluster, blocks, ttl=100.0)
+    assert grant.status == "granted", grant.reason
+    spans = []
+    for lease in list(grant.leases):
+        spans.append((lease.start, lease.end))
+        lease_table.commit(cluster, lease.lease_id, lease.end, pending=True, tag=tag)
+    return spans
+
+
+@check("pending: blocks are committed only when the server merges the update")
+def _():
+    lease_table, _ = table(100)
+    _mark(lease_table, "a", tag=1)
+    assert lease_table.committed == 0, "a pending block is not committed yet"
+    assert lease_table.clusters["a"].blocks_committed == 0
+    assert lease_table.verify()["pending"] == 10
+
+    result = lease_table.settle(1, ["a"])
+    assert result == {"committed": 10, "returned": 0}, result
+    assert lease_table.committed == 10 and lease_table.clusters["a"].blocks_committed == 10
+    counts = lease_table.verify()
+    assert counts["pending"] == 0 and counts["committed"] == 10, counts
+    assert lease_table.settle(1, ["a"]) == {"committed": 0, "returned": 0}, "settle is idempotent"
+
+
+@check("pending: an update that is not merged returns its blocks, and they are granted again")
+def _():
+    lease_table, _ = table(100)
+    spans_a = _mark(lease_table, "a", tag=1)
+    _mark(lease_table, "b", tag=1)
+    # The server merged b only: a failed after it marked, or its update was dropped.
+    result = lease_table.settle(1, ["b"])
+    assert result == {"committed": 10, "returned": 10}, result
+    assert lease_table.clusters["a"].blocks_unmerged == 10
+    assert lease_table.clusters["a"].blocks_committed == 0
+    counts = lease_table.verify()
+    assert counts["unassigned"] == 90 and counts["committed"] == 10, counts
+    assert all(lease_table._state[p] == 0 for start, end in spans_a for p in range(start, end)), \
+        "a's blocks are free again"
+
+    # b trains the rest of the epoch, a's returned blocks included, and every block
+    # ends up committed exactly once.
+    tag = 1
+    while not lease_table.epoch_complete:
+        tag += 1
+        grant = lease_table.acquire("b", 10, ttl=100.0)
+        assert grant.status == "granted", grant.reason
+        for lease in list(grant.leases):
+            lease_table.commit("b", lease.lease_id, lease.end, pending=True, tag=tag)
+        lease_table.settle(tag, ["b"])
+    assert lease_table.committed == 100
+    assert lease_table.clusters["b"].blocks_committed == 100, "nothing was committed twice"
+    lease_table.verify()
+
+
+@check("pending: blocks marked in an earlier round are not committed by a later merge")
+def _():
+    lease_table, _ = table(40)
+    # Round 3 timed out for a before it reported; it marked its blocks afterwards and
+    # its late update was dropped. Round 4 it trains again and is merged.
+    _mark(lease_table, "a", tag=3)
+    _mark(lease_table, "a", tag=4)
+    result = lease_table.settle(4, ["a"])
+    assert result == {"committed": 10, "returned": 10}, result
+    lease_table.verify()
+
+
+@check("pending: a site that dies after marking keeps its blocks until the server decides")
+def _():
+    lease_table, clock = table(30)
+    _mark(lease_table, "a", tag=1)
+    grant = lease_table.acquire("a", 5, ttl=20.0)          # the next phase's lease
+    clock.advance(500)                                       # the job is gone
+    assert lease_table.reap() == 5, "only the unmarked lease expires"
+    assert lease_table.verify()["pending"] == 10
+    lease_table.register("a", incarnation="requeued")
+    assert lease_table.verify()["pending"] == 10, "a requeue does not touch pending blocks"
+    # The update had been uploaded before the job died, and the server merges it.
+    assert lease_table.settle(1, ["a"])["committed"] == 10
+    lease_table.verify()
+    assert grant.leases[0].lease_id not in lease_table.leases
+
+
+@check("pending: without a verdict the blocks return to the pool on their deadline")
+def _():
+    lease_table, clock = table(10, pending_ttl=600.0)
+    _mark(lease_table, "a", tag=1)
+    clock.advance(599)
+    assert lease_table.reap() == 0
+    clock.advance(2)
+    assert lease_table.reap() == 10
+    counts = lease_table.verify()
+    assert counts["unassigned"] == 10 and counts["pending"] == 0, counts
+    assert lease_table.clusters["a"].blocks_unmerged == 10
+
+
+@check("pending: the epoch is not complete while blocks wait for the server")
+def _():
+    lease_table, _ = table(10)
+    _mark(lease_table, "a", tag=1)
+    assert not lease_table.epoch_complete
+    grant = lease_table.acquire("b", 5, ttl=100.0)
+    assert grant.status == "drain", grant.status       # wait, do not call the epoch done
+    lease_table.settle(1, [])                           # not merged: back to the pool
+    assert lease_table.acquire("b", 5, ttl=100.0).status == "granted"
+    lease_table.verify()
+
+
+@check("pending: a snapshot carries pending blocks across a coordinator restart")
+def _():
+    lease_table, clock = table(30)
+    _mark(lease_table, "a", tag=7)
+    restored = LeaseTable.restore(json.loads(json.dumps(lease_table.snapshot())), clock=clock)
+    assert restored.verify()["pending"] == 10
+    assert restored.settle(7, ["a"]) == {"committed": 10, "returned": 0}
+    restored.verify()
+
+
+@check("pending: stealing and release leave marked blocks alone")
+def _():
+    lease_table, _ = table(20)
+    grant = lease_table.acquire("slow", 20, ttl=100.0)
+    lease = grant.leases[0]
+    lease_table.commit("slow", lease.lease_id, lease.start + 6, pending=True, tag=1)
+    stolen = lease_table.acquire("fast", 20, ttl=100.0)     # steals from the tail
+    assert all(l.start >= lease.start + 6 for l in stolen.leases), stolen.leases
+    lease_table.release("slow")
+    counts = lease_table.verify()
+    assert counts["pending"] == 6, counts
+    assert lease_table.settle(1, ["slow"])["committed"] == 6
+    lease_table.verify()
+
+
+@check("HTTP: a client under a merge server marks pending, and /settle commits")
+def _():
+    space = BlockSpace(num_samples=400, block_size=10)       # 40 blocks
+    with _Server(space.num_blocks, digest=space.digest(), first_grant_fraction=1.0) as server:
+        coordinator = server.coordinator
+
+        def train(name: str, tag: int | None) -> int:
+            client = LeaseClient(server.url, name, retries=2, timeout=5.0)
+            client.pending_tag = tag
+            session = LeaseSession(client, space, blocks_per_phase=8, min_ttl=5.0,
+                                   heartbeat=False)
+            result = session.acquire(wait=False)
+            assert result.granted
+            for span in result.spans:
+                session.note_consumed(span.lease_id, span.end)
+            return session.commit_all()
+
+        assert train("a", 1) == 8 and train("b", 1) == 8
+        assert coordinator.table.committed == 0
+        assert coordinator.status()["pending"] == 16
+        reply = coordinator.settle({"tag": 1, "merged": ["a"]})
+        assert reply["committed"] == 8 and reply["returned"] == 8, reply
+        # A client with no tag commits by itself, as it always did.
+        assert train("c", None) == 8
+        assert coordinator.table.committed == 16
+        coordinator.table.verify()
+
+
+@check("journal: pending marks and the server's verdict survive a coordinator restart")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        first = Coordinator(LeaseTable(40, first_grant_fraction=1.0), tmp)
+        first.save_snapshot(force=True)
+        for name in ("a", "b"):
+            grant = first.acquire({"cluster": name, "blocks": 8, "ttl": 600.0})
+            for lease in grant["leases"]:
+                first.commit({"cluster": name, "lease": lease["lease_id"],
+                              "through": lease["end"], "pending": True, "tag": 5})
+        first._journal.close()
+
+        # Restart before the verdict: the marks are still there.
+        second = Coordinator.load(tmp, grace_s=60.0)
+        assert second.table.verify()["pending"] == 16
+        second.settle({"tag": 5, "merged": ["b"]})
+        second._journal.close()
+
+        # Restart after it: the verdict is replayed from the journal.
+        third = Coordinator.load(tmp, grace_s=60.0)
+        counts = third.table.verify()
+        assert counts["committed"] == 8 and counts["pending"] == 0, counts
+        assert third.table.clusters["b"].blocks_committed == 8
+        assert third.table.clusters["a"].blocks_committed == 0
+        third._journal.close()
+
+
 # --- the trainer side ------------------------------------------------------
 
 

@@ -69,6 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--darl-port", type=int, default=29510, help="DARL coordinator port")
     parser.add_argument(
+        "--darl-settle", action=argparse.BooleanOptionalAction, default=True,
+        help="Commit a cluster's DARL blocks when its update is merged, instead of "
+             "letting the cluster commit them before the upload. The clusters mark "
+             "their blocks pending, and after every round this server tells the "
+             "coordinator on --darl-port which clusters it merged; blocks of a cluster "
+             "that was not merged return to the pool. Needs the coordinator on this "
+             "machine. --no-darl-settle restores commits by the clusters.",
+    )
+    parser.add_argument(
         "--num-samples", type=int, default=1000000, help="DARL total sample count"
     )
     parser.add_argument("--block-size", type=int, default=10000, help="DARL block size")
@@ -579,6 +588,39 @@ def build_metric_aggregators(
     return aggregate_fit_metrics, aggregate_eval_metrics
 
 
+def make_darl_settler(port: int, token: str, *, timeout: float = 10.0, retries: int = 3):
+    """settle(tag, merged) -> reply, as a call to the DARL coordinator on this machine.
+
+    The coordinator runs next to this server, so the call never crosses the network
+    that the clusters use, and no proxy is involved.
+    """
+    import json
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    url = f"http://127.0.0.1:{int(port)}/settle"
+
+    def settle(tag: int, merged: list[str]) -> dict:
+        body = json.dumps({"tag": int(tag), "merged": list(merged)}).encode()
+        request = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-DARL-Token": token},
+        )
+        for attempt in range(retries):
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    return json.loads(response.read() or b"{}")
+            except OSError:
+                # Also covers HTTPError. Settling is idempotent, so a retry after a
+                # lost reply is safe.
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1.0 + attempt)
+        return {}
+
+    return settle
+
+
 def _install_init_retry(backoff: float = 2.0) -> None:
     """Stop one cluster's disconnect during INIT from ending the run for everyone.
 
@@ -843,7 +885,27 @@ def main() -> None:
         control=control,
     )
 
+    darl_settle = None
+    if args.darl_settle:
+        darl_settle = make_darl_settler(args.darl_port, os.environ.get("DARL_TOKEN", ""))
+        try:
+            # No server process is merging at this point, so whatever a previous one
+            # left pending will never be merged: return it to the pool. This is also
+            # the check that the coordinator is there and knows how to settle.
+            left = darl_settle(0, [])
+            logger.info(
+                "DARL commits are settled by this server: a cluster's blocks are "
+                "committed when its update is merged (%d block(s) left pending by a "
+                "previous server returned to the pool)", int(left.get("returned", 0)))
+        except Exception as exc:                                  # noqa: BLE001
+            logger.warning(
+                "the DARL coordinator on port %d did not accept a settle call (%s), so "
+                "this server will not settle commits and the clusters commit by "
+                "themselves, before their update is merged", args.darl_port, exc)
+            darl_settle = None
+
     strategy = FedMom(
+        darl_settle=darl_settle,
         min_fit_clients=args.min_clients,
         min_evaluate_clients=args.min_clients,
         min_available_clients=args.min_clients,

@@ -400,9 +400,12 @@ else
         exit 1
     fi
     echo "Starting Flower Aggregator Server on port ${FLOWER_PORT} (${AGGREGATOR_CONFIG})..."
+    # --darl-port from this script, not from the config file: the server settles DARL
+    # commits with the coordinator on that port, and it must be the one started above.
     nohup "${PYTHON_BIN}" -P -m pww.central.server \
         --config "${AGGREGATOR_CONFIG}" \
         --port "${FLOWER_PORT}" \
+        --darl-port "${DARL_PORT}" \
         "${SERVER_EXTRA[@]}" > "${STATE_DIR}/flower.log" 2>&1 &
     echo $! > "${FLOWER_PID_FILE}"
     sleep 2

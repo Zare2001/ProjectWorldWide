@@ -214,6 +214,11 @@ class DiLoCoFlowerClient(fl.client.NumPyClient):
     def fit(self, parameters: list, config: dict) -> tuple:
         transport = str(config.get(proto.TRANSPORT, proto.TRANSPORT_INLINE))
         self._require_transport(transport)
+        # A central node that settles DARL commits sends a tag with every round. This
+        # round's blocks are then marked pending, and the central node commits them
+        # when it merges the update. Without the tag the commit is final, as before.
+        tag = config.get(proto.DARL_TAG)
+        self.federated.set_pending_tag(None if tag is None else int(tag))
         if transport == proto.TRANSPORT_BLOB:
             return self._fit_blob(config)
         return self._fit_inline(parameters, config)

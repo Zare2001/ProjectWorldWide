@@ -30,6 +30,16 @@ Block states
     LEASED       held by exactly one cluster under a heartbeat TTL
     COMMITTED    durably processed, never re-issued this epoch
     QUARANTINED  reclaimed `max_attempts` times without ever being committed
+    PENDING      trained by a cluster and handed over to the merge server's decision:
+                 COMMITTED when the server merges that cluster's update, UNASSIGNED
+                 again when it does not (`LeaseTable.settle`)
+
+PENDING exists for runs in which a server merges the clusters' updates. There a
+checkpoint on the cluster is not what makes a block's work durable -- the merge is --
+so a cluster that committed by itself and then failed before its update was merged
+left blocks COMMITTED that the global model never saw. Such a cluster marks its blocks
+pending instead (`commit(..., pending=True)`), and the merge server settles them. A
+run without a merge server never uses the state and behaves as before.
 
 The design writeup lists EXPIRED as a fourth state; here expiry is a transition,
 not a resting state, because a reaped block must be immediately indistinguishable
@@ -59,6 +69,8 @@ TTL_BETA = 10.0
 DEFAULT_TTL = 900.0
 MIN_TTL = 30.0
 MAX_TTL = 6 * 3600.0
+# Longer than any round: a round at H=2000 runs for about an hour and its timeout is 2 h.
+DEFAULT_PENDING_TTL = 4 * 3600.0
 
 # Heartbeats go out at TTL/HEARTBEAT_DIVISOR, so a lease survives losing two
 # consecutive heartbeats. Anything less makes a single dropped packet on a
@@ -103,6 +115,7 @@ class BlockState(IntEnum):
     LEASED = 1
     COMMITTED = 2
     QUARANTINED = 3
+    PENDING = 4
 
 
 @dataclass
@@ -144,6 +157,17 @@ class Lease:
 
 
 @dataclass
+class PendingSpan:
+    """Blocks a cluster trained and marked, waiting for the merge server's verdict."""
+
+    cluster: str
+    start: int
+    end: int
+    tag: int                      # the round the cluster trained them in
+    deadline: float
+
+
+@dataclass
 class ClusterRecord:
     """What the coordinator knows about one participating HPC cluster.
 
@@ -161,6 +185,7 @@ class ClusterRecord:
     blocks_granted: int = 0
     blocks_committed: int = 0
     blocks_lost: int = 0          # reclaimed by expiry
+    blocks_unmerged: int = 0      # marked pending, then returned because not merged
     blocks_stolen_from: int = 0
     blocks_stolen_by: int = 0
     expiries: int = 0
@@ -394,6 +419,7 @@ class LeaseTable:
         allow_stealing: bool = True,
         steal_min_blocks: int = 2,
         min_ttl: float = MIN_TTL,
+        pending_ttl: float = DEFAULT_PENDING_TTL,
         clock: Callable[[], float] | None = None,
     ):
         if num_blocks < 1:
@@ -413,10 +439,15 @@ class LeaseTable:
         # and the simulation does exactly that to make expiry observable in
         # seconds rather than minutes.
         self.min_ttl = float(min_ttl)
+        # How long a pending span waits for the merge server before it is returned to
+        # the pool. The server settles every round, so this only matters when the
+        # server is gone.
+        self.pending_ttl = float(pending_ttl)
         self._clock = clock or time.time
 
         self.clusters: dict[str, ClusterRecord] = {}
         self.leases: dict[str, Lease] = {}
+        self.pending: list[PendingSpan] = []
         self.epochs_completed = 0
         self.events: list[dict[str, Any]] = []      # ring buffer for /status
         self._seq = 0
@@ -433,6 +464,7 @@ class LeaseTable:
         self.committed = 0
         self.quarantined = 0
         self.leases.clear()
+        self.pending.clear()
         for record in self.clusters.values():
             record.cursor = 0
 
@@ -595,7 +627,10 @@ class LeaseTable:
             # Nothing free and nothing stealable: every remaining block is held by
             # a cluster that is making progress on it. The right move is to wait
             # for the next lease boundary, not to spin.
-            outstanding = sum(lease.outstanding for lease in self.leases.values())
+            # Pending blocks count: the merge server may still return them to the pool,
+            # so the epoch is not over while any are waiting.
+            outstanding = (sum(lease.outstanding for lease in self.leases.values())
+                           + self.pending_blocks)
             return Grant(
                 status="drain" if outstanding else "epoch_complete",
                 epoch=self.epoch,
@@ -690,6 +725,8 @@ class LeaseTable:
         lease_id: str,
         through: int,
         *,
+        pending: bool = False,
+        tag: int = 0,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Mark [committed_end, through) durably processed.
@@ -697,6 +734,11 @@ class LeaseTable:
         Monotonic and idempotent: a retried commit after a dropped reply is a
         no-op, which matters because the client retries commits (losing one would
         cost the epoch a re-run of the span).
+
+        With `pending=True` the blocks become PENDING instead of COMMITTED and leave
+        the lease: from here on the merge server decides about them (`settle`), not
+        the cluster's heartbeat. `tag` names the round the cluster trained them in,
+        and `settle` commits only the spans whose tag it is given.
         """
         now = self._now(now)
         lease = self.leases.get(lease_id)
@@ -711,28 +753,26 @@ class LeaseTable:
         through = min(max(int(through), lease.committed_end), lease.end)
 
         newly = through - lease.committed_end
-        if newly:
-            self._fill(lease.committed_end, through, BlockState.COMMITTED)
-            self.committed += newly
+        if newly and pending:
+            self._fill(lease.committed_end, through, BlockState.PENDING)
+            self.pending.append(PendingSpan(
+                cluster=cluster_id, start=lease.committed_end, end=through,
+                tag=int(tag), deadline=now + self.pending_ttl))
             lease.committed_end = through
             lease.progress_end = max(lease.progress_end, through)
-
-            record = self.clusters[cluster_id]
-            record.blocks_committed += newly
-            record.last_seen = now
-            if record._last_commit_at:
-                elapsed = max(1e-6, now - record._last_commit_at)
-                rate = newly / elapsed
-                # EWMA: one slow phase (a checkpoint, a node reboot) should move
-                # the grant sizer, not redefine it.
-                record.rate = rate if record.rate <= 0 else 0.7 * record.rate + 0.3 * rate
-            record._last_commit_at = now
+            self.clusters[cluster_id].last_seen = now
+        elif newly:
+            self._fill(lease.committed_end, through, BlockState.COMMITTED)
+            lease.committed_end = through
+            lease.progress_end = max(lease.progress_end, through)
+            self._count_committed(self.clusters[cluster_id], newly, now)
 
         closed = lease.committed_end >= lease.end
         if closed:
             del self.leases[lease_id]
         if newly:
-            self._record("committed", cluster=cluster_id, blocks=newly, lease=lease_id)
+            self._record("pending" if pending else "committed", cluster=cluster_id,
+                         blocks=newly, lease=lease_id)
         return {
             "ok": True,
             "epoch": self.epoch,
@@ -741,6 +781,73 @@ class LeaseTable:
             "committed": self.committed,
             "epoch_complete": self.epoch_complete,
         }
+
+    def _count_committed(self, record: ClusterRecord, newly: int, now: float) -> None:
+        self.committed += newly
+        record.blocks_committed += newly
+        record.last_seen = now
+        if record._last_commit_at:
+            elapsed = max(1e-6, now - record._last_commit_at)
+            rate = newly / elapsed
+            # EWMA: one slow phase (a checkpoint, a node reboot) should move
+            # the grant sizer, not redefine it.
+            record.rate = rate if record.rate <= 0 else 0.7 * record.rate + 0.3 * rate
+        record._last_commit_at = now
+
+    @property
+    def pending_blocks(self) -> int:
+        return sum(span.end - span.start for span in self.pending)
+
+    def settle(
+        self,
+        tag: int,
+        merged: Iterable[str] = (),
+        *,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """The merge server's verdict on one round. Decides every pending span.
+
+        A span is COMMITTED when its cluster is in `merged` and it carries this
+        round's `tag`. Every other pending span returns to the pool: its cluster's
+        update was not merged (the cluster failed, the round timed out, the server
+        dropped the update), or it was marked in an earlier round whose update the
+        server never used. Only one round is open at a time, so nothing that is
+        pending at a settle can still be waiting for a later one.
+
+        Idempotent: a second settle finds nothing pending. The server calls it with
+        no merged clusters when it starts, which returns whatever a previous server
+        process left undecided.
+        """
+        now = self._now(now)
+        merged = set(merged)
+        committed = returned = 0
+        spans, self.pending = self.pending, []
+        for span in spans:
+            blocks = span.end - span.start
+            record = self.clusters.get(span.cluster)
+            if span.cluster in merged and span.tag == int(tag):
+                self._fill(span.start, span.end, BlockState.COMMITTED)
+                if record is None:
+                    self.committed += blocks
+                else:
+                    self._count_committed(record, blocks, now)
+                committed += blocks
+                self._record("committed", cluster=span.cluster, blocks=blocks, tag=span.tag)
+            else:
+                self._return_pending(span, reason="not merged")
+                returned += blocks
+        return {"committed": committed, "returned": returned}
+
+    def _return_pending(self, span: "PendingSpan", *, reason: str) -> None:
+        """PENDING -> UNASSIGNED. Not an attempt against the blocks: the fault is the
+        round's, and counting it would quarantine good data (see `_reclaim`)."""
+        self._fill(span.start, span.end, BlockState.UNASSIGNED)
+        self._free.add(span.start, span.end)
+        record = self.clusters.get(span.cluster)
+        if record is not None:
+            record.blocks_unmerged += span.end - span.start
+        self._record("unmerged", cluster=span.cluster, blocks=span.end - span.start,
+                     tag=span.tag, reason=reason)
 
     def release(
         self,
@@ -845,6 +952,13 @@ class LeaseTable:
                 self._record("expired", cluster=lease.cluster, blocks=blocks,
                              lease=lease.lease_id,
                              silent_for=round(now - lease.deadline + lease.ttl, 1))
+        # Pending spans that no merge server came back for.
+        overdue = [span for span in self.pending if span.deadline < now]
+        if overdue:
+            self.pending = [span for span in self.pending if span.deadline >= now]
+            for span in overdue:
+                self._return_pending(span, reason="no verdict from the merge server")
+                reclaimed += span.end - span.start
         return reclaimed
 
     def _reclaim(self, lease: Lease, now: float, *, reason: str,
@@ -1000,6 +1114,7 @@ class LeaseTable:
             "num_blocks": self.num_blocks,
             "committed": self.committed,
             "leased": leased,
+            "pending": self.pending_blocks,
             "unassigned": self._free.total,
             "quarantined": self.quarantined,
             "fragments": len(self._free),
@@ -1043,6 +1158,24 @@ class LeaseTable:
                         f"position {position} is in lease {lease.lease_id} but marked "
                         f"{BlockState(self._state[position]).name}"
                     )
+
+        # Pending spans cover exactly the PENDING blocks, each once.
+        waiting = bytearray(self.num_blocks)
+        for span in self.pending:
+            if not 0 <= span.start < span.end <= self.num_blocks:
+                raise AssertionError(f"pending span {span.start}-{span.end} is malformed")
+            for position in range(span.start, span.end):
+                if waiting[position] or self._state[position] != BlockState.PENDING:
+                    raise AssertionError(
+                        f"position {position} is in a pending span but marked "
+                        f"{BlockState(self._state[position]).name}, or is in two spans"
+                    )
+                waiting[position] = 1
+        if sum(waiting) != counts["pending"]:
+            raise AssertionError(
+                f"{counts['pending']} blocks marked PENDING but pending spans cover "
+                f"{sum(waiting)}"
+            )
 
         leased_positions = sum(covered)
         if leased_positions != counts["leased"]:
@@ -1105,6 +1238,7 @@ class LeaseTable:
             "state_rle": runs,
             "attempts": {str(k): v for k, v in self._attempts.items()},
             "leases": [lease.to_dict() for lease in self.leases.values()],
+            "pending": [asdict(span) for span in self.pending],
             "clusters": {cid: c.to_dict() for cid, c in self.clusters.items()},
             "config": {
                 "max_attempts": self.max_attempts,
@@ -1114,6 +1248,7 @@ class LeaseTable:
                 "allow_stealing": self.allow_stealing,
                 "steal_min_blocks": self.steal_min_blocks,
                 "min_ttl": self.min_ttl,
+                "pending_ttl": self.pending_ttl,
             },
         }
 
@@ -1142,7 +1277,8 @@ class LeaseTable:
             clock=clock,
             **{k: config[k] for k in
                ("max_attempts", "min_blocks", "max_blocks", "first_grant_fraction",
-                "allow_stealing", "steal_min_blocks", "min_ttl") if k in config},
+                "allow_stealing", "steal_min_blocks", "min_ttl", "pending_ttl")
+               if k in config},
         )
         now = table._clock()
 
@@ -1176,6 +1312,10 @@ class LeaseTable:
             lease = Lease(**data)
             lease.deadline = max(lease.deadline, now + grace_s)
             table.leases[lease.lease_id] = lease
+        for data in snapshot.get("pending", []):
+            span = PendingSpan(**data)
+            span.deadline = max(span.deadline, now + grace_s)
+            table.pending.append(span)
         return table
 
     # --- internals --------------------------------------------------------

@@ -204,6 +204,11 @@ class LeaseClient:
         # across concurrent jobs -- SLURM_JOB_ID changes on requeue, and the site name
         # does not change between jobs.
         self.incarnation = uuid.uuid4().hex
+        # Set per round by a cluster that trains under a merge server which settles
+        # commits (`LeaseTable.settle`): commits are then sent as pending under this
+        # tag, and the server turns them into commits when it merges the update. None
+        # means there is nobody to settle, so a commit is final, as it always was.
+        self.pending_tag: int | None = None
         # Compute nodes usually have http_proxy set so that they can reach the
         # internet through a slow gateway. The coordinator is normally *inside*
         # the facility, and routing to it through that proxy either fails or adds
@@ -349,8 +354,12 @@ class LeaseClient:
         })
 
     def commit(self, lease_id: str, through: int) -> dict[str, Any]:
-        return self._call("/commit", {"cluster": self.cluster_id, "lease": lease_id,
-                                      "through": int(through)})
+        payload: dict[str, Any] = {"cluster": self.cluster_id, "lease": lease_id,
+                                   "through": int(through)}
+        if self.pending_tag is not None:
+            payload["pending"] = True
+            payload["tag"] = int(self.pending_tag)
+        return self._call("/commit", payload)
 
     def release(self, lease_id: str | None = None, *,
                 count_attempt: bool = True) -> dict[str, Any]:

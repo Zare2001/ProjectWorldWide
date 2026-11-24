@@ -784,6 +784,163 @@ if HAS_FLWR:
             assert set(state.clusters) == {"snellius"}, sorted(state.clusters)
             assert state.clusters["snellius"].tokens_total == 600
 
+    @check("the server tells DARL which clusters it merged, on the inline transport")
+    def _():
+        """A cluster's blocks are committed by the merge, not by the cluster.
+
+        The strategy hands every round a tag, and after the round reports which
+        clusters' updates are in the global model. Everything else pending goes back
+        to the pool, which is what `settle` with a shorter list means.
+        """
+        from pww.central.strategy import FedMom
+
+        calls = []
+        zeros = [np.zeros((4,), dtype=np.float16)]
+        strategy = FedMom(
+            transport=proto.TRANSPORT_INLINE,
+            initial_parameters=ndarrays_to_parameters(zeros),
+            darl_settle=lambda tag, merged: calls.append((tag, sorted(merged))),
+        )
+        ins = strategy.configure_fit(7, ndarrays_to_parameters(zeros), _FakeManager(2))
+        assert ins[0][1].config[proto.DARL_TAG] == 7, "the tag is the attempt number"
+
+        good = _fit_res({proto.CLUSTER: "snellius"}, 1000,
+                        arrays=[np.ones((4,), dtype=np.float16)])
+        diverged = _fit_res({proto.CLUSTER: "lumi"}, 1000,
+                            arrays=[np.full((4,), np.nan, dtype=np.float16)])
+        strategy.aggregate_fit(7, [(None, good), (None, diverged)], [])
+        assert calls == [(7, ["snellius"])], calls      # lumi's update was dropped
+
+        # A round without any result still settles, with nobody merged.
+        strategy.aggregate_fit(8, [], [])
+        assert calls[-1] == (8, []), calls
+        # So does a round in which nobody trained anything.
+        strategy.aggregate_fit(9, [(None, _fit_res({proto.CLUSTER: "snellius"}, 0,
+                                                   arrays=zeros))], [])
+        assert calls[-1] == (9, []), calls
+
+        # Without a settler the round config carries no tag, so clusters commit
+        # by themselves as before.
+        plain = FedMom(transport=proto.TRANSPORT_INLINE,
+                       initial_parameters=ndarrays_to_parameters(zeros))
+        ins = plain.configure_fit(1, ndarrays_to_parameters(zeros), _FakeManager(1))
+        assert proto.DARL_TAG not in ins[0][1].config
+
+    @check("the server tells DARL which clusters it merged, on the blob transport")
+    def _():
+        from pww.central.strategy import FedMom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blobs = root / "blobs"
+            blobs.mkdir()
+            state = GlobalState(root / "state")
+            write_state_dict(root / "init.pww", _model())
+            state.initialise_from_file(root / "init.pww")
+            calls = []
+            strategy = FedMom(
+                transport=proto.TRANSPORT_BLOB, state=state, blob_root=blobs,
+                blob_url="http://vm:29512", run_id="t", keep_rounds=0,
+                darl_settle=lambda tag, merged: calls.append((tag, sorted(merged))),
+            )
+            _delta(blobs / proto.delta_blob("t", 0, "snellius"), 0.3, 0)
+            strategy.aggregate_fit(
+                3,
+                [
+                    (None, _fit_res({proto.CLUSTER: "snellius",
+                                     proto.DELTA_BLOB: proto.delta_blob("t", 0, "snellius"),
+                                     proto.BASE_ROUND: 0}, 600)),
+                    # lumi reports an upload that never reached the blob store.
+                    (None, _fit_res({proto.CLUSTER: "lumi",
+                                     proto.DELTA_BLOB: proto.delta_blob("t", 0, "lumi"),
+                                     proto.BASE_ROUND: 0}, 400)),
+                ],
+                [],
+            )
+            assert state.round == 1
+            assert calls == [(3, ["snellius"])], calls
+
+            # A stale update merges nothing, and is settled as such.
+            _delta(blobs / proto.delta_blob("t", 0, "frontier"), 0.3, 0)
+            strategy.aggregate_fit(
+                4,
+                [(None, _fit_res({proto.CLUSTER: "frontier",
+                                  proto.DELTA_BLOB: proto.delta_blob("t", 0, "frontier"),
+                                  proto.BASE_ROUND: 0}, 600))],
+                [],
+            )
+            assert state.round == 1 and calls[-1] == (4, []), (state.round, calls)
+
+    @check("end to end: a merged site's blocks are committed, an unmerged site's are re-issued")
+    def _():
+        """The strategy, the settle call and a real coordinator together.
+
+        Two sites lease blocks, train, and mark them under the tag the server sent.
+        One site's update is merged and the other's is dropped. Only the first site's
+        blocks are committed, and the other's are free for the next grant.
+        """
+        import threading
+
+        from pww.central.server import make_darl_settler
+        from pww.central.strategy import FedMom
+        from pww.darl.client import LeaseClient, LeaseSession
+        from pww.darl.server import Coordinator, make_server
+        from pww.darl.space import BlockSpace
+        from pww.darl.table import LeaseTable
+
+        space = BlockSpace(num_samples=1000, block_size=10)      # 100 blocks
+        coordinator = Coordinator(
+            LeaseTable(space.num_blocks, digest=space.digest(), first_grant_fraction=1.0),
+            None)
+        httpd = make_server(coordinator, host="127.0.0.1", port=0, token="secret")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            settle = make_darl_settler(port, "secret", retries=1)
+            assert settle(0, []) == {"committed": 0, "returned": 0, "epoch": 0,
+                                     "epoch_complete": False}
+
+            zeros = [np.zeros((4,), dtype=np.float16)]
+            strategy = FedMom(transport=proto.TRANSPORT_INLINE,
+                              initial_parameters=ndarrays_to_parameters(zeros),
+                              darl_settle=settle)
+            ins = strategy.configure_fit(1, ndarrays_to_parameters(zeros), _FakeManager(2))
+            tag = ins[0][1].config[proto.DARL_TAG]
+
+            def site(name: str) -> None:
+                client = LeaseClient(f"http://127.0.0.1:{port}", name, token="secret",
+                                     retries=1, timeout=5.0)
+                client.pending_tag = tag
+                session = LeaseSession(client, space, blocks_per_phase=8, min_ttl=5.0,
+                                       heartbeat=False)
+                for span in session.acquire(wait=False).spans:
+                    session.note_consumed(span.lease_id, span.end)
+                assert session.commit_all() == 8
+
+            site("snellius")
+            site("lumi")
+            assert coordinator.status()["pending"] == 16
+            assert coordinator.table.committed == 0, "nothing is committed before the merge"
+
+            strategy.aggregate_fit(1, [
+                (None, _fit_res({proto.CLUSTER: "snellius"}, 1000,
+                                arrays=[np.ones((4,), dtype=np.float16)])),
+                (None, _fit_res({proto.CLUSTER: "lumi"}, 1000,
+                                arrays=[np.full((4,), np.inf, dtype=np.float16)])),
+            ], [])
+            status = coordinator.status()
+            assert status["committed"] == 8 and status["pending"] == 0, status
+            assert status["unassigned"] == 92, status
+            assert status["clusters"]["snellius"]["blocks_committed"] == 8
+            assert status["clusters"]["lumi"]["blocks_committed"] == 0
+            assert status["clusters"]["lumi"]["blocks_unmerged"] == 8
+            coordinator.table.verify()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
     @check("a round with one site uses eta=1 on the blob transport, and eta<1 with two")
     def _():
         """The single-site rule must not depend on the transport.

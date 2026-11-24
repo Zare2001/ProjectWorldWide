@@ -257,6 +257,9 @@ class DARLWindowDataset(IterableDataset, Stateful):
         """
         return self.source.commit()
 
+    def set_pending_tag(self, tag: int | None) -> None:
+        self.source.set_pending_tag(tag)
+
     def state_dict(self) -> dict[str, Any]:
         """Where this cluster is in its phase sequence.
 
@@ -314,6 +317,9 @@ class DARLDataLoader(torch.utils.data.DataLoader, BaseDataLoader):
 
     def commit(self) -> int:
         return self.darl_dataset.commit()
+
+    def set_pending_tag(self, tag: int | None) -> None:
+        self.darl_dataset.set_pending_tag(tag)
 
     def release(self) -> int:
         return self.darl_dataset.release()

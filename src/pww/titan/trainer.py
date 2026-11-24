@@ -599,6 +599,16 @@ class FederatedTrainer:
                            "instead", exc)
             return 0
 
+    def set_pending_tag(self, tag: int | None) -> None:
+        """Send the next phase's DARL commits as pending under `tag` (None: final).
+
+        See `darl.client.LeaseClient.pending_tag`. A dataloader without DARL has
+        nothing to mark.
+        """
+        setter = getattr(self.trainer.dataloader, "set_pending_tag", None)
+        if setter is not None:
+            setter(tag)
+
     def _commit_leases(self) -> int:
         commit = getattr(self.trainer.dataloader, "commit", None)
         if commit is None:
